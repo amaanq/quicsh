@@ -63,6 +63,7 @@ use quicsh::{
       Token,
    },
    key::private_from_openssh,
+   known_hosts::glob,
    pipe::reopen,
    tls::{
       self,
@@ -93,11 +94,14 @@ use rustix::{
 };
 use rustls::sign::SigningKey;
 
-use crate::privsep::{
-   Ended,
-   Reply,
-   Request,
-   serve,
+use crate::{
+   child::SESSION_ENVIRONMENT,
+   privsep::{
+      Ended,
+      Reply,
+      Request,
+      serve,
+   },
 };
 
 /// Where distributions install OpenSSH's `sftp-server`.
@@ -132,6 +136,8 @@ pub struct Settings {
    pub authorized_keys: Option<PathBuf>,
    /// Program behind the `sftp` subsystem.
    pub sftp_server:     Option<PathBuf>,
+   /// Patterns for the environment variables a client may set.
+   pub accept_env:      Vec<String>,
    /// The account the network process runs as when the monitor is root.
    pub user:            String,
    /// Congestion controller the network process uses.
@@ -158,6 +164,8 @@ struct Monitor {
    authorized_keys: Option<PathBuf>,
    /// Program behind the `sftp` subsystem.
    sftp_server:     Option<PathBuf>,
+   /// Patterns for the environment variables a client may set.
+   accept_env:      Vec<String>,
    /// Logins the network process may start sessions for.
    grants:          HashMap<u64, Grant>,
    /// Directory of the sockets that reach session holders.
@@ -365,6 +373,26 @@ impl Monitor {
       }
 
       self.program(grant, open, &mut command)?;
+
+      for pair in &open.environment {
+         let (name, value) = (&pair.0, &pair.1);
+
+         let wellformed = name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+            && !name.starts_with(|first: char| first.is_ascii_digit())
+            && !name.is_empty()
+            && !value.contains('\0');
+
+         let accepted = self
+            .accept_env
+            .iter()
+            .any(|pattern| glob(pattern.as_bytes(), name.as_bytes()));
+
+         if wellformed && accepted {
+            command.env(format!("{SESSION_ENVIRONMENT}{name}"), value);
+         }
+      }
 
       let mut child = command
          .stdin(listener)
@@ -615,6 +643,7 @@ pub fn run(settings: Settings) -> Result<()> {
       listener: Some(listener),
       authorized_keys: settings.authorized_keys,
       sftp_server: settings.sftp_server,
+      accept_env: settings.accept_env,
       grants: HashMap::new(),
       holders: holders()?,
       issued: 0,

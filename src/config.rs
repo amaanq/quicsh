@@ -7,7 +7,8 @@
 //! - `HostName`, `User`, `IdentityFile`, `IdentityAgent`, `ProxyJump`,
 //!   `ForwardAgent`, the three forward keywords, `ClearAllForwardings`,
 //!   `RequestTTY`, `RemoteCommand`, `StrictHostKeyChecking`, `HostKeyAlias`,
-//!   `ControlMaster`, `ControlPath` and `ControlPersist`. `Port` is ignored,
+//!   `ControlMaster`, `ControlPath`, `ControlPersist`, `SendEnv` and `SetEnv`.
+//!   As in OpenSSH, only the first `SetEnv` line counts. `Port` is ignored,
 //!   because it names sshd's TCP port and says nothing about the UDP port.
 //! - `QshPort` for the UDP port, which OpenSSH skips once the file says
 //!   `IgnoreUnknown QshPort`.
@@ -17,6 +18,7 @@
 use std::{
    env,
    fs,
+   mem,
    path::{
       Path,
       PathBuf,
@@ -67,6 +69,10 @@ pub struct Host {
    pub control_path:    Option<String>,
    /// `ControlPersist`, as written.
    pub control_persist: Option<String>,
+   /// The `SendEnv` patterns that name local variables to pass on.
+   pub send_env:        Vec<String>,
+   /// The `NAME=VALUE` words of the first `SetEnv` line.
+   pub set_env:         Vec<String>,
 }
 
 /// Replaces a leading `~/` with the home directory.
@@ -87,6 +93,32 @@ pub struct Target<'name> {
    pub user:  Option<&'name str>,
    /// The local account.
    pub local: &'name str,
+}
+
+/// Splits a line's arguments at blanks, where double quotes keep blanks in
+/// a word and are dropped.
+fn words(text: &str) -> Vec<String> {
+   let mut found = Vec::new();
+   let mut word = String::new();
+   let mut quoted = false;
+
+   for symbol in text.chars() {
+      match symbol {
+         '"' => quoted = !quoted,
+         blank if blank.is_whitespace() && !quoted => {
+            if !word.is_empty() {
+               found.push(mem::take(&mut word));
+            }
+         },
+         other => word.push(other),
+      }
+   }
+
+   if !word.is_empty() {
+      found.push(word);
+   }
+
+   found
 }
 
 /// Whether a `Host` line's patterns cover `name`.
@@ -186,9 +218,9 @@ impl Host {
          let (keyword, rest) = line
             .split_once(|symbol: char| symbol.is_whitespace() || symbol == '=')
             .unwrap_or((line, ""));
-         let value = rest
-            .trim_start_matches(|symbol: char| symbol.is_whitespace() || symbol == '=')
-            .trim_matches('"');
+         let arguments =
+            rest.trim_start_matches(|symbol: char| symbol.is_whitespace() || symbol == '=');
+         let value = arguments.trim_matches('"');
 
          let lowered = keyword.to_ascii_lowercase();
 
@@ -228,6 +260,19 @@ impl Host {
             "localforward" => self.locals.push(value.to_owned()),
             "remoteforward" => self.remotes.push(value.to_owned()),
             "dynamicforward" => self.dynamics.push(value.to_owned()),
+            "sendenv" => {
+               for word in words(arguments) {
+                  match word.strip_prefix('-') {
+                     Some(dropped) => {
+                        self
+                           .send_env
+                           .retain(|kept| !glob(dropped.as_bytes(), kept.as_bytes()));
+                     },
+                     None => self.send_env.push(word),
+                  }
+               }
+            },
+            "setenv" if self.set_env.is_empty() => self.set_env = words(arguments),
             "include" if depth < MAX_DEPTH => {
                for pattern in value.split_whitespace() {
                   for path in matching(&base.join(expand(pattern))) {
@@ -376,6 +421,27 @@ mod tests {
          Some("5"),
          "exec holds for nobody"
       );
+   }
+
+   /// `SetEnv` keeps quoted blanks and only its first line, and `SendEnv`
+   /// adds up and takes patterns back.
+   #[test]
+   fn environment_lines() {
+      let text = "
+         SetEnv COLORTERM=\"truecolor\" NOTE=\"two words\"
+         SetEnv LATER=1
+         SendEnv LANG LC_*
+         SendEnv EDITOR -LC_*
+      ";
+
+      let host = lookup(text, "box");
+
+      assert_eq!(
+         host.set_env,
+         ["COLORTERM=truecolor", "NOTE=two words"],
+         "first line, without quotes"
+      );
+      assert_eq!(host.send_env, ["LANG", "EDITOR"], "pattern taken back");
    }
 
    /// A negated pattern keeps a host out of a block, and a `Match` block

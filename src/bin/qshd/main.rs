@@ -34,6 +34,11 @@ use crate::{
    },
 };
 
+/// The variables a client may set when no `--accept-env` says otherwise,
+/// which are the ones most distributions let through `sshd`, and the one
+/// that tells programs how many colors the terminal shows.
+const ACCEPTED_ENVIRONMENT: [&str; 3] = ["LANG", "LC_*", "COLORTERM"];
+
 fn main() -> Result<()> {
    let options = Options::parse();
 
@@ -46,6 +51,11 @@ fn main() -> Result<()> {
             host_key:        options.host_key,
             authorized_keys: options.authorized_keys,
             sftp_server:     options.sftp_server,
+            accept_env:      if options.accept_env.is_empty() {
+               ACCEPTED_ENVIRONMENT.map(str::to_owned).to_vec()
+            } else {
+               options.accept_env
+            },
             user:            options.user,
             congestion:      options.congestion,
          })

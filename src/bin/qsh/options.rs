@@ -28,6 +28,7 @@ use quicsh::{
       expand,
    },
    key::PublicKey,
+   known_hosts::glob,
    transport::Congestion,
 };
 use ring::digest::{
@@ -46,23 +47,25 @@ use crate::forward::{
 #[derive(Clone)]
 pub struct Login {
    /// Account name on the server.
-   pub user:    String,
+   pub user:        String,
    /// Host name or address of the server.
-   pub host:    String,
+   pub host:        String,
    /// The server's UDP port.
-   pub port:    u16,
+   pub port:        u16,
    /// The only keys to offer, when any were named.
-   pub keys:    Vec<Identity>,
+   pub keys:        Vec<Identity>,
    /// The hosts to connect through, the nearest first.
-   pub jump:    Option<String>,
+   pub jump:        Option<String>,
    /// Socket of the SSH agent, when there is one to use.
-   pub agent:   Option<PathBuf>,
+   pub agent:       Option<PathBuf>,
    /// What to do about a host key nobody vouched for yet.
-   pub strict:  Strict,
+   pub strict:      Strict,
    /// The name to look the host key up under, in place of the host's.
-   pub alias:   Option<String>,
+   pub alias:       Option<String>,
    /// The connection to share, when the configuration names a socket.
-   pub control: Option<Control>,
+   pub control:     Option<Control>,
+   /// Variables for the session's environment, from `SendEnv` and `SetEnv`.
+   pub environment: Vec<(String, String)>,
 }
 
 /// How a connection is shared with other runs of this program.
@@ -222,6 +225,31 @@ fn socket(named: Option<&str>) -> Option<PathBuf> {
          )
       },
    }
+}
+
+/// The variables that `SendEnv` takes from this process and the ones that
+/// `SetEnv` spells out, which win.
+fn environment(host: &Host) -> Result<Vec<(String, String)>> {
+   let mut found = env::vars_os()
+      .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
+      .filter(|pair| {
+         host
+            .send_env
+            .iter()
+            .any(|pattern| glob(pattern.as_bytes(), pair.0.as_bytes()))
+      })
+      .collect::<Vec<(String, String)>>();
+
+   for word in &host.set_env {
+      let Some((name, value)) = word.split_once('=') else {
+         bail!("SetEnv takes NAME=VALUE, got {word}");
+      };
+
+      found.retain(|sent| sent.0 != name);
+      found.push((name.to_owned(), value.to_owned()));
+   }
+
+   Ok(found)
 }
 
 /// How long `ControlPersist` keeps a connection without a session, forever
@@ -465,6 +493,7 @@ impl Options {
 
       Ok(Login {
          control,
+         environment: environment(&host)?,
          user,
          host: name,
          port,

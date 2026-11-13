@@ -74,6 +74,19 @@ in
       '';
     };
 
+    acceptEnv = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [
+        "LANG"
+        "LC_*"
+        "COLORTERM"
+      ];
+      description = ''
+        Patterns for the environment variables a client may set with
+        `SendEnv` and `SetEnv`.
+      '';
+    };
+
     congestion = lib.mkOption {
       type = lib.types.enum [
         "bbr"
@@ -142,6 +155,10 @@ in
             "--authorized-keys"
             cfg.authorizedKeysFile
           ]
+          ++ lib.concatMap (pattern: [
+            "--accept-env"
+            pattern
+          ]) cfg.acceptEnv
         );
         Restart = "on-failure";
         # Sessions live in holder processes that a restarted server

@@ -29,6 +29,11 @@ pub struct Options {
    /// Without it, the usual places for OpenSSH's sftp-server are tried.
    #[pound(long, value_name = "FILE")]
    pub sftp_server:     Option<PathBuf>,
+   /// Let clients set the environment variables that PATTERN matches, with
+   /// the wildcards * and ?. Without the option, LANG, LC_* and COLORTERM
+   /// pass.
+   #[pound(long, value_name = "PATTERN")]
+   pub accept_env:      Vec<String>,
    /// The account the network process runs as when the server is root.
    #[pound(long, value_name = "NAME", default = "sshd")]
    pub user:            String,

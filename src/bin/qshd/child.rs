@@ -68,6 +68,12 @@ use rustix::{
    },
 };
 
+/// Starts the name of each variable in a holder's environment that the
+/// session gets under the rest of the name. They travel there because a
+/// command line is open for every account to read. The session sets them
+/// before its own, so a client cannot replace `HOME` or `PATH`.
+pub const SESSION_ENVIRONMENT: &str = "QSHD_SESSION_";
+
 /// `PATH` for sessions when the server has none.
 const FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
@@ -196,8 +202,18 @@ impl Launch {
 
       let mut shell = Command::new(&account.shell);
 
+      shell.env_clear();
+
+      for (name, value) in env::vars_os() {
+         if let Some(wanted) = name
+            .to_str()
+            .and_then(|text| text.strip_prefix(SESSION_ENVIRONMENT))
+         {
+            shell.env(wanted, value);
+         }
+      }
+
       shell
-         .env_clear()
          .env("HOME", &account.home)
          .env("USER", &account.name)
          .env("LOGNAME", &account.name)

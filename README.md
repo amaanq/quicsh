@@ -99,10 +99,14 @@ with security keys since every wrong one costs you a touch.
 
 `qsh` reads `~/.ssh/config` and `/etc/ssh/ssh_config`, so the names you
 already use with `ssh` work, along with their keys, jump hosts, forwards and
-agent settings. `-o` takes a line of that file and wins over both. `Port` is
-ignored in the files, because that's sshd's TCP port and `qshd` may sit on
-another one. `QshPort` sets the UDP port, and `IgnoreUnknown` makes `ssh` skip
-it.
+agent settings. `SendEnv` and `SetEnv` pass environment variables to the
+session, and a `TERM` in `SetEnv` names the terminal. The server lets `LANG`,
+`LC_*` and `COLORTERM` through unless `--accept-env` lists other patterns, and
+the login shell may still set its own on top.
+
+`-o` takes a line of that file and wins over both. `Port` is ignored in the
+files, because that's sshd's TCP port and `qshd` may sit on another one.
+`QshPort` sets the UDP port, and `IgnoreUnknown` makes `ssh` skip it.
 
 ```
 IgnoreUnknown QshPort
@@ -208,7 +212,8 @@ batch into real packets there, and I haven't measured it between two machines.
   `User`, `IdentityFile`, `IdentityAgent`, `ProxyJump`, `ForwardAgent`,
   `LocalForward`, `RemoteForward`, `DynamicForward`, `ClearAllForwardings`,
   `RequestTTY`, `RemoteCommand`, `StrictHostKeyChecking`, `HostKeyAlias`,
-  `ControlMaster`, `ControlPath`, `ControlPersist` and `QshPort` are read.
+  `ControlMaster`, `ControlPath`, `ControlPersist`, `SendEnv`, `SetEnv` and
+  `QshPort` are read.
   `ControlPath` takes `%h`, `%n`, `%p`, `%r`, `%u`, `%i` and `%C`, and `%C`
   is not the hash `ssh` computes. `StrictHostKeyChecking no` behaves like
   `accept-new`, so a changed host key is always refused. `Match` checks

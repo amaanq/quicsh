@@ -29,6 +29,8 @@ use crate::{
 
 /// Largest frame either side accepts.
 const MAX_FRAME: usize = 64 << 10;
+/// Most environment variables a session may ask for.
+const MAX_ENVIRONMENT: u32 = 256;
 /// Longest account name a login may carry.
 const MAX_USER: usize = 64;
 /// Tag of [`Message::Request`].
@@ -107,12 +109,14 @@ pub enum Program {
 
 pub struct Open {
    /// Chosen by the client and echoed in resize and exit messages.
-   pub session:  u32,
+   pub session:     u32,
    /// `None` runs the command on pipes with a separate standard error.
-   pub terminal: Option<Terminal>,
-   pub program:  Program,
+   pub terminal:    Option<Terminal>,
+   pub program:     Program,
    /// Offer the client's SSH agent to the session.
-   pub agent:    bool,
+   pub agent:       bool,
+   /// Environment variables for the session, which the server may drop.
+   pub environment: Vec<(String, String)>,
 }
 
 pub enum Message {
@@ -213,6 +217,16 @@ pub enum Message {
    },
 }
 
+/// Appends a count and that many pairs of a name and a value.
+fn put_environment(out: &mut Vec<u8>, environment: &[(String, String)]) {
+   put_u32(out, u32::try_from(environment.len()).unwrap_or(u32::MAX));
+
+   for pair in environment {
+      put_string(out, pair.0.as_bytes());
+      put_string(out, pair.1.as_bytes());
+   }
+}
+
 /// Appends the tag and the fields of a message that names a host and a port.
 fn put_target(out: &mut Vec<u8>, tag: u8, host: &str, port: u16) {
    out.push(tag);
@@ -296,11 +310,25 @@ fn open(reader: &mut Reader<'_>) -> Result<Open, Error> {
       _ => return Err(Error::Frame),
    };
 
+   let agent = reader.byte()? != 0;
+   let count = reader.u32()?;
+
+   if count > MAX_ENVIRONMENT {
+      return Err(Error::Frame);
+   }
+
+   let mut environment = Vec::new();
+
+   for _ in 0..count {
+      environment.push((text(reader)?, text(reader)?));
+   }
+
    Ok(Open {
       session,
       terminal,
       program,
-      agent: reader.byte()? != 0,
+      agent,
+      environment,
    })
 }
 
@@ -342,6 +370,7 @@ impl Message {
             }
 
             payload.push(u8::from(open.agent));
+            put_environment(&mut payload, &open.environment);
          },
          Self::Resize { session, size } => {
             payload.push(RESIZE);
@@ -696,16 +725,17 @@ mod tests {
    fn open_round_trips() {
       let mut outbox = Outbox::default();
       outbox.push(&Message::Open(Open {
-         session:  3,
-         terminal: Some(Terminal {
+         session:     3,
+         terminal:    Some(Terminal {
             name: "xterm".to_owned(),
             size: Size {
                columns: 120,
                rows:    40,
             },
          }),
-         program:  Program::Command("uname -a".to_owned()),
-         agent:    true,
+         program:     Program::Command("uname -a".to_owned()),
+         agent:       true,
+         environment: vec![("LANG".to_owned(), "C.UTF-8".to_owned())],
       }));
 
       let mut deframer = Deframer::default();

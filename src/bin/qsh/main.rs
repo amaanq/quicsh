@@ -1288,7 +1288,7 @@ fn jump(hops: &str, login: &Login) -> Result<(Child, OwnedFd)> {
 
 /// What the options ask the server to run, on a terminal when this
 /// process has one and the options want it.
-fn request(options: &Options) -> Result<Open> {
+fn request(options: &Options, login: &Login) -> Result<Open> {
    let program = match (options.command.is_empty(), options.subsystem) {
       (true, _) => Program::Shell,
       (false, false) => Program::Command(options.command.join(" ")),
@@ -1297,9 +1297,20 @@ fn request(options: &Options) -> Result<Open> {
 
    let interactive = (matches!(program, Program::Shell) || options.terminal) && isatty(io::stdin());
 
+   // A `TERM` from `SetEnv` names the terminal, as it does in OpenSSH.
+   let (terminals, environment) = login
+      .environment
+      .iter()
+      .cloned()
+      .partition::<Vec<(String, String)>, _>(|pair| pair.0 == "TERM");
+   let named = terminals.last().map(|pair| &pair.1);
+
    let terminal = if interactive {
       Some(Terminal {
-         name: env::var("TERM").unwrap_or_else(|_| "xterm".to_owned()),
+         name: named
+            .cloned()
+            .or_else(|| env::var("TERM").ok())
+            .unwrap_or_else(|| "xterm".to_owned()),
          size: window(&standard(io::stdin())?)?,
       })
    } else {
@@ -1311,6 +1322,7 @@ fn request(options: &Options) -> Result<Open> {
       terminal,
       program,
       agent: options.agent,
+      environment,
    })
 }
 
@@ -1398,11 +1410,11 @@ fn shared(control: &Control, options: &Options) -> Result<Option<OwnedFd>> {
 
 /// Runs what the options ask for through the `qsh` behind `socket` and
 /// returns its exit status.
-fn share(socket: &OwnedFd, options: &Options) -> Result<u32> {
+fn share(socket: &OwnedFd, options: &Options, login: &Login) -> Result<u32> {
    let signals = SignalPipe::install()?;
    let signalled = reopen(signals.read_fd())?;
 
-   let open = request(options)?;
+   let open = request(options, login)?;
    let interactive = open.terminal.is_some();
 
    mux::open(socket, open)?;
@@ -1436,7 +1448,9 @@ fn divert(login: &Login, options: &Options, plain: bool) -> Result<Option<u32>> 
             None
          };
 
-         return socket.map(|holder| share(&holder, options)).transpose();
+         return socket
+            .map(|holder| share(&holder, options, login))
+            .transpose();
       },
    }
 
@@ -1444,7 +1458,7 @@ fn divert(login: &Login, options: &Options, plain: bool) -> Result<Option<u32>> 
 }
 
 /// The session this process runs for itself, when it runs one.
-fn first(options: &Options, relaying: bool) -> Result<BTreeMap<u32, Channel>> {
+fn first(options: &Options, login: &Login, relaying: bool) -> Result<BTreeMap<u32, Channel>> {
    let mut channels = BTreeMap::new();
 
    if !options.forward && !options.master && !relaying {
@@ -1456,7 +1470,7 @@ fn first(options: &Options, relaying: bool) -> Result<BTreeMap<u32, Channel>> {
 
       channels.insert(
          1,
-         Channel::new(request(options)?, stdio, Owner::Process(None))?,
+         Channel::new(request(options, login)?, stdio, Owner::Process(None))?,
       );
    }
 
@@ -1521,7 +1535,7 @@ fn main() -> Result<()> {
       Some(_) | None => None,
    };
 
-   let channels = first(&options, relay.is_some())?;
+   let channels = first(&options, &login, relay.is_some())?;
 
    let signals = SignalPipe::install()?;
    let mut signalled = reopen(signals.read_fd())?;
