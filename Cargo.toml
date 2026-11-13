@@ -1,0 +1,27 @@
+[package]
+name    = "ssh-quic"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes       = "1.12.1"
+quinn-proto = { default-features = false, features = [ "rustls-ring" ], version = "0.11.19" }
+quinn-udp   = { default-features = false, version = "0.6.3" }
+ring        = "0.17.14"
+rustix      = { features = [ "event", "net", "time" ], version = "1.1.6" }
+rustls      = { default-features = false, features = [ "ring", "std" ], version = "0.23.46" }
+thiserror   = "2.0.21"
+
+[dev-dependencies]
+eyre = "0.6.14"
+
+[profile.release]
+lto   = "thin"
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+nursery  = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
