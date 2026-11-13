@@ -133,6 +133,8 @@ pub struct Session {
    errors:  Option<Relay>,
    /// Where the session runs.
    backing: Backing,
+   /// Yields programs that want the client's SSH agent, for a held session.
+   agents:  Option<Receiver<OwnedFd>>,
    /// Yields the exit status once, as four bytes.
    exit:    Receiver<Bytes>,
    /// Exit status and when it arrived.
@@ -176,6 +178,7 @@ impl Session {
             id: spawned.session,
             helper,
          },
+         agents:  None,
          exit:    reader(File::from(status), Arc::clone(waker)),
          exited:  None,
       })
@@ -196,19 +199,22 @@ impl Session {
 
       let mut buffer = vec![0; PACKET_LIMIT];
 
-      let Some(Packet::Attached { taken, skipped }) = Packet::receive(&link, &mut buffer)? else {
+      let Some((Packet::Attached { taken, skipped }, _)) = Packet::receive(&link, &mut buffer)?
+      else {
          bail!("the session holder did not answer");
       };
 
       let (chunks, outbound) = sync_channel(QUEUE);
       let (status, exit) = channel();
+      let (wanted, agents) = channel();
       let source = link.try_clone()?;
       let signal = Arc::clone(waker);
 
       thread::spawn(move || {
-         while let Ok(Some(packet)) = Packet::receive(&source, &mut buffer) {
+         while let Ok(Some((packet, descriptor))) = Packet::receive(&source, &mut buffer) {
             let delivered = match packet {
                Packet::Data(bytes) => chunks.send(Bytes::from(bytes)).is_ok(),
+               Packet::Agent => descriptor.is_none_or(|socket| wanted.send(socket).is_ok()),
                Packet::Exit(code) => {
                   status
                      .send(Bytes::copy_from_slice(&code.to_be_bytes()))
@@ -245,9 +251,15 @@ impl Session {
          relay,
          errors: None,
          backing: Backing::Holder { link, keep: false },
+         agents: Some(agents),
          exit,
          exited: None,
       })
+   }
+
+   /// The next program that wants the client's SSH agent.
+   pub fn agent(&self) -> Option<OwnedFd> {
+      self.agents.as_ref()?.try_recv().ok()
    }
 
    /// Sets the terminal's size.

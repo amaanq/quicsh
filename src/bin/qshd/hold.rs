@@ -10,23 +10,38 @@
 //! - The network process reaches a holder through a connection the monitor
 //!   makes for it, and speaks [`Packet`]s over it. A new connection replaces
 //!   the old one.
+//! - The holder also owns the socket that reaches the client's SSH agent, so
+//!   the path the session knows keeps working for every later connection.
 
 use std::{
    collections::VecDeque,
    env,
-   fs::File,
+   fs::{
+      self,
+      DirBuilder,
+      File,
+   },
    io::{
       self,
+      IoSlice,
+      IoSliceMut,
       Read as _,
       Write as _,
    },
+   mem::MaybeUninit,
    ops::ControlFlow,
    os::{
       fd::{
          AsFd as _,
          OwnedFd,
       },
-      unix::fs::fchown,
+      unix::{
+         fs::{
+            DirBuilderExt as _,
+            fchown,
+         },
+         net::UnixListener,
+      },
    },
    path::PathBuf,
    process::Command,
@@ -41,6 +56,7 @@ use misstep::{
    OptionExt as _,
    Result,
    ResultExt as _,
+   report,
 };
 use quicsh::{
    auth::Account,
@@ -52,7 +68,12 @@ use quicsh::{
    relay::Tail,
    wire::Reader,
 };
+use ring::rand::{
+   SecureRandom as _,
+   SystemRandom,
+};
 use rustix::{
+   cmsg_space,
    event::{
       PollFd,
       PollFlags,
@@ -65,12 +86,18 @@ use rustix::{
       write,
    },
    net::{
+      RecvAncillaryBuffer,
+      RecvAncillaryMessage,
       RecvFlags,
+      SendAncillaryBuffer,
+      SendAncillaryMessage,
       SendFlags,
       SocketFlags,
       accept_with,
       recv,
+      recvmsg,
       send,
+      sendmsg,
    },
    process::{
       Pid,
@@ -117,6 +144,8 @@ const RESIZE: u8 = 4;
 const EXIT: u8 = 5;
 /// Tag of [`Packet::Hangup`].
 const HANGUP: u8 = 6;
+/// Tag of [`Packet::Agent`].
+const AGENT: u8 = 7;
 
 /// One message between the network process and a holder.
 pub enum Packet {
@@ -141,6 +170,9 @@ pub enum Packet {
    Exit(u32),
    /// The client is done with the session.
    Hangup,
+   /// A program in the session wants the client's SSH agent. Its socket
+   /// comes along as a descriptor.
+   Agent,
 }
 
 impl Packet {
@@ -167,6 +199,7 @@ impl Packet {
          },
          Self::Exit(status) => [&[EXIT][..], &status.to_be_bytes()].concat(),
          Self::Hangup => vec![HANGUP],
+         Self::Agent => vec![AGENT],
       }
    }
 
@@ -200,6 +233,7 @@ impl Packet {
          },
          EXIT => Self::Exit(reader.u32()?),
          HANGUP => Self::Hangup,
+         AGENT => Self::Agent,
          _ => return Err(Error::Frame),
       })
    }
@@ -210,16 +244,40 @@ impl Packet {
       Ok(())
    }
 
-   /// Waits for the next packet. `None` means the other side closed.
-   pub fn receive(link: &OwnedFd, buffer: &mut [u8]) -> io::Result<Option<Self>> {
-      let (count, _) = recv(link, &mut *buffer, RecvFlags::empty())?;
+   /// Waits for the next packet and the descriptor it may carry. `None`
+   /// means the other side closed.
+   pub fn receive(
+      link: &OwnedFd,
+      buffer: &mut [u8],
+   ) -> io::Result<Option<(Self, Option<OwnedFd>)>> {
+      let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(1))];
+      let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+
+      let count = recvmsg(
+         link,
+         &mut [IoSliceMut::new(&mut *buffer)],
+         &mut ancillary,
+         RecvFlags::CMSG_CLOEXEC,
+      )?
+      .bytes;
 
       if count == 0 {
          return Ok(None);
       }
 
+      let descriptor = ancillary
+         .drain()
+         .filter_map(|message| {
+            match message {
+               RecvAncillaryMessage::ScmRights(descriptors) => Some(descriptors),
+               _ => None,
+            }
+         })
+         .flatten()
+         .next();
+
       Self::decode(&buffer[..count])
-         .map(Some)
+         .map(|packet| Some((packet, descriptor)))
          .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
    }
 }
@@ -232,10 +290,62 @@ pub struct Hold {
    pub terminal: String,
    /// The command, or `None` for a login shell.
    pub command:  Option<String>,
-   /// Where the session finds the client's forwarded SSH agent.
-   pub agent:    Option<PathBuf>,
+   /// Whether the session gets a socket to the client's SSH agent.
+   pub agent:    bool,
    /// The terminal's first size.
    pub size:     Size,
+}
+
+/// The socket programs in the session open to reach the client's SSH agent.
+/// Dropping it removes the socket and its directory.
+struct AgentSocket {
+   /// A directory only the account can enter.
+   directory: PathBuf,
+   /// Accepts those programs, once the holder runs as the account.
+   listener:  Option<UnixListener>,
+}
+
+impl AgentSocket {
+   /// Picks a directory name nobody can guess.
+   fn new() -> Result<Self> {
+      let mut random = [0; 8];
+      SystemRandom::new()
+         .fill(&mut random)
+         .map_err(|_| report!("system random source failed"))?;
+
+      Ok(Self {
+         directory: env::temp_dir().join(format!("quicsh-{:016x}", u64::from_be_bytes(random))),
+         listener:  None,
+      })
+   }
+
+   /// Where the socket is.
+   fn path(&self) -> PathBuf {
+      self.directory.join("agent.sock")
+   }
+
+   /// Makes the directory and the socket.
+   fn listen(&mut self) -> Result<()> {
+      DirBuilder::new()
+         .mode(0o700)
+         .create(&self.directory)
+         .with_context(|| format!("creating {}", self.directory.display()))?;
+
+      let listener = UnixListener::bind(self.path()).context("binding the agent socket")?;
+      listener.set_nonblocking(true)?;
+      self.listener = Some(listener);
+
+      Ok(())
+   }
+}
+
+impl Drop for AgentSocket {
+   fn drop(&mut self) {
+      if self.listener.is_some() {
+         let _ = fs::remove_file(self.path());
+         let _ = fs::remove_dir(&self.directory);
+      }
+   }
 }
 
 /// A running session and its link to the network process.
@@ -244,6 +354,8 @@ struct Holder {
    master:   OwnedFd,
    /// Accepts the network process.
    listener: OwnedFd,
+   /// Accepts programs that want the client's SSH agent.
+   agent:    Option<AgentSocket>,
    /// Yields the exit status once, as four bytes.
    status:   File,
    /// The session's process group.
@@ -299,6 +411,35 @@ impl Holder {
       self.flush(now);
    }
 
+   /// Hands a program that wants the SSH agent to the link. Without a link
+   /// that listens, the program sees its connection close.
+   fn offer(&self) {
+      let accepting = self
+         .agent
+         .as_ref()
+         .and_then(|agent| agent.listener.as_ref());
+
+      let Some(Ok((socket, _))) = accepting.map(UnixListener::accept) else {
+         return;
+      };
+
+      let Some(link) = self.link.as_ref().filter(|_| self.attached) else {
+         return;
+      };
+
+      let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(1))];
+      let mut ancillary = SendAncillaryBuffer::new(&mut space);
+      let descriptors = [socket.as_fd()];
+      ancillary.push(SendAncillaryMessage::ScmRights(&descriptors));
+
+      let _ = sendmsg(
+         link,
+         &[IoSlice::new(&Packet::Agent.encode())],
+         &mut ancillary,
+         SendFlags::NOSIGNAL | SendFlags::DONTWAIT,
+      );
+   }
+
    /// Handles everything the link sent. Breaks when the client hung up.
    fn receive(&mut self, now: Instant, buffer: &mut [u8]) -> ControlFlow<()> {
       while let Some(ref link) = self.link {
@@ -330,7 +471,9 @@ impl Holder {
                let _ = tcsetwinsize(&self.master, winsize(size));
             },
             Some(Packet::Hangup) => return ControlFlow::Break(()),
-            Some(Packet::Attached { .. } | Packet::Exit(_)) | None => self.detach(now),
+            Some(Packet::Attached { .. } | Packet::Exit(_) | Packet::Agent) | None => {
+               self.detach(now);
+            },
          }
       }
 
@@ -355,8 +498,8 @@ impl Holder {
    }
 
    /// Sleeps until something needs handling. Returns what the listener, the
-   /// status pipe, the terminal and the link are ready for.
-   fn wait(&self, now: Instant) -> Result<[PollFlags; 4]> {
+   /// status pipe, the terminal, the link and the agent socket are ready for.
+   fn wait(&self, now: Instant) -> Result<[PollFlags; 5]> {
       let reading = self.reading();
 
       let mut terminal = PollFlags::empty();
@@ -396,6 +539,11 @@ impl Holder {
             .then(|| PollFd::new(&self.status, PollFlags::IN)),
          (!terminal.is_empty()).then(|| PollFd::new(&self.master, terminal)),
          self.link.as_ref().map(|link| PollFd::new(link, sending)),
+         self
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.listener.as_ref())
+            .map(|listener| PollFd::new(listener, PollFlags::IN)),
       ]
       .map(|entry| {
          entry.map(|fd| {
@@ -412,10 +560,10 @@ impl Holder {
       let ready = fds.iter().map(PollFd::revents).collect::<Vec<PollFlags>>();
       drop(fds);
 
-      let [status, master, link] =
+      let [status, master, link, agent] =
          watched.map(|index| index.map_or(PollFlags::empty(), |at| ready[at]));
 
-      Ok([ready[0], status, master, link])
+      Ok([ready[0], status, master, link, agent])
    }
 
    /// Waits for one thing to happen and handles it. Breaks when the session
@@ -441,8 +589,12 @@ impl Holder {
       }
 
       let reading = self.reading();
-      let [listener, status, master, link] = self.wait(now)?;
+      let [listener, status, master, link, agent] = self.wait(now)?;
       now = Instant::now();
+
+      if !agent.is_empty() {
+         self.offer();
+      }
 
       if !listener.is_empty() {
          let accepted = accept_with(&self.listener, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK)
@@ -525,8 +677,10 @@ impl Hold {
          .arg("--term")
          .arg(&self.terminal);
 
-      if let Some(ref agent) = self.agent {
-         command.arg("--agent-socket").arg(agent);
+      let mut agent = self.agent.then(AgentSocket::new).transpose()?;
+
+      if let Some(ref socket) = agent {
+         command.arg("--agent-socket").arg(socket.path());
       }
 
       if let Some(ref text) = self.command {
@@ -549,6 +703,10 @@ impl Hold {
       // without privileges.
       become_account(&account)?;
 
+      if let Some(ref mut socket) = agent {
+         socket.listen()?;
+      }
+
       let (status, mut report) = io::pipe()?;
 
       thread::spawn(move || {
@@ -561,6 +719,7 @@ impl Hold {
       let mut holder = Holder {
          master,
          listener,
+         agent,
          status: File::from(OwnedFd::from(status)),
          group,
          tail: Tail::default(),

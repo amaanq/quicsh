@@ -329,8 +329,8 @@ impl Monitor {
          .arg("--rows")
          .arg(terminal.size.rows.to_string());
 
-      if let Some(agent) = grant.agent.as_ref().filter(|_| open.agent) {
-         command.arg("--agent-socket").arg(&agent.socket);
+      if open.agent {
+         command.arg("--agent");
       }
 
       if let Some(ref text) = open.command {

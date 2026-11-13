@@ -50,13 +50,13 @@ fn main() -> Result<()> {
          columns,
          rows,
          command,
-         agent_socket,
+         agent,
       }) => {
          let hold = Hold {
             user,
             terminal: term,
             command,
-            agent: agent_socket,
+            agent,
             size: Size { columns, rows },
          };
 

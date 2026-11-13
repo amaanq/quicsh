@@ -21,14 +21,16 @@ afford to lose :)
 
 - Login shells and remote commands, with a terminal or with pipes
 - `-L`, `-R` and `-D` (SOCKS5) forwarding
-- Agent forwarding with `-A`
+- Agent forwarding with `-A`, which keeps working after a reattach
+- `rsync -e qsh`
 - IPv4 and IPv6 on one socket
 - Roaming. A session carries on when the client changes networks
 - Reattaching. A terminal session survives up to an hour without a
   connection, and `qsh` picks it up again. The server keeps the last 256 KiB
   of output for that, and `qsh` says so when more was produced
 - Restarting `qshd` under a terminal session. The session lives in a process
-  of its own, and `qsh` reattaches about a second after the server is back
+  of its own, and `qsh` reattaches with the next packet it sends, a keystroke
+  or the keep-alive that goes out every 15 seconds
 - `ed25519` keys, signed through `ssh-agent` or `ssh-keygen`
 - `ed25519-sk` keys in the same way, with the PIN and the touch
 
@@ -153,8 +155,6 @@ switch. I'd like to close that gap, but it isn't closed.
   `/etc/passwd`.
 - Restarts for anything but terminal sessions. Remote commands on pipes and
   open forwarded connections end with the server.
-- Agent forwarding after a reattach. The forwarded agent goes away with the
-  connection that carried it.
 - Anything but Linux.
 
 ## Building

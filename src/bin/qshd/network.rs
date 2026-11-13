@@ -328,7 +328,7 @@ impl Server {
                bail!("session id reused or too many sessions");
             }
 
-            if open.agent && peer.agent.is_none() {
+            if open.agent && open.terminal.is_none() && peer.agent.is_none() {
                let listener = UnixListener::from(self.helper.agent(grant)?);
                peer.agent = Some(Acceptor::unix(listener, &self.waker)?);
             }
@@ -519,6 +519,12 @@ impl Server {
 
       while let Some(socket) = peer.agent.as_ref().and_then(Acceptor::poll) {
          accepted.push((Message::Agent, socket));
+      }
+
+      for session in peer.sessions.values() {
+         while let Some(socket) = session.agent() {
+            accepted.push((Message::Agent, socket));
+         }
       }
 
       for (opening, socket) in accepted {
