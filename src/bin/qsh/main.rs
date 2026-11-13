@@ -257,20 +257,21 @@ fn authenticate(
    // The main loop takes one login and asks for the next when the server
    // refuses it.
    let offer = |request| attempts.send(Ok(Some(request))).is_ok() && next.recv().is_ok();
-   let mut offered = false;
+   let mut tried = Vec::new();
 
    if env::var_os("SSH_AUTH_SOCK").is_some() {
       let mut agent = Agent::connect()?;
       let data = challenge(secret, &login.user);
 
       for identity in agent.identities()? {
-         if login
-            .identity
-            .as_ref()
-            .is_some_and(|wanted| *wanted != identity.key)
-         {
+         let wanted =
+            login.keys.is_empty() || login.keys.iter().any(|named| named.public == identity.key);
+
+         if !wanted {
             continue;
          }
+
+         tried.push(identity.key.clone());
 
          let request = Request {
             user:      login.user.clone(),
@@ -280,43 +281,44 @@ fn authenticate(
             key:       identity.key,
          };
 
-         offered = true;
-
          if !offer(request) {
             return Ok(());
          }
       }
    }
 
-   if !offered {
-      let files = if let Some(ref file) = login.key_file {
-         vec![file.clone()]
-      } else {
-         let ssh = home()?.join(".ssh");
+   let files = if login.keys.is_empty() && tried.is_empty() {
+      let ssh = home()?.join(".ssh");
 
-         ["id_ed25519", "id_ed25519_sk"]
-            .map(|name| ssh.join(name))
-            .into_iter()
-            .filter(|file| file.exists())
-            .collect()
+      ["id_ed25519", "id_ed25519_sk"]
+         .map(|name| ssh.join(name))
+         .into_iter()
+         .filter(|file| file.exists())
+         .collect()
+   } else {
+      login
+         .keys
+         .iter()
+         .filter(|named| !tried.contains(&named.public))
+         .map(|named| named.file.clone())
+         .collect::<Vec<PathBuf>>()
+   };
+
+   if files.is_empty() && tried.is_empty() {
+      bail!("no key to log in with, start ssh-agent or name a key file with -i");
+   }
+
+   for file in files {
+      let (key, signature) = sign_with_file(&file, &message(secret, &login.user))?;
+
+      let request = Request {
+         user: login.user.clone(),
+         key,
+         signature,
       };
 
-      if files.is_empty() {
-         bail!("no key to log in with, start ssh-agent or name a key file with -i");
-      }
-
-      for file in files {
-         let (key, signature) = sign_with_file(&file, &message(secret, &login.user))?;
-
-         let request = Request {
-            user: login.user.clone(),
-            key,
-            signature,
-         };
-
-         if !offer(request) {
-            return Ok(());
-         }
+      if !offer(request) {
+         return Ok(());
       }
    }
 

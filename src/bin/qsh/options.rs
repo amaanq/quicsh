@@ -7,7 +7,10 @@
 use std::{
    env,
    fs,
-   path::PathBuf,
+   path::{
+      Path,
+      PathBuf,
+   },
 };
 
 use misstep::{
@@ -16,6 +19,7 @@ use misstep::{
 };
 use quicsh::{
    DEFAULT_PORT,
+   config::Host,
    key::PublicKey,
    transport::Congestion,
 };
@@ -30,15 +34,44 @@ use crate::forward::{
 #[derive(Clone)]
 pub struct Login {
    /// Account name on the server.
-   pub user:     String,
+   pub user: String,
    /// Host name or address of the server.
-   pub host:     String,
+   pub host: String,
    /// The server's UDP port.
-   pub port:     u16,
-   /// The only key to offer, when one was named.
-   pub identity: Option<PublicKey>,
-   /// The private key file that goes with it.
-   pub key_file: Option<PathBuf>,
+   pub port: u16,
+   /// The only keys to offer, when any were named.
+   pub keys: Vec<Identity>,
+}
+
+/// A key to log in with.
+#[derive(Clone)]
+pub struct Identity {
+   /// The public half.
+   pub public: PublicKey,
+   /// The private key file, for when no agent holds the key.
+   pub file:   PathBuf,
+}
+
+impl Identity {
+   /// Reads the public half that sits beside a key file. `path` may name
+   /// either half.
+   fn load(path: &Path) -> Result<Self> {
+      let (public, file) = if path.extension().is_some_and(|extension| extension == "pub") {
+         (path.to_owned(), path.with_extension(""))
+      } else {
+         let mut name = path.to_owned().into_os_string();
+         name.push(".pub");
+         (PathBuf::from(name), path.to_owned())
+      };
+
+      let text = fs::read_to_string(&public)
+         .with_context(|| format!("reading public key {}", public.display()))?;
+
+      Ok(Self {
+         public: text.parse()?,
+         file,
+      })
+   }
 }
 
 /// SSH over QUIC client.
@@ -61,7 +94,8 @@ pub struct Options {
    #[pound(short = 'l', value_name = "USER")]
    pub login:      Option<String>,
    /// Log in with the key in FILE, which may name either half. The agent
-   /// signs when it holds the key, and ssh-keygen does otherwise.
+   /// signs when it holds the key, and ssh-keygen does otherwise. Without
+   /// it, the OpenSSH client configuration picks the key.
    #[pound(short = 'i', value_name = "FILE")]
    pub identity:   Option<PathBuf>,
    /// Listen locally and connect each connection to HOST:HOSTPORT from the
@@ -80,7 +114,8 @@ pub struct Options {
    #[pound(long, value_name = "NAME", default = "bbr")]
    pub congestion: Congestion,
 
-   /// The server, with an optional account name.
+   /// The server, with an optional account name. The OpenSSH client
+   /// configuration may give HOST a real name and an account.
    #[pound(value_name = "[USER@]HOST")]
    pub target:  String,
    /// Runs in place of the login shell. Flags after HOST belong to it.
@@ -91,40 +126,47 @@ pub struct Options {
 impl Options {
    /// Resolves the account, host, port and identity the options name.
    pub fn login(&self) -> Result<Login> {
-      let (identity, key_file) = match self.identity {
-         Some(ref path) => {
-            let (public, private) = if path.extension().is_some_and(|extension| extension == "pub")
-            {
-               (path.clone(), path.with_extension(""))
-            } else {
-               let mut name = path.clone().into_os_string();
-               name.push(".pub");
-               (PathBuf::from(name), path.clone())
-            };
-
-            let text = fs::read_to_string(&public)
-               .with_context(|| format!("reading public key {}", public.display()))?;
-            (Some(text.parse()?), Some(private))
-         },
-         None => (None, None),
+      let (named, alias) = match self.target.split_once('@') {
+         Some((named, alias)) => (Some(named), alias),
+         None => (None, self.target.as_str()),
       };
 
-      let (named, host) = match self.target.split_once('@') {
-         Some((named, host)) => (Some(named), host),
-         None => (None, self.target.as_str()),
+      let mut host = Host::default();
+
+      if let Some(home) = env::var_os("HOME") {
+         host.read(&Path::new(&home).join(".ssh/config"), alias);
+      }
+
+      host.read(Path::new("/etc/ssh/ssh_config"), alias);
+
+      // A key named on the command line must be usable. A configured one is
+      // skipped when it is of a type this program cannot use.
+      let keys = match self.identity {
+         Some(ref path) => vec![Identity::load(path)?],
+         None => {
+            host
+               .identity_files
+               .iter()
+               .filter_map(|file| Identity::load(file).ok())
+               .collect()
+         },
       };
 
       let user = match named.or(self.login.as_deref()) {
          Some(user) => user.to_owned(),
-         None => env::var("USER").context("USER is not set, pass USER@HOST")?,
+         None => {
+            match host.user {
+               Some(user) => user,
+               None => env::var("USER").context("USER is not set, pass USER@HOST")?,
+            }
+         },
       };
 
       Ok(Login {
          user,
-         host: host.to_owned(),
+         host: host.hostname.unwrap_or_else(|| alias.to_owned()),
          port: self.port.unwrap_or(DEFAULT_PORT),
-         identity,
-         key_file,
+         keys,
       })
    }
 }

@@ -123,7 +123,8 @@ fn matches(hosts: &str, name: &str) -> bool {
 }
 
 /// Whether `name` matches a pattern with `*` and `?`.
-fn glob(pattern: &[u8], name: &[u8]) -> bool {
+#[must_use]
+pub fn glob(pattern: &[u8], name: &[u8]) -> bool {
    match pattern.split_first() {
       None => name.is_empty(),
       Some((&b'*', rest)) => (0..=name.len()).any(|skip| glob(rest, &name[skip..])),
