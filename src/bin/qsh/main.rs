@@ -66,9 +66,11 @@ use knell::signals::{
 };
 use misstep::{
    OptionExt as _,
+   Report,
    Result,
    ResultExt as _,
    bail,
+   report,
 };
 use pound::Parse as _;
 use quicsh::{
@@ -122,6 +124,10 @@ use quinn_proto::{
    StreamEvent,
    StreamId,
    VarInt,
+};
+use ring::rand::{
+   SecureRandom as _,
+   SystemRandom,
 };
 use rustix::termios::{
    OptionalActions,
@@ -321,27 +327,43 @@ fn authenticate(
 /// Signs a login with `ssh-keygen`, which reads the key file and asks for its
 /// passphrase, PIN or touch on the terminal.
 fn sign_with_file(file: &Path, message: &[u8]) -> Result<(PublicKey, Vec<u8>)> {
-   let mut child = Command::new("ssh-keygen")
-      .args(["-Y", "sign", "-q", "-n", NAMESPACE, "-f"])
-      .arg(file)
-      .stdin(Stdio::piped())
-      .stdout(Stdio::piped())
-      .spawn()
-      .context("starting ssh-keygen")?;
+   let mut random = [0; 8];
+   SystemRandom::new()
+      .fill(&mut random)
+      .map_err(|_| report!("system random source failed"))?;
 
-   child
-      .stdin
-      .take()
-      .context("ssh-keygen has no stdin")?
-      .write_all(message)?;
+   let directory = env::temp_dir().join(format!("quicsh-{:016x}", u64::from_be_bytes(random)));
+   let input = directory.join("login");
 
-   let output = child.wait_with_output()?;
+   DirBuilder::new()
+      .mode(0o700)
+      .create(&directory)
+      .with_context(|| format!("creating {}", directory.display()))?;
 
-   if !output.status.success() {
-      bail!("ssh-keygen could not sign with {}", file.display());
-   }
+   // ssh-keygen asks for a FIDO PIN on the terminal only when its standard
+   // input is one. So the message goes in a file, the signature comes back
+   // in a second file beside it, and standard input is the terminal even
+   // when this process reads a pipe.
+   let signed = fs::write(&input, message)
+      .map_err(Report::from)
+      .and_then(|()| {
+         let status = Command::new("ssh-keygen")
+            .args(["-Y", "sign", "-q", "-n", NAMESPACE, "-f"])
+            .arg(file)
+            .arg(&input)
+            .stdin(File::open("/dev/tty").map_or_else(|_| Stdio::null(), Stdio::from))
+            .status()
+            .context("starting ssh-keygen")?;
 
-   Ok(armored(&String::from_utf8_lossy(&output.stdout))?)
+         if !status.success() {
+            bail!("ssh-keygen could not sign with {}", file.display());
+         }
+
+         Ok(fs::read_to_string(directory.join("login.sig"))?)
+      });
+
+   let _ = fs::remove_dir_all(&directory);
+   Ok(armored(&signed?)?)
 }
 
 /// Puts the local terminal in raw mode and restores it when dropped.
