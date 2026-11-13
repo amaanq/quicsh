@@ -194,7 +194,12 @@ impl Message {
       frame
    }
 
-   fn decode(payload: &[u8]) -> Result<Self, Error> {
+   /// Reads the payload of one frame, which is the frame without its length.
+   ///
+   /// # Errors
+   ///
+   /// Fails on unknown or malformed content.
+   pub fn decode(payload: &[u8]) -> Result<Self, Error> {
       let mut reader = Reader::new(payload);
 
       let message = match reader.byte()? {

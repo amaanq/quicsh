@@ -1,62 +1,36 @@
 use std::{
-   env,
    fs::File,
-   os::{
-      fd::OwnedFd,
-      unix::process::ExitStatusExt as _,
-   },
-   path::Path,
-   process::{
-      Command,
-      Stdio,
-   },
+   os::fd::OwnedFd,
    sync::{
       Arc,
       mpsc::{
          Receiver,
-         channel,
+         TryRecvError,
       },
    },
-   thread,
    time::{
       Duration,
       Instant,
    },
 };
 
+use bytes::Bytes;
 use eyre::{
    OptionExt as _,
    Result,
-   WrapErr as _,
+   bail,
 };
 use quinn_proto::{
    Connection,
    Dir,
    StreamId,
 };
-use rustix::{
-   process::{
-      Pid,
-      Signal,
-      kill_process_group,
-   },
-   pty::{
-      OpenptFlags,
-      grantpt,
-      ioctl_tiocgptpeer,
-      openpt,
-      unlockpt,
-   },
-   termios::{
-      Winsize,
-      tcsetwinsize,
-   },
+use rustix::termios::{
+   Winsize,
+   tcsetwinsize,
 };
 use ssh_quic::{
-   control::{
-      Open,
-      Size,
-   },
+   control::Size,
    pipe::{
       Waker,
       reader,
@@ -65,11 +39,17 @@ use ssh_quic::{
    relay::Relay,
 };
 
+use crate::privsep::{
+   Helper,
+   Spawned,
+};
+
 /// How long output may keep flowing after the command exits. A background
 /// process that inherited the terminal would otherwise hold the session open.
 const EXIT_GRACE: Duration = Duration::from_millis(200);
+const NO_STATUS: u32 = 255;
 
-const fn winsize(size: Size) -> Winsize {
+pub const fn winsize(size: Size) -> Winsize {
    Winsize {
       ws_col:    size.columns,
       ws_row:    size.rows,
@@ -78,119 +58,75 @@ const fn winsize(size: Size) -> Winsize {
    }
 }
 
+/// The network process's side of a session that the monitor started.
 pub struct Session {
    relay:    Relay,
    errors:   Option<Relay>,
    terminal: Option<OwnedFd>,
-   group:    Pid,
-   exit:     Receiver<u32>,
+   id:       u64,
+   helper:   Helper,
+   /// Yields the exit status once, as four bytes.
+   exit:     Receiver<Bytes>,
    exited:   Option<(u32, Instant)>,
 }
 
 impl Session {
-   /// Starts the command or login shell that `open` asks for as `user`.
-   /// `buffered` and `finished` describe input already read from `stream`.
-   pub fn spawn(
-      open: &Open,
-      user: &str,
-      agent: Option<&Path>,
+   /// Joins `stream` to the descriptors of a started session. `label` is
+   /// the client's number for the session, and `buffered` and `finished`
+   /// describe input already read from `stream`.
+   pub fn adopt(
+      label: u32,
+      spawned: Spawned,
+      helper: Helper,
       stream: StreamId,
       (buffered, finished): (Vec<u8>, bool),
       connection: &mut Connection,
       waker: &Arc<Waker>,
    ) -> Result<Self> {
-      let mut command = Command::new(env::current_exe()?);
-      command.arg("--session").arg(user);
-
-      if let Some(socket) = agent {
-         command.arg("--agent-socket").arg(socket);
-      }
-
-      if let Some(text) = &open.command {
-         command.arg("--command").arg(text);
-      }
-
-      let (mut child, output, input, errors, terminal) = if let Some(terminal) = &open.terminal {
-         let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
-         let master = openpt(flags).wrap_err("opening a terminal")?;
-         grantpt(&master)?;
-         unlockpt(&master)?;
-         tcsetwinsize(&master, winsize(terminal.size))?;
-
-         let slave = ioctl_tiocgptpeer(&master, flags)?;
-
-         command
-            .arg("--term")
-            .arg(&terminal.name)
-            .stdin(slave.try_clone()?)
-            .stdout(slave.try_clone()?)
-            .stderr(slave);
-
-         let child = command.spawn().wrap_err("starting the session process")?;
-         let output = File::from(master.try_clone()?);
-         let input = File::from(master.try_clone()?);
-
-         connection.send_stream(stream).set_priority(1)?;
-         (child, output, input, None, Some(master))
-      } else {
-         command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-         let mut child = command.spawn().wrap_err("starting the session process")?;
-         let output = child.stdout.take().ok_or_eyre("child has no stdout")?;
-         let input = child.stdin.take().ok_or_eyre("child has no stdin")?;
-         let errors = child.stderr.take().ok_or_eyre("child has no stderr")?;
-
-         let side = connection
-            .streams()
-            .open(Dir::Uni)
-            .ok_or_eyre("no stream credit for stderr")?;
-
-         let errors = reader(File::from(OwnedFd::from(errors)), Arc::clone(waker));
-         let mut errors = Relay::new(side, Some(errors), None, Vec::new(), false);
-         errors.prefix(open.session.to_be_bytes().to_vec());
-
-         (
-            child,
-            File::from(OwnedFd::from(output)),
-            File::from(OwnedFd::from(input)),
-            Some(errors),
-            None,
-         )
+      let mut descriptors = spawned.descriptors.into_iter();
+      let count = descriptors.len();
+      let mut next = || {
+         descriptors
+            .next()
+            .ok_or_eyre("monitor sent too few descriptors")
       };
 
-      // The parent's copies of the terminal's child side live in `command`,
-      // and the terminal reports end of output only once they are closed.
-      drop(command);
+      let (input, output, errors, terminal, status) = match count {
+         2 => {
+            let master = next()?;
+            let input = master.try_clone()?;
+            let output = master.try_clone()?;
 
-      let output = reader(output, Arc::clone(waker));
-      let (input, _) = writer(input, Arc::clone(waker));
-      let group = Pid::from_child(&child);
+            connection.send_stream(stream).set_priority(1)?;
+            (input, output, None, Some(master), next()?)
+         },
+         4 => {
+            let (input, output, errors) = (next()?, next()?, next()?);
 
-      let (status, exit) = channel();
-      let reaper = Arc::clone(waker);
+            let side = connection
+               .streams()
+               .open(Dir::Uni)
+               .ok_or_eyre("no stream credit for stderr")?;
 
-      thread::spawn(move || {
-         let code = child.wait().map_or(255, |status| {
-            status
-               .code()
-               .or_else(|| status.signal().map(|signal| 128 + signal))
-               .and_then(|code| u32::try_from(code).ok())
-               .unwrap_or(255)
-         });
+            let errors = reader(File::from(errors), Arc::clone(waker));
+            let mut errors = Relay::new(side, Some(errors), None, Vec::new(), false);
+            errors.prefix(label.to_be_bytes().to_vec());
 
-         let _ = status.send(code);
-         reaper.wake();
-      });
+            (input, output, Some(errors), None, next()?)
+         },
+         _ => bail!("monitor sent an unexpected set of descriptors"),
+      };
+
+      let output = reader(File::from(output), Arc::clone(waker));
+      let (input, _) = writer(File::from(input), Arc::clone(waker));
 
       Ok(Self {
          relay: Relay::new(stream, Some(output), Some(input), buffered, finished),
          errors,
          terminal,
-         group,
-         exit,
+         id: spawned.session,
+         helper,
+         exit: reader(File::from(status), Arc::clone(waker)),
          exited: None,
       })
    }
@@ -211,10 +147,20 @@ impl Session {
          errors.pump(connection)?;
       }
 
-      if self.exited.is_none()
-         && let Ok(status) = self.exit.try_recv()
-      {
-         self.exited = Some((status, now));
+      if self.exited.is_none() {
+         let status = match self.exit.try_recv() {
+            Ok(bytes) => {
+               Some(
+                  bytes
+                     .first_chunk()
+                     .map_or(NO_STATUS, |raw| u32::from_be_bytes(*raw)),
+               )
+            },
+            Err(TryRecvError::Disconnected) => Some(NO_STATUS),
+            Err(TryRecvError::Empty) => None,
+         };
+
+         self.exited = status.map(|status| (status, now));
       }
 
       let Some((status, at)) = self.exited else {
@@ -245,10 +191,8 @@ impl Session {
 
 impl Drop for Session {
    fn drop(&mut self) {
-      // The session process leads its own process group, so this reaches the
-      // command and its foreground children when the client goes away.
       if self.exited.is_none() {
-         let _ = kill_process_group(self.group, Signal::HUP);
+         self.helper.hangup(self.id);
       }
    }
 }

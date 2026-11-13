@@ -25,9 +25,11 @@ use eyre::{
 use rustix::{
    process::{
       Gid,
+      Signal,
       Uid,
       geteuid,
       ioctl_tiocsctty,
+      set_parent_process_death_signal,
       setsid,
    },
    thread::{
@@ -73,6 +75,10 @@ impl Launch {
             account.name
          );
       }
+
+      // The kernel clears this setting when the uid changes, so it comes
+      // after the switch. A monitor that dies can hang nothing up itself.
+      set_parent_process_death_signal(Some(Signal::HUP))?;
 
       let mut shell = Command::new(&account.shell);
 

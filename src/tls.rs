@@ -39,7 +39,10 @@ use rustls::{
       UnixTime,
    },
    server::AlwaysResolvesServerRawPublicKeys,
-   sign::CertifiedKey,
+   sign::{
+      CertifiedKey,
+      SigningKey,
+   },
    version::TLS13,
 };
 
@@ -68,13 +71,19 @@ pub fn generate_key() -> Result<PrivatePkcs8KeyDer<'static>, Error> {
    Ok(PrivatePkcs8KeyDer::from(pkcs8.as_ref().to_vec()))
 }
 
-/// Presents `key` as an RFC 7250 raw public key.
-///
 /// # Errors
 ///
 /// Fails when `key` is not a valid ed25519 PKCS#8 document.
-pub fn server(key: &PrivatePkcs8KeyDer<'_>) -> Result<Arc<QuicServerConfig>, Error> {
-   let signer = any_eddsa_type(key).map_err(Error::Tls)?;
+pub fn signing_key(key: &PrivatePkcs8KeyDer<'_>) -> Result<Arc<dyn SigningKey>, Error> {
+   any_eddsa_type(key).map_err(Error::Tls)
+}
+
+/// Presents the public half of `signer` as an RFC 7250 raw public key.
+///
+/// # Errors
+///
+/// Fails when `signer` cannot name its public key.
+pub fn server(signer: Arc<dyn SigningKey>) -> Result<Arc<QuicServerConfig>, Error> {
    let public = signer.public_key().ok_or(Error::PublicKey)?;
    let certified = CertifiedKey::new(vec![CertificateDer::from(public.to_vec())], signer);
 

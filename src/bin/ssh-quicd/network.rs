@@ -1,0 +1,541 @@
+//! The unprivileged process. It runs QUIC and TLS, parses what clients send
+//! and moves session data, and it asks the monitor for anything privileged.
+
+use std::{
+   collections::HashMap,
+   io,
+   net::Ipv4Addr,
+   os::{
+      fd::AsFd as _,
+      unix::net::UnixListener,
+   },
+   sync::Arc,
+   time::{
+      Duration,
+      Instant,
+   },
+};
+
+use bytes::Bytes;
+use eyre::{
+   OptionExt as _,
+   Result,
+   bail,
+};
+use quinn_proto::{
+   Connection,
+   ConnectionHandle,
+   Dir,
+   Event,
+   StreamEvent,
+   StreamId,
+   VarInt,
+};
+use rustix::{
+   process::{
+      Signal,
+      set_parent_process_death_signal,
+   },
+   thread::set_no_new_privs,
+};
+use rustls::{
+   SignatureAlgorithm,
+   SignatureScheme,
+   pki_types::SubjectPublicKeyInfoDer,
+   sign::{
+      Signer,
+      SigningKey,
+   },
+};
+use ssh_quic::{
+   auth::exporter,
+   control::{
+      Deframer,
+      Message,
+      Outbox,
+   },
+   forward::{
+      Acceptor,
+      Forwards,
+   },
+   pipe::Waker,
+   relay::Relay,
+   tls,
+   transport::{
+      App,
+      Transport,
+      Tuning,
+      drain,
+   },
+};
+
+use crate::{
+   privsep::Helper,
+   session::Session,
+};
+
+const LOGIN_GRACE: Duration = Duration::from_secs(120);
+const MAX_ATTEMPTS: u32 = 6;
+const MAX_SESSIONS: usize = 64;
+const MAX_LISTENERS: usize = 16;
+const MAX_FORWARDS: usize = 256;
+const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
+const PROTOCOL_ERROR: VarInt = VarInt::from_u32(1);
+const AUTH_FAILED: VarInt = VarInt::from_u32(2);
+/// A host key that only the monitor can sign with.
+#[derive(Debug)]
+struct RemoteKey {
+   helper: Helper,
+   public: Vec<u8>,
+}
+
+impl SigningKey for RemoteKey {
+   fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+      offered
+         .contains(&SignatureScheme::ED25519)
+         .then(|| Box::new(RemoteSigner(self.helper.clone())) as Box<dyn Signer>)
+   }
+
+   fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+      Some(SubjectPublicKeyInfoDer::from(self.public.as_slice()))
+   }
+
+   fn algorithm(&self) -> SignatureAlgorithm {
+      SignatureAlgorithm::ED25519
+   }
+}
+
+#[derive(Debug)]
+struct RemoteSigner(Helper);
+
+impl Signer for RemoteSigner {
+   fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+      self
+         .0
+         .sign(message)
+         .map_err(|error| rustls::Error::General(format!("{error:#}")))
+   }
+
+   fn scheme(&self) -> SignatureScheme {
+      SignatureScheme::ED25519
+   }
+}
+
+/// A login the monitor accepted. Dropping it ends the monitor's record of
+/// the login and removes the agent socket.
+struct Grant {
+   id:     u64,
+   helper: Helper,
+}
+
+impl Drop for Grant {
+   fn drop(&mut self) {
+      self.helper.logout(self.id);
+   }
+}
+
+struct Peer {
+   control:   Option<StreamId>,
+   deframer:  Deframer,
+   outbox:    Outbox,
+   attempts:  u32,
+   grant:     Option<Grant>,
+   deadline:  Instant,
+   /// Client streams whose opening frame has not fully arrived.
+   opening:   HashMap<StreamId, Deframer>,
+   sessions:  HashMap<u32, Session>,
+   forwards:  Forwards,
+   listeners: HashMap<u32, Acceptor>,
+   agent:     Option<Acceptor>,
+}
+
+struct Server {
+   peers:  HashMap<ConnectionHandle, Peer>,
+   helper: Helper,
+   waker:  Arc<Waker>,
+}
+
+impl Server {
+   fn control(
+      &mut self,
+      now: Instant,
+      handle: ConnectionHandle,
+      connection: &mut Connection,
+   ) -> Result<()> {
+      let peer = self
+         .peers
+         .get_mut(&handle)
+         .ok_or_eyre("data before the handshake finished")?;
+      let control = peer
+         .control
+         .ok_or_eyre("data before the control stream opened")?;
+
+      for bytes in drain(connection, control)?.0 {
+         peer.deframer.push(&bytes);
+      }
+
+      while let Some(message) = peer.deframer.pop()? {
+         match message {
+            Message::Request(request) => {
+               if peer.grant.is_some() {
+                  bail!("second login on an authenticated connection");
+               }
+
+               peer.attempts += 1;
+
+               if peer.attempts > MAX_ATTEMPTS {
+                  connection.close(now, AUTH_FAILED, Bytes::from_static(b"too many attempts"));
+                  return Ok(());
+               }
+
+               let label = format!("{} for {}", request.key.fingerprint(), request.user);
+               let granted = self.helper.login(request, exporter(connection)?)?;
+
+               let reply = if granted.is_some() {
+                  println!("accepted {label} from {}", connection.remote_address());
+                  Message::Accepted
+               } else {
+                  Message::Rejected
+               };
+               peer.outbox.push(&reply);
+
+               peer.grant = granted.map(|id| {
+                  Grant {
+                     id,
+                     helper: self.helper.clone(),
+                  }
+               });
+            },
+            Message::Resize { session, size } => {
+               if let Some(session) = peer.sessions.get(&session) {
+                  session.resize(size)?;
+               }
+            },
+            Message::Listen { listener, port } => {
+               if peer.grant.is_none() {
+                  bail!("forward before login");
+               }
+
+               // The listener is reachable from this host only.
+               let allowed = (port == 0 || port >= FIRST_UNPRIVILEGED_PORT)
+                  && peer.listeners.len() < MAX_LISTENERS
+                  && !peer.listeners.contains_key(&listener);
+
+               let bound = allowed
+                  .then(|| Acceptor::tcp((Ipv4Addr::LOCALHOST, port).into(), &self.waker).ok())
+                  .flatten();
+
+               let reply = match bound {
+                  Some((acceptor, port)) => {
+                     peer.listeners.insert(listener, acceptor);
+                     Message::Listening { listener, port }
+                  },
+                  None => Message::Refused { listener },
+               };
+
+               peer.outbox.push(&reply);
+            },
+            _ => bail!("unexpected control message"),
+         }
+      }
+
+      Ok(())
+   }
+
+   /// Reads a new client stream until its opening frame is complete, then
+   /// starts what the frame asks for.
+   fn opening(
+      &mut self,
+      handle: ConnectionHandle,
+      connection: &mut Connection,
+      stream: StreamId,
+   ) -> Result<()> {
+      let peer = self
+         .peers
+         .get_mut(&handle)
+         .ok_or_eyre("stream on an unknown connection")?;
+      let grant = peer.grant.as_ref().ok_or_eyre("stream before login")?.id;
+
+      let Some(deframer) = peer.opening.get_mut(&stream) else {
+         return Ok(());
+      };
+
+      let (received, finished) = drain(connection, stream)?;
+
+      for bytes in received {
+         deframer.push(&bytes);
+      }
+
+      let Some(message) = deframer.pop()? else {
+         return Ok(());
+      };
+
+      let buffered = peer
+         .opening
+         .remove(&stream)
+         .map_or_else(Vec::new, Deframer::into_rest);
+
+      match message {
+         Message::Open(open) => {
+            if peer.sessions.contains_key(&open.session) || peer.sessions.len() >= MAX_SESSIONS {
+               bail!("session id reused or too many sessions");
+            }
+
+            if open.agent && peer.agent.is_none() {
+               let listener = UnixListener::from(self.helper.agent(grant)?);
+               peer.agent = Some(Acceptor::unix(listener, &self.waker)?);
+            }
+
+            let label = open.session;
+            let spawned = self.helper.spawn(grant, open)?;
+
+            let session = Session::adopt(
+               label,
+               spawned,
+               self.helper.clone(),
+               stream,
+               (buffered, finished),
+               connection,
+               &self.waker,
+            )?;
+
+            peer.sessions.insert(label, session);
+         },
+         Message::Connect { host, port } => {
+            if peer.forwards.len() >= MAX_FORWARDS {
+               Relay::abort(connection, stream);
+               return Ok(());
+            }
+
+            peer
+               .forwards
+               .dial(stream, (host, port), (buffered, finished), &self.waker);
+         },
+         _ => bail!("stream did not start with an opening frame"),
+      }
+
+      Ok(())
+   }
+
+   fn handle(
+      &mut self,
+      now: Instant,
+      handle: ConnectionHandle,
+      connection: &mut Connection,
+      event: &Event,
+   ) -> Result<()> {
+      match *event {
+         Event::Connected => {
+            self.peers.insert(handle, Peer {
+               control:   None,
+               deframer:  Deframer::default(),
+               outbox:    Outbox::default(),
+               attempts:  0,
+               grant:     None,
+               deadline:  now + LOGIN_GRACE,
+               opening:   HashMap::new(),
+               sessions:  HashMap::new(),
+               forwards:  Forwards::default(),
+               listeners: HashMap::new(),
+               agent:     None,
+            });
+         },
+         Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
+            while let Some(id) = connection.streams().accept(Dir::Bi) {
+               let peer = self
+                  .peers
+                  .get_mut(&handle)
+                  .ok_or_eyre("stream before the handshake finished")?;
+
+               if peer.control.is_none() {
+                  peer.control = Some(id);
+                  self.control(now, handle, connection)?;
+               } else {
+                  peer.opening.insert(id, Deframer::default());
+                  self.opening(handle, connection, id)?;
+               }
+            }
+         },
+         Event::Stream(StreamEvent::Opened { dir: Dir::Uni }) => {
+            bail!("clients do not open unidirectional streams");
+         },
+         Event::Stream(StreamEvent::Readable { id }) => {
+            let peer = self
+               .peers
+               .get(&handle)
+               .ok_or_eyre("data on an unknown connection")?;
+
+            if peer.control == Some(id) {
+               self.control(now, handle, connection)?;
+            } else {
+               self.opening(handle, connection, id)?;
+            }
+         },
+         Event::ConnectionLost { .. } => {
+            self.peers.remove(&handle);
+         },
+         _ => {},
+      }
+
+      Ok(())
+   }
+
+   /// Moves session and forward data and reports finished sessions. Returns
+   /// the next instant this connection needs attention.
+   fn pump(
+      &mut self,
+      now: Instant,
+      handle: ConnectionHandle,
+      connection: &mut Connection,
+   ) -> Result<Option<Instant>> {
+      let Some(peer) = self.peers.get_mut(&handle) else {
+         return Ok(None);
+      };
+
+      let mut finished = Vec::new();
+
+      for (&id, session) in &mut peer.sessions {
+         if let Some(status) = session.pump(now, connection)? {
+            finished.push((id, status));
+         }
+      }
+
+      for (session, status) in finished {
+         peer.sessions.remove(&session);
+         peer.outbox.push(&Message::Exit { session, status });
+      }
+
+      if let Some(control) = peer.control {
+         peer.outbox.flush(connection, control)?;
+      }
+
+      let mut accepted = Vec::new();
+
+      for (&listener, acceptor) in &peer.listeners {
+         while let Some(socket) = acceptor.poll() {
+            accepted.push((Message::Forwarded { listener }, socket));
+         }
+      }
+
+      while let Some(socket) = peer.agent.as_ref().and_then(Acceptor::poll) {
+         accepted.push((Message::Agent, socket));
+      }
+
+      for (opening, socket) in accepted {
+         if peer.forwards.len() >= MAX_FORWARDS {
+            break;
+         }
+
+         let Some(stream) = connection.streams().open(Dir::Bi) else {
+            break;
+         };
+
+         peer.forwards.open(stream, &opening, socket, &self.waker)?;
+      }
+
+      peer.forwards.pump(connection, &self.waker)?;
+
+      let login = peer.grant.is_none().then_some(peer.deadline);
+      Ok(peer
+         .sessions
+         .values()
+         .filter_map(Session::deadline)
+         .chain(login)
+         .min())
+   }
+
+   fn drop_peer(&mut self, now: Instant, handle: ConnectionHandle, connection: &mut Connection) {
+      connection.close(now, PROTOCOL_ERROR, Bytes::from_static(b"protocol error"));
+      self.peers.remove(&handle);
+   }
+}
+
+impl App for Server {
+   type Error = eyre::Report;
+
+   fn event(
+      &mut self,
+      now: Instant,
+      handle: ConnectionHandle,
+      connection: &mut Connection,
+      event: Event,
+   ) -> Result<()> {
+      // One client's protocol violation ends that connection and leaves the
+      // server running.
+      if let Err(error) = self.handle(now, handle, connection, &event) {
+         eprintln!("closing {}: {error:#}", connection.remote_address());
+         self.drop_peer(now, handle, connection);
+      }
+
+      Ok(())
+   }
+
+   fn tick(
+      &mut self,
+      now: Instant,
+      handle: ConnectionHandle,
+      connection: &mut Connection,
+   ) -> Result<Option<Instant>> {
+      self.waker.clear();
+
+      let deadline = match self.pump(now, handle, connection) {
+         Ok(deadline) => deadline,
+         Err(error) => {
+            eprintln!("closing {}: {error:#}", connection.remote_address());
+            self.drop_peer(now, handle, connection);
+            return Ok(None);
+         },
+      };
+
+      let expired = self
+         .peers
+         .get(&handle)
+         .is_some_and(|peer| peer.grant.is_none() && now >= peer.deadline);
+
+      if expired && !connection.is_closed() {
+         connection.close(now, AUTH_FAILED, Bytes::from_static(b"login timed out"));
+         self.peers.remove(&handle);
+         return Ok(None);
+      }
+
+      Ok(deadline)
+   }
+
+   fn done(&self) -> bool {
+      false
+   }
+
+   fn waker(&self) -> Option<&Waker> {
+      Some(&self.waker)
+   }
+}
+
+/// Serves clients on the socket the monitor hands over, and stops with the
+/// monitor, since a second server could otherwise share the port with it.
+pub fn run() -> Result<()> {
+   set_no_new_privs(true)?;
+   set_parent_process_death_signal(Some(Signal::TERM))?;
+
+   let helper = Helper::new(io::stdin().as_fd().try_clone_to_owned()?);
+   let (public, listen, socket) = helper.hello()?;
+
+   let crypto = tls::server(Arc::new(RemoteKey {
+      helper: helper.clone(),
+      public,
+   }))?;
+
+   let sockets = helper.clone();
+   let opener = Box::new(move |local, remote| {
+      sockets
+         .socket(local, remote)
+         .map_err(|error| io::Error::other(format!("{error:#}")))
+   });
+
+   let mut server = Server {
+      peers: HashMap::new(),
+      helper,
+      waker: Arc::new(Waker::new()?),
+   };
+
+   Transport::adopt(socket, listen, crypto, Tuning::default(), opener)?.run(&mut server)
+}

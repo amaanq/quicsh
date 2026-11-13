@@ -15,7 +15,6 @@ use std::{
       fd::OwnedFd,
       unix::net::UnixListener,
    },
-   path::Path,
    sync::{
       Arc,
       atomic::{
@@ -79,13 +78,12 @@ impl Acceptor {
       Ok((Self::spawn(handle, accept, waker), port))
    }
 
-   /// Listens on a new Unix socket at `path`.
+   /// Accepts on a Unix socket that is already listening.
    ///
    /// # Errors
    ///
-   /// Fails when the socket cannot be created.
-   pub fn unix(path: &Path, waker: &Arc<Waker>) -> Result<Self, Error> {
-      let listener = UnixListener::bind(path).map_err(Error::Forward)?;
+   /// Fails when the process is out of file descriptors.
+   pub fn unix(listener: UnixListener, waker: &Arc<Waker>) -> Result<Self, Error> {
       let handle = listener.try_clone().map_err(Error::Forward)?.into();
       let accept = move || Ok(OwnedFd::from(listener.accept()?.0));
 

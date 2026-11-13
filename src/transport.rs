@@ -21,6 +21,7 @@ use std::{
       SocketAddr,
       UdpSocket,
    },
+   os::fd::OwnedFd,
    str::FromStr,
    sync::Arc,
    time::{
@@ -225,6 +226,35 @@ pub fn drain(connection: &mut Connection, id: StreamId) -> Result<(Vec<Bytes>, b
    Ok((received, finished))
 }
 
+/// A UDP socket bound to `local` that shares the port with other sockets,
+/// and connected to `remote` when one is given.
+///
+/// # Errors
+///
+/// Fails when the address cannot be bound, as for a port under 1024 without
+/// the privilege to use it.
+pub fn udp_socket(local: SocketAddr, remote: Option<SocketAddr>) -> io::Result<OwnedFd> {
+   let family = if local.is_ipv4() {
+      AddressFamily::INET
+   } else {
+      AddressFamily::INET6
+   };
+
+   let fd = socket_with(family, SocketType::DGRAM, SocketFlags::CLOEXEC, None)?;
+   set_socket_reuseport(&fd, true)?;
+   bind(&fd, &local)?;
+
+   if let Some(remote) = remote {
+      connect(&fd, &remote)?;
+   }
+
+   Ok(fd)
+}
+
+/// Makes the socket for one accepted connection, bound to the first address
+/// and connected to the second.
+pub type Opener = Box<dyn Fn(SocketAddr, SocketAddr) -> io::Result<OwnedFd>>;
+
 struct Socket {
    io:    UdpSocket,
    state: UdpSocketState,
@@ -232,21 +262,11 @@ struct Socket {
 
 impl Socket {
    fn open(local: SocketAddr, remote: Option<SocketAddr>) -> Result<Self, Error> {
-      let family = if local.is_ipv4() {
-         AddressFamily::INET
-      } else {
-         AddressFamily::INET6
-      };
+      Self::adopt(udp_socket(local, remote).map_err(Error::Socket)?)
+   }
 
+   fn adopt(fd: OwnedFd) -> Result<Self, Error> {
       let setup = || {
-         let fd = socket_with(family, SocketType::DGRAM, SocketFlags::CLOEXEC, None)?;
-         set_socket_reuseport(&fd, true)?;
-         bind(&fd, &local)?;
-
-         if let Some(remote) = remote {
-            connect(&fd, &remote)?;
-         }
-
          let io = UdpSocket::from(fd);
          let state = UdpSocketState::new((&io).into())?;
          state.set_send_buffer_size((&io).into(), SOCKET_BUFFER)?;
@@ -373,6 +393,7 @@ struct Listener {
    socket: Socket,
    local:  SocketAddr,
    config: ServerConfig,
+   opener: Opener,
 }
 
 #[derive(Clone, Copy)]
@@ -410,10 +431,30 @@ impl Transport {
       crypto: Arc<QuicServerConfig>,
       tuning: Tuning,
    ) -> Result<Self, Error> {
+      let socket = udp_socket(local, None).map_err(Error::Socket)?;
+      let opener = Box::new(|local, remote| udp_socket(local, Some(remote)));
+
+      Self::adopt(socket, local, crypto, tuning, opener)
+   }
+
+   /// A transport that accepts connections on `socket`, which is bound to
+   /// `local`, and gets each connection's own socket from `opener`.
+   ///
+   /// # Errors
+   ///
+   /// Fails when `socket` is not a usable UDP socket.
+   pub fn adopt(
+      socket: OwnedFd,
+      local: SocketAddr,
+      crypto: Arc<QuicServerConfig>,
+      tuning: Tuning,
+      opener: Opener,
+   ) -> Result<Self, Error> {
       let listener = Listener {
-         socket: Socket::open(local, None)?,
+         socket: Socket::adopt(socket)?,
          local,
          config: ServerConfig::with_crypto(crypto),
+         opener,
       };
 
       Self::build(Some(listener), tuning)
@@ -647,8 +688,9 @@ impl Transport {
          .count();
 
       let socket = (handshaking < MAX_HANDSHAKES)
-         .then(|| Socket::open(local, Some(remote)).ok())
-         .flatten();
+         .then(|| (listener.opener)(local, remote).ok())
+         .flatten()
+         .and_then(|fd| Socket::adopt(fd).ok());
 
       let Some(socket) = socket else {
          let refusal = self.endpoint.refuse(incoming, &mut self.send);
