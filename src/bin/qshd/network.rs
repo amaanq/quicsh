@@ -43,6 +43,7 @@ use quicsh::{
       Acceptor,
       Forwards,
    },
+   key::PublicKey,
    pipe::Waker,
    relay::Relay,
    tls,
@@ -119,13 +120,18 @@ struct RemoteKey {
    helper: Helper,
    /// The public half as a `SubjectPublicKeyInfo` document.
    public: Vec<u8>,
+   /// How a key of this type signs.
+   scheme: SignatureScheme,
 }
 
 impl SigningKey for RemoteKey {
    fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
-      offered
-         .contains(&SignatureScheme::ED25519)
-         .then(|| Box::new(RemoteSigner(self.helper.clone())) as Box<dyn Signer>)
+      offered.contains(&self.scheme).then(|| {
+         Box::new(RemoteSigner {
+            helper: self.helper.clone(),
+            scheme: self.scheme,
+         }) as Box<dyn Signer>
+      })
    }
 
    fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
@@ -133,24 +139,33 @@ impl SigningKey for RemoteKey {
    }
 
    fn algorithm(&self) -> SignatureAlgorithm {
-      SignatureAlgorithm::ED25519
+      if self.scheme == SignatureScheme::ED25519 {
+         SignatureAlgorithm::ED25519
+      } else {
+         SignatureAlgorithm::ECDSA
+      }
    }
 }
 
 /// Signs through the monitor.
 #[derive(Debug)]
-struct RemoteSigner(Helper);
+struct RemoteSigner {
+   /// Reaches the monitor.
+   helper: Helper,
+   /// How the monitor's key signs.
+   scheme: SignatureScheme,
+}
 
 impl Signer for RemoteSigner {
    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
       self
-         .0
+         .helper
          .sign(message)
          .map_err(|error| rustls::Error::General(format!("{error}")))
    }
 
    fn scheme(&self) -> SignatureScheme {
-      SignatureScheme::ED25519
+      self.scheme
    }
 }
 
@@ -714,9 +729,11 @@ pub fn run(congestion: Congestion) -> Result<()> {
       bail!("unexpected reply from the monitor");
    };
 
+   let scheme = tls::scheme(&PublicKey::from_spki(&public)?)?;
    let crypto = tls::server(Arc::new(RemoteKey {
       helper: helper.clone(),
       public,
+      scheme,
    }))?;
 
    let sockets = helper.clone();

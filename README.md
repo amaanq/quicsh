@@ -187,7 +187,7 @@ batch into real packets there, and I haven't measured it between two machines.
   so a changed host key is always refused.
 - P-521 keys, RSA keys under 2048 bits and RSA signatures over SHA-1.
   `ecdsa-sk` keys are accepted but nobody has tried one.
-- Host keys other than `ed25519`.
+- RSA host keys. `qshd` takes an `ed25519`, P-256 or P-384 key.
 - A few `authorized_keys` options. `command=`, `from=`, `expiry-time=`,
   `permitopen=`, `permitlisten=`, `restrict`, `no-touch-required`,
   `verify-required` and the `pty`, `agent-forwarding` and `port-forwarding`

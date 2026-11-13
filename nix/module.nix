@@ -51,7 +51,8 @@ in
       type = lib.types.path;
       default = "/etc/ssh/ssh_host_ed25519_key";
       description = ''
-        The ed25519 host key in OpenSSH format. It is generated when missing.
+        The host key in OpenSSH format, an ed25519, P-256 or P-384 key. An ed25519
+        key is generated when missing.
       '';
     };
 

@@ -44,7 +44,7 @@ pub enum Error {
    Base64,
    #[error("unsupported key type")]
    KeyType,
-   #[error("not an unencrypted OpenSSH ed25519 private key")]
+   #[error("not an unencrypted OpenSSH ed25519, P-256 or P-384 private key")]
    PrivateKey,
    #[error("signature does not verify")]
    Signature,
@@ -52,7 +52,7 @@ pub enum Error {
    Agent(#[source] io::Error),
    #[error("the SSH agent refused the request")]
    AgentRefused,
-   #[error("peer presented no ed25519 key")]
+   #[error("peer presented no key of a usable type")]
    PeerKey,
    #[error("TLS exporter is unavailable")]
    Exporter,

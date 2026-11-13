@@ -19,7 +19,7 @@ pub struct Options {
    /// and the default is [::]:22.
    #[pound(long, value_name = "ADDR:PORT")]
    pub listen:          Option<SocketAddr>,
-   /// The ed25519 host key in OpenSSH format.
+   /// The host key in OpenSSH format, an ed25519, P-256 or P-384 key.
    #[pound(long, value_name = "FILE", default = "/etc/ssh/ssh_host_ed25519_key")]
    pub host_key:        PathBuf,
    /// Check every login against FILE instead of each account's own key file.

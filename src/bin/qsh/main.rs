@@ -253,7 +253,7 @@ fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
       },
       Strict::Ask => {
          eprint!(
-            "The authenticity of host '[{named}]:{}' can't be established.\nED25519 key \
+            "The authenticity of host '[{named}]:{}' can't be established.\nHost key \
              fingerprint is {fingerprint}.\nAre you sure you want to continue connecting \
              (yes/no)? ",
             login.port

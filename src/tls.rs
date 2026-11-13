@@ -23,13 +23,13 @@ use rustls::{
       WebPkiSupportedAlgorithms,
       ring::{
          default_provider,
-         sign::any_eddsa_type,
+         sign::any_supported_type,
       },
       verify_tls13_signature_with_raw_key,
    },
    pki_types::{
       CertificateDer,
-      PrivatePkcs8KeyDer,
+      PrivateKeyDer,
       ServerName,
       SubjectPublicKeyInfoDer,
       UnixTime,
@@ -45,7 +45,10 @@ use rustls::{
 use crate::{
    error::Error,
    kex::X25519_MLKEM768,
-   key::PublicKey,
+   key::{
+      Curve,
+      PublicKey,
+   },
 };
 
 /// ALPN protocol name.
@@ -61,11 +64,38 @@ fn provider() -> Arc<CryptoProvider> {
    Arc::new(provider)
 }
 
+/// The signature schemes a host key may use, one per key type.
+pub const HOST_SCHEMES: [SignatureScheme; 3] = [
+   SignatureScheme::ED25519,
+   SignatureScheme::ECDSA_NISTP256_SHA256,
+   SignatureScheme::ECDSA_NISTP384_SHA384,
+];
+
+/// The scheme a host key of this type signs handshakes with.
+///
 /// # Errors
 ///
-/// Fails when `key` is not a valid ed25519 PKCS#8 document.
-pub fn signing_key(key: &PrivatePkcs8KeyDer<'_>) -> Result<Arc<dyn SigningKey>, Error> {
-   any_eddsa_type(key).map_err(Error::Tls)
+/// Fails for a key type that cannot be a host key.
+pub const fn scheme(key: &PublicKey) -> Result<SignatureScheme, Error> {
+   match *key {
+      PublicKey::Ed25519(_) => Ok(SignatureScheme::ED25519),
+      PublicKey::Ecdsa {
+         curve: Curve::P256, ..
+      } => Ok(SignatureScheme::ECDSA_NISTP256_SHA256),
+      PublicKey::Ecdsa {
+         curve: Curve::P384, ..
+      } => Ok(SignatureScheme::ECDSA_NISTP384_SHA384),
+      PublicKey::SkEd25519 { .. } | PublicKey::SkEcdsa { .. } | PublicKey::Rsa { .. } => {
+         Err(Error::KeyType)
+      },
+   }
+}
+
+/// # Errors
+///
+/// Fails when `key` is not a valid private key document.
+pub fn signing_key(key: &PrivateKeyDer<'_>) -> Result<Arc<dyn SigningKey>, Error> {
+   any_supported_type(key).map_err(Error::Tls)
 }
 
 /// Presents the public half of `signer` as an RFC 7250 raw public key.
@@ -116,7 +146,8 @@ pub fn client() -> Result<Arc<QuicClientConfig>, Error> {
 ///
 /// # Errors
 ///
-/// Fails before the handshake completes or when the peer sent no ed25519 key.
+/// Fails before the handshake completes or when the peer sent no key of a
+/// usable type.
 pub fn peer_key(connection: &Connection) -> Result<PublicKey, Error> {
    let chain = connection
       .crypto_session()

@@ -76,7 +76,10 @@ use quicsh::{
    },
    key::private_from_openssh,
    pipe::reopen,
-   tls,
+   tls::{
+      self,
+      HOST_SCHEMES,
+   },
    transport::{
       Congestion,
       udp_socket,
@@ -105,10 +108,7 @@ use rustix::{
       kill_process_group,
    },
 };
-use rustls::{
-   SignatureScheme,
-   sign::SigningKey,
-};
+use rustls::sign::SigningKey;
 
 use crate::{
    child::exit_code,
@@ -228,8 +228,8 @@ impl Monitor {
 
       let signer = self
          .key
-         .choose_scheme(&[SignatureScheme::ED25519])
-         .context("host key is not ed25519")?;
+         .choose_scheme(&HOST_SCHEMES)
+         .context("host key is of no usable type")?;
 
       Ok(Reply::Signature(signer.sign(message)?))
    }
