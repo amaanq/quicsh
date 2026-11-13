@@ -1,7 +1,12 @@
 [package]
-name    = "quicsh"
-version = "0.1.0"
-edition = "2024"
+name        = "quicsh"
+version     = "0.1.0"
+edition     = "2024"
+description = "SSH replacement over QUIC with a privilege-separated server"
+repository  = "https://github.com/amaanq/quicsh"
+license     = "EUPL-1.2"
+keywords    = [ "port-forwarding", "quic", "remote-shell", "ssh", "tunnel" ]
+categories  = [ "command-line-utilities", "network-programming" ]
 
 [dependencies]
 bytes       = "1.12.1"
