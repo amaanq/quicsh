@@ -11,6 +11,7 @@
 !Cargo.toml
 !LICENSE
 !README.md
+!bench.nu
 !flake.lock
 !flake.nix
 

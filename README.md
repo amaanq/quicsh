@@ -216,6 +216,13 @@ So it's a lot better on a slow or lossy network and about even on a clean
 one. Loopback is kind to QUIC though, since the kernel never has to split a
 batch into real packets there, and I haven't measured it between two machines.
 
+`bench.nu` takes those measurements between two machines. It runs `qsh` and
+`ssh` in turns against a host that has both servers and prints the medians.
+
+```sh
+nu bench.nu host --identity ~/.ssh/id_bench
+```
+
 ## What's missing
 
 - Passwords and PAM. Keys only.
