@@ -607,11 +607,17 @@ impl Client {
       Ok(())
    }
 
+   /// Whether there is no session and only ports are forwarded.
+   const fn sessionless(&self) -> bool {
+      self.shell.is_none() && self.session.is_none() && self.relay.is_none()
+   }
+
    /// Whether a new connection could take over. A session can, since the
-   /// server keeps it, and so can a UDP relay, which has no state on the
-   /// server worth keeping.
+   /// server keeps it. So can a UDP relay and a client that only forwards
+   /// ports, which have no state on the server worth keeping.
    const fn resumable(&self) -> bool {
       self.relay.is_some()
+         || self.sessionless() && (self.accepted || self.lost.is_some())
          || self.token.is_some() && self.session.is_some() && self.status.is_none()
    }
 
@@ -932,6 +938,10 @@ impl Client {
                self.next = None;
                self.accepted = true;
                self.listen();
+
+               if self.sessionless() && self.lost.take().is_some() {
+                  eprintln!("qsh: reconnected");
+               }
 
                self.associate(connection)?;
 

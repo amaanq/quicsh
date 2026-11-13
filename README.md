@@ -35,6 +35,8 @@ afford to lose :)
 - Restarting `qshd` under a session. The session lives in a process of its
   own, and `qsh` reattaches with the next packet it sends, a keystroke, data
   or the keep-alive that goes out every 15 seconds
+- `qsh -N` reconnects after an outage or a restart too, and its `-L`, `-R` and
+  `-D` listeners work again
 - `ed25519`, ECDSA (P-256, P-384 and P-521) and RSA keys, signed through
   `ssh-agent` or `ssh-keygen`
 - `ed25519-sk` keys in the same way, with the PIN and the touch
@@ -200,8 +202,8 @@ batch into real packets there, and I haven't measured it between two machines.
   skipped instead of being honored without its restriction. `from=` matches
   addresses and networks and never host names. An `expiry-time=` without a
   `Z` ends up to a day early, since `qshd` doesn't know your time zone.
-- Forwarded connections across a restart. They end with the server, and so
-  does a `qsh -N`.
+- Forwarded connections across a restart. The listeners come back, and the
+  connections that were open are closed.
 - Anything but Linux.
 
 ## Building
