@@ -58,10 +58,10 @@ def main [
          {
             tool: $tool.name
             connect_ms: ($connect.wall * 1000)
-            upload_gbit: $upload.gbit
-            upload_cpu_s_per_gb: $upload.cpu_per_gb
-            download_gbit: $download.gbit
-            download_cpu_s_per_gb: $download.cpu_per_gb
+            up_gbit: $upload.gbit
+            up_cpu_s_gb: $upload.cpu_per_gb
+            down_gbit: $download.gbit
+            down_cpu_s_gb: $download.cpu_per_gb
          }
       }
    } | flatten

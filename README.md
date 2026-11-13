@@ -214,7 +214,21 @@ with `netem` adding delay and loss, so treat them as rough.
 
 So it's a lot better on a slow or lossy network and about even on a clean
 one. Loopback is kind to QUIC though, since the kernel never has to split a
-batch into real packets there, and I haven't measured it between two machines.
+batch into real packets there.
+
+Between real machines it looks like this. Both paths run over my overlay
+network, which leaves 1372 bytes per packet, and the CPU time is the client's.
+
+| Path            | Tool  | `true` | Upload      | Download    | CPU per GB   |
+| --------------- | ----- | ------ | ----------- | ----------- | ------------ |
+| LAN             | `qsh` | 75 ms  | 1.66 Gbit/s | 1.62 Gbit/s | 2.2 to 2.3 s |
+| LAN             | `ssh` | 132 ms | 1.63 Gbit/s | 1.78 Gbit/s | 1.6 to 1.7 s |
+| VPS, 12 ms away | `qsh` | 111 ms | 0.45 Gbit/s | 1.14 Gbit/s | 2.2 to 2.8 s |
+| VPS, 12 ms away | `ssh` | 275 ms | 0.49 Gbit/s | 0.63 Gbit/s | 1.2 to 1.5 s |
+
+Connecting is about twice as fast and so is the download from the VPS. The
+rest is a tie that the link decides, and `qsh` burns roughly half again as
+much CPU per byte to get there.
 
 `bench.nu` takes those measurements between two machines. It runs `qsh` and
 `ssh` in turns against a host that has both servers and prints the medians.
