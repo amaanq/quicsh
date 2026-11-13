@@ -17,7 +17,10 @@ use std::{
       Write as _,
    },
    mem,
-   net::ToSocketAddrs as _,
+   net::{
+      SocketAddr,
+      ToSocketAddrs as _,
+   },
    os::{
       fd::{
          AsFd,
@@ -418,9 +421,11 @@ struct Client {
    token:    Option<Token>,
    /// When the connection died, until the session is resumed.
    lost:     Option<Instant>,
-   /// When the current attempt to reach the server again began, until its
+   /// When the current attempt to reach the server began, until its
    /// handshake finishes.
    dialed:   Option<Instant>,
+   /// How many more addresses the host has to try if this attempt fails.
+   spares:   usize,
    /// The stream that asks for the session back, with the server's answer
    /// so far and the request not yet sent.
    resuming: Option<(StreamId, Deframer, Outbox)>,
@@ -899,6 +904,9 @@ impl App for Client {
             self.opened(connection, id)?;
          },
          Event::Stream(StreamEvent::Readable { .. }) => self.heading(connection)?,
+         Event::ConnectionLost { .. } if self.dialed.is_some() && self.spares > 0 => {
+            self.current = None;
+         },
          Event::ConnectionLost { reason } => {
             let silent = matches!(reason, ConnectionError::TimedOut | ConnectionError::Reset);
 
@@ -925,15 +933,16 @@ impl App for Client {
       }
 
       // A handshake retransmits ever more slowly, so a new attempt reaches a
-      // server that just became reachable sooner than a long one does.
+      // server that just became reachable sooner than a long one does. The
+      // first attempts are cut short only while another address is left.
       let limit = self
          .dialed
-         .filter(|_| self.lost.is_some())
+         .filter(|_| self.lost.is_some() || self.spares > 0)
          .map(|at| at + ATTEMPT);
 
       if limit.is_some_and(|at| now >= at) {
          connection.close(now, VarInt::from_u32(0), Bytes::new());
-         self.suspend(now);
+         self.current = None;
          return Ok(None);
       }
 
@@ -996,15 +1005,76 @@ impl App for Client {
    }
 }
 
+/// Runs `client` on the first of `addresses` that answers, and dials that
+/// address again for as long as a lost session can be resumed.
+fn drive(transport: &mut Transport, client: &mut Client, addresses: &[SocketAddr]) -> Result<()> {
+   let dial = |endpoint: &mut Transport, address| -> Result<ConnectionHandle> {
+      let handle = endpoint.connect(
+         Instant::now(),
+         address,
+         SERVER_NAME,
+         tls::client()?,
+         INTERACTIVE_WINDOW,
+      )?;
+
+      Ok(handle)
+   };
+
+   let mut reached = None;
+
+   for (index, &address) in addresses.iter().enumerate() {
+      client.reset(Instant::now());
+      client.spares = addresses.len() - index - 1;
+
+      client.current = match dial(transport, address) {
+         Ok(handle) => Some(handle),
+         Err(_) if client.spares > 0 => continue,
+         Err(error) => return Err(error),
+      };
+
+      transport.run(client)?;
+
+      // The handshake finished, or the user gave up before it did.
+      if client.dialed.is_none() || client.done {
+         reached = Some(address);
+         break;
+      }
+   }
+
+   let address =
+      reached.with_context(|| format!("no address of {} answered", client.login.host))?;
+   client.spares = 0;
+
+   while let Some(since) = client.lost.filter(|_| !client.done) {
+      client.current = loop {
+         if shutdown_requested() || since.elapsed() >= DETACH_LIMIT {
+            bail!("connection lost");
+         }
+
+         client.reset(Instant::now());
+
+         // Dialing fails while no network reaches the server.
+         if let Ok(handle) = dial(transport, address) {
+            break Some(handle);
+         }
+
+         thread::sleep(REDIAL);
+      };
+
+      transport.run(client)?;
+   }
+
+   Ok(())
+}
+
 fn main() -> Result<()> {
    let options = Options::parse();
    let login = options.login()?;
 
-   let address = (login.host.as_str(), login.port)
+   let addresses = (login.host.as_str(), login.port)
       .to_socket_addrs()
       .with_context(|| format!("resolving {}", login.host))?
-      .next()
-      .context("host resolved to no address")?;
+      .collect::<Vec<SocketAddr>>();
 
    let waker = Arc::new(Waker::new()?);
 
@@ -1030,24 +1100,13 @@ fn main() -> Result<()> {
 
    let mut transport = Transport::new(options.congestion)?;
 
-   let dial = |endpoint: &mut Transport| -> Result<ConnectionHandle> {
-      let handle = endpoint.connect(
-         Instant::now(),
-         address,
-         SERVER_NAME,
-         tls::client()?,
-         INTERACTIVE_WINDOW,
-      )?;
-
-      Ok(handle)
-   };
-
    let mut client = Client {
-      current: Some(dial(&mut transport)?),
+      current: None,
       login,
       token: None,
       lost: None,
       dialed: None,
+      spares: 0,
       resuming: None,
       shell: (!options.forward).then_some(Shell {
          command:  (!options.command.is_empty()).then(|| options.command.join(" ")),
@@ -1075,28 +1134,7 @@ fn main() -> Result<()> {
       done: false,
    };
 
-   loop {
-      transport.run(&mut client)?;
-
-      let Some(since) = client.lost.filter(|_| !client.done) else {
-         break;
-      };
-
-      client.current = loop {
-         if shutdown_requested() || since.elapsed() >= DETACH_LIMIT {
-            bail!("connection lost");
-         }
-
-         client.reset(Instant::now());
-
-         // Dialing fails while no network reaches the server.
-         if let Ok(handle) = dial(&mut transport) {
-            break Some(handle);
-         }
-
-         thread::sleep(REDIAL);
-      };
-   }
+   drive(&mut transport, &mut client, &addresses)?;
 
    let status = client.status.unwrap_or(255);
    let writers = mem::take(&mut client.writers);
