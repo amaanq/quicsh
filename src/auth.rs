@@ -186,3 +186,84 @@ impl Account {
       })
    }
 }
+
+#[cfg(test)]
+mod tests {
+   use std::{
+      env,
+      fs,
+      path::PathBuf,
+      process,
+   };
+
+   use ring::signature::{
+      Ed25519KeyPair,
+      KeyPair as _,
+   };
+
+   use crate::{
+      auth::{
+         Account,
+         Request,
+         challenge,
+      },
+      key::PublicKey,
+      wire::put_string,
+   };
+
+   /// A login signature is good for one user on one connection.
+   #[test]
+   fn signature_binds_user_and_connection() {
+      let pair = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+
+      let mut signature = Vec::new();
+      put_string(&mut signature, b"ssh-ed25519");
+      put_string(
+         &mut signature,
+         pair.sign(&challenge(&[3; 32], "alice")).as_ref(),
+      );
+
+      let mut request = Request {
+         user: "alice".to_owned(),
+         key: PublicKey::Ed25519(pair.public_key().as_ref().try_into().unwrap()),
+         signature,
+      };
+
+      assert!(request.verify(&[3; 32]).is_ok(), "same connection and user");
+      assert!(request.verify(&[4; 32]).is_err(), "another connection");
+
+      request.user = "root".to_owned();
+
+      assert!(request.verify(&[3; 32]).is_err(), "another user");
+   }
+
+   /// A key behind `authorized_keys` options does not log in, since the
+   /// options would not be enforced.
+   #[test]
+   fn restricted_key_is_skipped() {
+      let plain = PublicKey::Ed25519([1; 32]);
+      let restricted = PublicKey::Ed25519([2; 32]);
+
+      let path = env::temp_dir().join(format!("quicsh-authorized-keys-{}", process::id()));
+      fs::write(
+         &path,
+         format!("# keys\ncommand=\"date\" {restricted}\n{plain} laptop\n"),
+      )
+      .unwrap();
+
+      let account = Account {
+         name:  "alice".to_owned(),
+         uid:   1000,
+         gid:   1000,
+         home:  PathBuf::from("/nonexistent"),
+         shell: PathBuf::from("/bin/sh"),
+      };
+
+      let listed = account.authorizes(&plain, Some(&path));
+      let skipped = account.authorizes(&restricted, Some(&path));
+      fs::remove_file(&path).unwrap();
+
+      assert!(listed.unwrap(), "plain line");
+      assert!(!skipped.unwrap(), "line with options");
+   }
+}

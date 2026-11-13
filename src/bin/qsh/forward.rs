@@ -282,3 +282,40 @@ fn socks(mut stream: &TcpStream) -> io::Result<(String, u16)> {
 
    Ok((host, u16::from_be_bytes(port)))
 }
+
+#[cfg(test)]
+mod tests {
+   use crate::forward::{
+      Fixed,
+      Remote,
+      Target,
+   };
+
+   /// `-L` binds loopback unless the spec names an address.
+   #[test]
+   fn local_spec() {
+      let Fixed(short) = "8080:example.com:80".parse::<Fixed>().unwrap();
+      let Fixed(long) = "0.0.0.0:8080:example.com:80".parse::<Fixed>().unwrap();
+
+      assert_eq!(short.bind.to_string(), "127.0.0.1:8080", "default address");
+      assert_eq!(long.bind.to_string(), "0.0.0.0:8080", "named address");
+      assert!(
+         matches!(short.target, Target::Fixed { ref host, port: 80 } if host == "example.com"),
+         "target"
+      );
+   }
+
+   /// Specs with missing fields or bad ports fail.
+   #[test]
+   fn malformed_specs() {
+      assert!("8080".parse::<Fixed>().is_err(), "no target");
+      assert!(
+         "8080:example.com:http".parse::<Fixed>().is_err(),
+         "named port"
+      );
+      assert!(
+         "70000:example.com:80".parse::<Remote>().is_err(),
+         "port out of range"
+      );
+   }
+}

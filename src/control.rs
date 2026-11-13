@@ -384,3 +384,110 @@ impl Deframer {
       self.0
    }
 }
+
+#[cfg(test)]
+mod tests {
+   use crate::{
+      control::{
+         Deframer,
+         MAX_FRAME,
+         Message,
+         Open,
+         Outbox,
+         Size,
+         Terminal,
+      },
+      error::Error,
+   };
+
+   /// A frame that arrives in pieces decodes once it is whole, and the bytes
+   /// after it are kept.
+   #[test]
+   fn frame_split_across_reads() {
+      let mut outbox = Outbox::default();
+      outbox.push(&Message::Listen {
+         listener: 7,
+         port:     8080,
+      });
+
+      let (head, tail) = outbox.0.split_at(3);
+      let mut deframer = Deframer::default();
+      deframer.push(head);
+
+      assert!(
+         deframer.pop().unwrap().is_none(),
+         "length prefix is incomplete"
+      );
+
+      deframer.push(tail);
+      deframer.push(b"input");
+
+      assert!(
+         matches!(
+            deframer.pop().unwrap(),
+            Some(Message::Listen {
+               listener: 7,
+               port:     8080,
+            })
+         ),
+         "whole frame"
+      );
+      assert_eq!(deframer.into_rest(), b"input", "bytes after the frame");
+   }
+
+   /// A length over the limit fails before any payload is buffered.
+   #[test]
+   fn oversize_frame_is_refused() {
+      let mut deframer = Deframer::default();
+      deframer.push(
+         &u32::try_from(MAX_FRAME + 1)
+            .unwrap_or(u32::MAX)
+            .to_be_bytes(),
+      );
+
+      assert!(
+         matches!(deframer.pop(), Err(Error::Frame)),
+         "length over the limit"
+      );
+   }
+
+   /// The message with the most optional fields survives encoding.
+   #[test]
+   fn open_round_trips() {
+      let mut outbox = Outbox::default();
+      outbox.push(&Message::Open(Open {
+         session:  3,
+         terminal: Some(Terminal {
+            name: "xterm".to_owned(),
+            size: Size {
+               columns: 120,
+               rows:    40,
+            },
+         }),
+         command:  Some("uname -a".to_owned()),
+         agent:    true,
+      }));
+
+      let mut deframer = Deframer::default();
+      deframer.push(&outbox.0);
+
+      let Some(Message::Open(open)) = deframer.pop().unwrap() else {
+         panic!("expected an open message");
+      };
+      let size = open.terminal.as_ref().map(|terminal| terminal.size);
+
+      assert_eq!(open.session, 3, "session");
+      assert_eq!(
+         open.terminal.map(|terminal| terminal.name).as_deref(),
+         Some("xterm"),
+         "TERM"
+      );
+      assert_eq!(
+         size.map(|sent| (sent.columns, sent.rows)),
+         Some((120, 40)),
+         "size"
+      );
+      assert_eq!(open.command.as_deref(), Some("uname -a"), "command");
+      assert!(open.agent, "agent");
+   }
+}

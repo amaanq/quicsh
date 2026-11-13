@@ -4,6 +4,7 @@
 !.github/
 !.github/**
 !.gitignore
+!.clippy.toml
 !.rustfmt.toml
 !.tombi.toml
 !Cargo.lock

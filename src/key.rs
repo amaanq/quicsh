@@ -314,3 +314,108 @@ pub fn encode(bytes: &[u8]) -> String {
 
    out
 }
+
+#[cfg(test)]
+mod tests {
+   use ring::{
+      digest::{
+         SHA256,
+         digest,
+      },
+      signature::{
+         Ed25519KeyPair,
+         KeyPair as _,
+      },
+   };
+
+   use crate::{
+      error::Error,
+      key::{
+         PublicKey,
+         SK_ED25519_NAME,
+         encode,
+      },
+      wire::put_string,
+   };
+
+   /// A fixed key pair and its public half.
+   fn pair() -> (Ed25519KeyPair, [u8; 32]) {
+      let pair = Ed25519KeyPair::from_seed_unchecked(&[7; 32]).unwrap();
+      let public = pair.public_key().as_ref().try_into().unwrap();
+
+      (pair, public)
+   }
+
+   /// Both key types survive the text form, and a wrong type name is refused.
+   #[test]
+   fn text_form_round_trips() {
+      let plain = PublicKey::Ed25519([1; 32]);
+      let fido = PublicKey::SkEd25519 {
+         key:         [2; 32],
+         application: b"ssh:".to_vec(),
+      };
+
+      assert_eq!(
+         plain.to_string().parse::<PublicKey>().unwrap(),
+         plain,
+         "plain key"
+      );
+      assert_eq!(
+         format!("{fido} comment").parse::<PublicKey>().unwrap(),
+         fido,
+         "fido key"
+      );
+
+      let mislabeled = format!("ssh-ed25519 {}", encode(&fido.to_blob()));
+
+      assert!(
+         matches!(mislabeled.parse::<PublicKey>(), Err(Error::KeyType)),
+         "name and blob disagree"
+      );
+   }
+
+   /// A plain signature covers one message and nothing may follow it.
+   #[test]
+   fn plain_signature() {
+      let (pair, public) = pair();
+      let key = PublicKey::Ed25519(public);
+
+      let mut blob = Vec::new();
+      put_string(&mut blob, b"ssh-ed25519");
+      put_string(&mut blob, pair.sign(b"message").as_ref());
+
+      assert!(key.verify(b"message", &blob).is_ok(), "signed message");
+      assert!(key.verify(b"other", &blob).is_err(), "another message");
+
+      blob.push(0);
+
+      assert!(key.verify(b"message", &blob).is_err(), "trailing byte");
+   }
+
+   /// A FIDO signature made without a touch is refused.
+   #[test]
+   fn fido_signature_needs_touch() {
+      let (pair, public) = pair();
+      let key = PublicKey::SkEd25519 {
+         key:         public,
+         application: b"ssh:".to_vec(),
+      };
+
+      let blob = |flags: u8| {
+         let mut signed = digest(&SHA256, b"ssh:").as_ref().to_vec();
+         signed.push(flags);
+         signed.extend_from_slice(&5_u32.to_be_bytes());
+         signed.extend_from_slice(digest(&SHA256, b"message").as_ref());
+
+         let mut blob = Vec::new();
+         put_string(&mut blob, SK_ED25519_NAME);
+         put_string(&mut blob, pair.sign(&signed).as_ref());
+         blob.push(flags);
+         blob.extend_from_slice(&5_u32.to_be_bytes());
+         blob
+      };
+
+      assert!(key.verify(b"message", &blob(1)).is_ok(), "touched");
+      assert!(key.verify(b"message", &blob(0)).is_err(), "not touched");
+   }
+}
