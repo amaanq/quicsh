@@ -97,8 +97,6 @@ use crate::{
 
 /// Send window floor for a connection that carries keystrokes.
 pub const INTERACTIVE_WINDOW: u64 = 256 << 10;
-/// Send window floor for a connection that carries only bulk data.
-pub const BULK_WINDOW: u64 = 1 << 20;
 
 /// Largest datagram batch one receive slot holds.
 const RECV_LEN: usize = 1 << 16;
@@ -468,22 +466,6 @@ impl Transport {
    /// Fails when the endpoint rejects its configuration.
    pub fn new(tuning: Tuning) -> Result<Self, Error> {
       Self::build(None, tuning)
-   }
-
-   /// A transport that also accepts connections on `local`.
-   ///
-   /// # Errors
-   ///
-   /// Fails when the listening socket cannot be opened.
-   pub fn listen(
-      local: SocketAddr,
-      crypto: Arc<QuicServerConfig>,
-      tuning: Tuning,
-   ) -> Result<Self, Error> {
-      let socket = udp_socket(local, None).map_err(Error::Socket)?;
-      let opener = Box::new(|bound, peer| udp_socket(bound, Some(peer)));
-
-      Self::adopt(socket, local, crypto, tuning, opener)
    }
 
    /// A transport that accepts connections on `socket`, which is bound to

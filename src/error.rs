@@ -28,8 +28,6 @@ pub enum Error {
    Tls(#[source] rustls::Error),
    #[error("TLS configuration lacks the QUIC initial cipher suite")]
    InitialCipherSuite(#[source] NoInitialCipherSuite),
-   #[error("ed25519 key generation failed")]
-   KeyGeneration,
    #[error("signing key exposes no public key")]
    PublicKey,
    #[error("unknown congestion controller {0:?}")]

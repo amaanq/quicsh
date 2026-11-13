@@ -7,10 +7,6 @@ use quinn_proto::{
       QuicServerConfig,
    },
 };
-use ring::{
-   rand::SystemRandom,
-   signature::Ed25519KeyPair,
-};
 use rustls::{
    CipherSuite,
    ClientConfig,
@@ -61,16 +57,6 @@ fn provider() -> Arc<CryptoProvider> {
       .cipher_suites
       .retain(|suite| suite.suite() == CipherSuite::TLS13_AES_128_GCM_SHA256);
    Arc::new(provider)
-}
-
-/// # Errors
-///
-/// Fails when the system random source is unavailable.
-pub fn generate_key() -> Result<PrivatePkcs8KeyDer<'static>, Error> {
-   let pkcs8 =
-      Ed25519KeyPair::generate_pkcs8(&SystemRandom::new()).map_err(|_| Error::KeyGeneration)?;
-
-   Ok(PrivatePkcs8KeyDer::from(pkcs8.as_ref().to_vec()))
 }
 
 /// # Errors
