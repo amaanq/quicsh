@@ -70,7 +70,11 @@ impl Tail {
 
    /// How many of the bytes after the first `received` are no longer kept.
    #[must_use]
-   pub const fn dropped(&self, received: u64) -> u64 {
+   #[allow(
+      clippy::missing_const_for_fn,
+      reason = "VecDeque::len is const from Rust 1.101, and stable 1.100 rejects it"
+   )]
+   pub fn dropped(&self, received: u64) -> u64 {
       self
          .total
          .saturating_sub(received)

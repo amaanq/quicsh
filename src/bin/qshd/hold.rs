@@ -341,7 +341,11 @@ impl Holder {
    /// go, which is the link when one is attached and the tail when none is
    /// connected. A full link therefore makes the program wait, as a slow
    /// terminal would.
-   const fn reading(&self) -> bool {
+   #[allow(
+      clippy::missing_const_for_fn,
+      reason = "VecDeque::is_empty is const from Rust 1.101, and stable 1.100 rejects it"
+   )]
+   fn reading(&self) -> bool {
       !self.ended
          && if self.link.is_some() {
             self.attached && self.outbox.is_empty()
