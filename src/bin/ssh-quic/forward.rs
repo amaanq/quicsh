@@ -24,10 +24,10 @@ use std::{
    time::Duration,
 };
 
-use eyre::{
+use misstep::{
    Report,
    Result,
-   WrapErr as _,
+   ResultExt as _,
    bail,
 };
 use ssh_quic::pipe::Waker;
@@ -68,17 +68,24 @@ pub struct Remote {
 }
 
 fn bind(address: Option<&str>, port: &str) -> Result<SocketAddr> {
-   let address: IpAddr = match address {
-      Some(address) => address.parse().wrap_err("bad bind address")?,
+   let address = match address {
+      Some(address) => address.parse::<IpAddr>().context("bad bind address")?,
       None => Ipv4Addr::LOCALHOST.into(),
    };
 
-   Ok(SocketAddr::new(address, port.parse().wrap_err("bad port")?))
+   Ok(SocketAddr::new(
+      address,
+      port.parse::<u16>().context("bad port")?,
+   ))
 }
 
-impl Local {
-   /// Parses `-L [bind:]port:host:hostport`.
-   pub fn fixed(spec: &str) -> Result<Self> {
+/// `-L [bind:]port:host:hostport`.
+pub struct Fixed(Local);
+
+impl FromStr for Fixed {
+   type Err = Report;
+
+   fn from_str(spec: &str) -> Result<Self> {
       let fields: Vec<&str> = spec.split(':').collect();
 
       let (bind, host, port) = match fields.as_slice() {
@@ -89,30 +96,50 @@ impl Local {
 
       let target = Target::Fixed {
          host: (*host).to_owned(),
-         port: port.parse().wrap_err("bad target port")?,
+         port: port.parse::<u16>().context("bad target port")?,
       };
 
-      Ok(Self { bind, target })
+      Ok(Self(Local { bind, target }))
    }
+}
 
-   /// Parses `-D [bind:]port`.
-   pub fn socks(spec: &str) -> Result<Self> {
+/// `-D [bind:]port`.
+pub struct Socks(Local);
+
+impl FromStr for Socks {
+   type Err = Report;
+
+   fn from_str(spec: &str) -> Result<Self> {
       let bind = match spec.split_once(':') {
          Some((address, port)) => bind(Some(address), port)?,
          None => bind(None, spec)?,
       };
 
-      Ok(Self {
+      Ok(Self(Local {
          bind,
          target: Target::Socks,
-      })
+      }))
    }
+}
 
+impl From<Fixed> for Local {
+   fn from(fixed: Fixed) -> Self {
+      fixed.0
+   }
+}
+
+impl From<Socks> for Local {
+   fn from(socks: Socks) -> Self {
+      socks.0
+   }
+}
+
+impl Local {
    /// Binds now, so a taken port fails before the connection starts, then
    /// accepts on a thread.
    pub fn listen(self, inbound: &Sender<Inbound>, waker: &Arc<Waker>) -> Result<()> {
       let listener =
-         TcpListener::bind(self.bind).wrap_err_with(|| format!("listening on {}", self.bind))?;
+         TcpListener::bind(self.bind).with_context(|| format!("listening on {}", self.bind))?;
       let inbound = inbound.clone();
       let waker = Arc::clone(waker);
 
@@ -159,9 +186,9 @@ impl FromStr for Remote {
       };
 
       Ok(Self {
-         port:   port.parse().wrap_err("bad port")?,
+         port:   port.parse::<u16>().context("bad port")?,
          host:   (*host).to_owned(),
-         target: target.parse().wrap_err("bad target port")?,
+         target: target.parse::<u16>().context("bad target port")?,
       })
    }
 }

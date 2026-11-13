@@ -16,6 +16,7 @@ use std::{
       AsFd,
       BorrowedFd,
       OwnedFd,
+      RawFd,
    },
    sync::{
       Arc,
@@ -103,6 +104,17 @@ impl Drop for SendHalf {
    }
 }
 
+/// A second handle to the pipe behind `descriptor`, for a pipe whose owner
+/// gives out only the number. Borrowing the number itself would need unsafe
+/// code.
+///
+/// # Errors
+///
+/// Fails when `/proc` is not mounted or the descriptor is closed.
+pub fn reopen(descriptor: RawFd) -> io::Result<File> {
+   File::open(format!("/proc/self/fd/{descriptor}"))
+}
+
 /// Reads `source` until it ends. The channel closes at end of input, and a
 /// full channel pauses reading.
 #[must_use]
@@ -114,7 +126,13 @@ pub fn reader(mut source: File, waker: Arc<Waker>) -> Receiver<Bytes> {
 
       // A terminal whose other side closed fails with EIO, which is its end
       // of input.
-      while let Ok(count @ 1..) = source.read(&mut buffer) {
+      loop {
+         let count = match source.read(&mut buffer) {
+            Ok(count @ 1..) => count,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Ok(0) | Err(_) => break,
+         };
+
          if chunks
             .send(Bytes::copy_from_slice(&buffer[..count]))
             .is_err()

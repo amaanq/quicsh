@@ -17,7 +17,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use eyre::{
+use misstep::{
    OptionExt as _,
    Result,
    bail,
@@ -113,7 +113,7 @@ impl Signer for RemoteSigner {
       self
          .0
          .sign(message)
-         .map_err(|error| rustls::Error::General(format!("{error:#}")))
+         .map_err(|error| rustls::Error::General(format!("{error}")))
    }
 
    fn scheme(&self) -> SignatureScheme {
@@ -165,10 +165,10 @@ impl Server {
       let peer = self
          .peers
          .get_mut(&handle)
-         .ok_or_eyre("data before the handshake finished")?;
+         .context("data before the handshake finished")?;
       let control = peer
          .control
-         .ok_or_eyre("data before the control stream opened")?;
+         .context("data before the control stream opened")?;
 
       for bytes in drain(connection, control)?.0 {
          peer.deframer.push(&bytes);
@@ -253,8 +253,8 @@ impl Server {
       let peer = self
          .peers
          .get_mut(&handle)
-         .ok_or_eyre("stream on an unknown connection")?;
-      let grant = peer.grant.as_ref().ok_or_eyre("stream before login")?.id;
+         .context("stream on an unknown connection")?;
+      let grant = peer.grant.as_ref().context("stream before login")?.id;
 
       let Some(deframer) = peer.opening.get_mut(&stream) else {
          return Ok(());
@@ -345,7 +345,7 @@ impl Server {
                let peer = self
                   .peers
                   .get_mut(&handle)
-                  .ok_or_eyre("stream before the handshake finished")?;
+                  .context("stream before the handshake finished")?;
 
                if peer.control.is_none() {
                   peer.control = Some(id);
@@ -363,7 +363,7 @@ impl Server {
             let peer = self
                .peers
                .get(&handle)
-               .ok_or_eyre("data on an unknown connection")?;
+               .context("data on an unknown connection")?;
 
             if peer.control == Some(id) {
                self.control(now, handle, connection)?;
@@ -451,7 +451,7 @@ impl Server {
 }
 
 impl App for Server {
-   type Error = eyre::Report;
+   type Error = misstep::Report;
 
    fn event(
       &mut self,
@@ -463,7 +463,7 @@ impl App for Server {
       // One client's protocol violation ends that connection and leaves the
       // server running.
       if let Err(error) = self.handle(now, handle, connection, &event) {
-         eprintln!("closing {}: {error:#}", connection.remote_address());
+         eprintln!("closing {}: {error}", connection.remote_address());
          self.drop_peer(now, handle, connection);
       }
 
@@ -481,7 +481,7 @@ impl App for Server {
       let deadline = match self.pump(now, handle, connection) {
          Ok(deadline) => deadline,
          Err(error) => {
-            eprintln!("closing {}: {error:#}", connection.remote_address());
+            eprintln!("closing {}: {error}", connection.remote_address());
             self.drop_peer(now, handle, connection);
             return Ok(None);
          },
@@ -528,7 +528,7 @@ pub fn run() -> Result<()> {
    let opener = Box::new(move |local, remote| {
       sockets
          .socket(local, remote)
-         .map_err(|error| io::Error::other(format!("{error:#}")))
+         .map_err(|error| io::Error::other(format!("{error}")))
    });
 
    let mut server = Server {

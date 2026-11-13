@@ -15,7 +15,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use eyre::{
+use misstep::{
    OptionExt as _,
    Result,
    bail,
@@ -88,7 +88,7 @@ impl Session {
       let mut next = || {
          descriptors
             .next()
-            .ok_or_eyre("monitor sent too few descriptors")
+            .context("monitor sent too few descriptors")
       };
 
       let (input, output, errors, terminal, status) = match count {
@@ -106,7 +106,7 @@ impl Session {
             let side = connection
                .streams()
                .open(Dir::Uni)
-               .ok_or_eyre("no stream credit for stderr")?;
+               .context("no stream credit for stderr")?;
 
             let errors = reader(File::from(errors), Arc::clone(waker));
             let mut errors = Relay::new(side, Some(errors), None, Vec::new(), false);

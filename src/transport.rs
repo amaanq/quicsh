@@ -72,6 +72,7 @@ use rustix::{
       PollFlags,
       poll,
    },
+   io::Errno,
    net::{
       AddressFamily,
       SocketFlags,
@@ -607,8 +608,11 @@ impl Transport {
          .chain(waker.map(|waker| PollFd::new(waker, PollFlags::IN)))
          .collect();
 
-      poll(&mut sockets, timeout.as_ref()).map_err(|errno| Error::Poll(errno.into()))?;
-      Ok(())
+      match poll(&mut sockets, timeout.as_ref()) {
+         // A signal handler ran. The caller's tick decides what that means.
+         Ok(_) | Err(Errno::INTR) => Ok(()),
+         Err(errno) => Err(Error::Poll(errno.into())),
+      }
    }
 
    fn receive(&mut self, now: Instant, source: Source) -> Result<(), Error> {

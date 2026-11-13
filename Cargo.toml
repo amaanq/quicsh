@@ -5,8 +5,9 @@ edition = "2024"
 
 [dependencies]
 bytes       = "1.12.1"
-eyre        = "0.6.14"
-lexopt      = "0.3.2"
+knell       = "1.0.1"
+misstep     = { features = [ "pretty" ], version = "0.4.1" }
+pound       = "0.6.1"
 quinn-proto = { default-features = false, features = [ "rustls-ring" ], version = "0.11.19" }
 quinn-udp   = { default-features = false, version = "0.6.3" }
 ring        = "0.17.14"

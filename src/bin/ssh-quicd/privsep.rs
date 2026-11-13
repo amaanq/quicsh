@@ -8,6 +8,7 @@
 //!   took over can start sessions only for users who logged in through it.
 
 use std::{
+   fs::File,
    io::{
       self,
       IoSlice,
@@ -26,14 +27,21 @@ use std::{
    },
 };
 
-use eyre::{
+use knell::signals::shutdown_requested;
+use misstep::{
    OptionExt as _,
    Result,
    bail,
-   eyre,
+   report,
 };
 use rustix::{
    cmsg_space,
+   event::{
+      PollFd,
+      PollFlags,
+      poll,
+   },
+   io::Errno,
    net::{
       RecvAncillaryBuffer,
       RecvAncillaryMessage,
@@ -360,23 +368,53 @@ fn receive(channel: &OwnedFd) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
    Ok(Some((bytes, descriptors)))
 }
 
-/// Answers requests with `handle` until the network process goes away. A
-/// request that fails is reported to the network process and serving goes on.
+/// Why [`serve`] returned.
+pub enum Ended {
+   /// The monitor was told to stop with `SIGINT` or `SIGTERM`.
+   Signal,
+   /// The network process went away.
+   Closed,
+}
+
+/// Answers requests with `handle` until the network process goes away or
+/// `signal` reports a shutdown signal. A request that fails is reported to
+/// the network process and serving goes on.
 pub fn serve(
    channel: &OwnedFd,
+   signal: &File,
    mut handle: impl FnMut(Request) -> Result<(Reply, Vec<OwnedFd>)>,
-) -> Result<()> {
-   while let Some((bytes, _)) = receive(channel)? {
+) -> Result<Ended> {
+   loop {
+      let mut watched = [
+         PollFd::new(channel, PollFlags::IN),
+         PollFd::new(signal, PollFlags::IN),
+      ];
+
+      match poll(&mut watched, None) {
+         Ok(_) | Err(Errno::INTR) => {},
+         Err(errno) => return Err(errno.into()),
+      }
+
+      if shutdown_requested() {
+         return Ok(Ended::Signal);
+      }
+
+      if watched[0].revents().is_empty() {
+         continue;
+      }
+
+      let Some((bytes, _)) = receive(channel)? else {
+         return Ok(Ended::Closed);
+      };
+
       let (reply, descriptors) = Request::decode(&bytes)
          .map_err(Into::into)
          .and_then(&mut handle)
-         .unwrap_or_else(|error| (Reply::Failed(format!("{error:#}")), Vec::new()));
+         .unwrap_or_else(|error| (Reply::Failed(format!("{error}")), Vec::new()));
 
       let borrowed: Vec<_> = descriptors.iter().map(OwnedFd::as_fd).collect();
       send(channel, &reply.encode(), &borrowed)?;
    }
-
-   Ok(())
 }
 
 /// What the monitor returns for a started session.
@@ -398,10 +436,10 @@ impl Helper {
       let channel = self
          .0
          .lock()
-         .map_err(|_| eyre!("a thread died while talking to the monitor"))?;
+         .map_err(|_| report!("a thread died while talking to the monitor"))?;
 
       send(&channel, &request.encode(), &[])?;
-      let (bytes, descriptors) = receive(&channel)?.ok_or_eyre("the monitor exited")?;
+      let (bytes, descriptors) = receive(&channel)?.context("the monitor exited")?;
 
       match Reply::decode(&bytes)? {
          Reply::Failed(text) => bail!("monitor: {text}"),
@@ -415,7 +453,7 @@ impl Helper {
             descriptors
                .into_iter()
                .next()
-               .ok_or_eyre("monitor sent no descriptor")
+               .context("monitor sent no descriptor")
          },
          _ => bail!("unexpected reply from the monitor"),
       }
@@ -428,7 +466,7 @@ impl Helper {
             let socket = descriptors
                .into_iter()
                .next()
-               .ok_or_eyre("monitor sent no listening socket")?;
+               .context("monitor sent no listening socket")?;
 
             Ok((key, listen, socket))
          },

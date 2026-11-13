@@ -1,4 +1,5 @@
 mod forward;
+mod options;
 
 use std::{
    collections::HashMap,
@@ -10,8 +11,10 @@ use std::{
    },
    io::{
       self,
+      Read as _,
       Write as _,
    },
+   mem,
    net::ToSocketAddrs as _,
    os::{
       fd::{
@@ -45,17 +48,17 @@ use std::{
 };
 
 use bytes::Bytes;
-use eyre::{
+use knell::signals::{
+   SignalPipe,
+   shutdown_requested,
+};
+use misstep::{
    OptionExt as _,
    Result,
-   WrapErr as _,
+   ResultExt as _,
    bail,
 };
-use lexopt::{
-   Arg,
-   Parser,
-   ValueExt as _,
-};
+use pound::Parse as _;
 use quinn_proto::{
    Connection,
    ConnectionHandle,
@@ -74,7 +77,6 @@ use rustix::termios::{
    tcsetattr,
 };
 use ssh_quic::{
-   DEFAULT_PORT,
    agent::Agent,
    auth::{
       Request,
@@ -99,6 +101,7 @@ use ssh_quic::{
    pipe::{
       Waker,
       reader,
+      reopen,
       writer,
    },
    relay::Relay,
@@ -112,121 +115,26 @@ use ssh_quic::{
    },
 };
 
-use crate::forward::{
-   Inbound,
-   Local,
-   Remote,
+use crate::{
+   forward::{
+      Inbound,
+      Local,
+      Remote,
+   },
+   options::{
+      Login,
+      Options,
+   },
 };
 
 const WORKER_POLL: Duration = Duration::from_millis(20);
 const RESIZE_POLL: Duration = Duration::from_millis(250);
 const SERVER_NAME: &str = "ssh-quic";
 const SESSION: u32 = 1;
-const USAGE: &str = "usage: ssh-quic [-AtN] [-p PORT] [-l USER] [-i PUBLIC_KEY_FILE] [-L \
-                     [BIND:]PORT:HOST:HOSTPORT] [-R PORT:HOST:HOSTPORT] [-D [BIND:]PORT] \
-                     [USER@]HOST [COMMAND...]";
-
-struct Login {
-   user:     String,
-   host:     String,
-   port:     u16,
-   identity: Option<PublicKey>,
-}
-
-struct Options {
-   login:    Login,
-   command:  Option<String>,
-   /// Run the command on a terminal, as `ssh -t` does.
-   terminal: bool,
-   /// Forward the local SSH agent, as `ssh -A` does.
-   agent:    bool,
-   /// Start no session and only forward, as `ssh -N` does.
-   forward:  bool,
-   locals:   Vec<Local>,
-   remotes:  Vec<Remote>,
-}
-
-impl Options {
-   fn parse() -> Result<Self> {
-      let mut port = DEFAULT_PORT;
-      let mut identity = None;
-      let mut target = None;
-      let mut command = None;
-      let mut terminal = false;
-      let mut login_name = None;
-      let mut agent = false;
-      let mut forward = false;
-      let mut locals = Vec::new();
-      let mut remotes = Vec::new();
-      let mut parser = Parser::from_env();
-
-      while let Some(argument) = parser.next()? {
-         match argument {
-            Arg::Short('p') => port = parser.value()?.parse()?,
-            Arg::Short('t') => terminal = true,
-            Arg::Short('A') => agent = true,
-            Arg::Short('N') => forward = true,
-            Arg::Short('L') => locals.push(Local::fixed(&parser.value()?.string()?)?),
-            Arg::Short('D') => locals.push(Local::socks(&parser.value()?.string()?)?),
-            Arg::Short('R') => remotes.push(parser.value()?.string()?.parse()?),
-            Arg::Short('l') => login_name = Some(parser.value()?.string()?),
-            Arg::Short('i') => {
-               let path: PathBuf = parser.value()?.into();
-               let text = fs::read_to_string(&path)
-                  .wrap_err_with(|| format!("reading public key {}", path.display()))?;
-               identity = Some(text.parse()?);
-            },
-            Arg::Value(value) => {
-               target = Some(value.string()?);
-
-               // Everything after the host is the remote command, flags
-               // included.
-               let words = parser
-                  .raw_args()?
-                  .map(lexopt::ValueExt::string)
-                  .collect::<Result<Vec<_>, _>>()?;
-               command = (!words.is_empty()).then(|| words.join(" "));
-            },
-            Arg::Long("help") => {
-               println!("{USAGE}");
-               process::exit(0);
-            },
-            other => return Err(other.unexpected().into()),
-         }
-      }
-
-      let target = target.ok_or_eyre(USAGE)?;
-
-      let (named, host) = match target.split_once('@') {
-         Some((named, host)) => (Some(named.to_owned()), host.to_owned()),
-         None => (None, target),
-      };
-
-      let user = match named.or(login_name) {
-         Some(user) => user,
-         None => env::var("USER").wrap_err("USER is not set, pass USER@HOST")?,
-      };
-
-      Ok(Self {
-         login: Login {
-            user,
-            host,
-            port,
-            identity,
-         },
-         command,
-         terminal,
-         agent,
-         forward,
-         locals,
-         remotes,
-      })
-   }
-}
 
 fn home() -> Result<PathBuf> {
    Ok(PathBuf::from(
-      env::var_os("HOME").ok_or_eyre("HOME is not set")?,
+      env::var_os("HOME").context("HOME is not set")?,
    ))
 }
 
@@ -245,7 +153,11 @@ fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
             known.push('\n');
          },
          Err(error) if error.kind() == io::ErrorKind::NotFound => {},
-         Err(error) => return Err(error).wrap_err_with(|| format!("reading {}", path.display())),
+         Err(error) => {
+            return Err(error)
+               .with_context(|| format!("reading {}", path.display()))
+               .erase();
+         },
       }
    }
 
@@ -284,7 +196,7 @@ fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
       .create(true)
       .mode(0o600)
       .open(&own)
-      .wrap_err_with(|| format!("opening {}", own.display()))?;
+      .with_context(|| format!("opening {}", own.display()))?;
 
    file.write_all(entry(&login.host, login.port, key).as_bytes())?;
    Ok(())
@@ -320,7 +232,7 @@ fn authenticate(
          user:      login.user.clone(),
          signature: agent
             .sign(&identity.key, &data)
-            .wrap_err_with(|| format!("signing with {}", identity.comment))?,
+            .with_context(|| format!("signing with {}", identity.comment))?,
          key:       identity.key,
       };
 
@@ -429,7 +341,7 @@ impl Client {
       let stream = connection
          .streams()
          .open(Dir::Bi)
-         .ok_or_eyre("no stream credit")?;
+         .context("no stream credit")?;
 
       if interactive {
          connection.send_stream(stream).set_priority(1)?;
@@ -590,7 +502,7 @@ impl Client {
                let control = connection
                   .streams()
                   .open(Dir::Bi)
-                  .ok_or_eyre("no stream credit")?;
+                  .context("no stream credit")?;
                self.control = Some(control);
             }
 
@@ -606,7 +518,7 @@ impl Client {
 }
 
 impl App for Client {
-   type Error = eyre::Report;
+   type Error = misstep::Report;
 
    fn event(
       &mut self,
@@ -617,7 +529,7 @@ impl App for Client {
    ) -> Result<()> {
       match event {
          Event::Connected => {
-            let login = self.login.take().ok_or_eyre("connected twice")?;
+            let login = self.login.take().context("connected twice")?;
             let host_key = tls::peer_key(connection)?;
             let secret = exporter(connection)?;
 
@@ -741,12 +653,12 @@ impl App for Client {
          && self.heading.is_none()
          && self.errors.as_ref().is_none_or(Relay::received_all);
 
-      if self.status.is_some() && flushed && !self.done {
+      if (shutdown_requested() || self.status.is_some() && flushed) && !self.done {
          connection.close(now, VarInt::from_u32(0), Bytes::new());
          self.done = true;
       }
 
-      // The loop has no signal handling yet, so a resize is noticed by
+      // No handler reports a changed window, so a resize is noticed by
       // polling the terminal size.
       Ok([
          self.attempts.is_some().then_some(now + WORKER_POLL),
@@ -767,13 +679,36 @@ impl App for Client {
 }
 
 fn main() -> Result<()> {
-   let options = Options::parse()?;
+   let options = Options::parse();
+   let login = options.login()?;
 
-   let address = (options.login.host.as_str(), options.login.port)
+   let address = (login.host.as_str(), login.port)
       .to_socket_addrs()
-      .wrap_err_with(|| format!("resolving {}", options.login.host))?
+      .with_context(|| format!("resolving {}", login.host))?
       .next()
-      .ok_or_eyre("host resolved to no address")?;
+      .context("host resolved to no address")?;
+
+   let waker = Arc::new(Waker::new()?);
+
+   let signals = SignalPipe::install()?;
+   let mut signalled = reopen(signals.read_fd())?;
+   let interrupted = Arc::clone(&waker);
+
+   thread::spawn(move || {
+      let _ = signalled.read(&mut [0; 1]);
+      interrupted.wake();
+   });
+
+   let (accepted, inbound) = channel();
+
+   for local in options
+      .local
+      .into_iter()
+      .map(Local::from)
+      .chain(options.dynamic.into_iter().map(Local::from))
+   {
+      local.listen(&accepted, &waker)?;
+   }
 
    let mut transport = Transport::new(Tuning::default())?;
    transport.connect(
@@ -784,21 +719,14 @@ fn main() -> Result<()> {
       INTERACTIVE_WINDOW,
    )?;
 
-   let waker = Arc::new(Waker::new()?);
-   let (accepted, inbound) = channel();
-
-   for local in options.locals {
-      local.listen(&accepted, &waker)?;
-   }
-
    let mut client = Client {
-      login: Some(options.login),
+      login: Some(login),
       shell: (!options.forward).then_some(Shell {
-         command:  options.command,
+         command:  (!options.command.is_empty()).then(|| options.command.join(" ")),
          terminal: options.terminal,
       }),
       agent: options.agent,
-      remotes: options.remotes,
+      remotes: options.remote,
       inbound,
       opening: HashMap::new(),
       forwards: Forwards::default(),
@@ -822,7 +750,7 @@ fn main() -> Result<()> {
    transport.run(&mut client)?;
 
    let status = client.status.unwrap_or(255);
-   let writers = std::mem::take(&mut client.writers);
+   let writers = mem::take(&mut client.writers);
    drop(client);
 
    for handle in writers {

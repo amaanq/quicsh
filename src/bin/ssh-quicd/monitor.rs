@@ -21,7 +21,6 @@ use std::{
             chown,
             fchown,
          },
-         net::UnixListener,
          process::{
             CommandExt as _,
             ExitStatusExt as _,
@@ -40,13 +39,17 @@ use std::{
    thread,
 };
 
-use eyre::{
+use knell::{
+   signals::SignalPipe,
+   socket::bind_unix,
+};
+use misstep::{
    OptionExt as _,
    Result,
-   WrapErr as _,
+   ResultExt as _,
    bail,
    ensure,
-   eyre,
+   report,
 };
 use ring::rand::{
    SecureRandom as _,
@@ -85,12 +88,14 @@ use ssh_quic::{
    },
    control::Open,
    key::private_from_openssh,
+   pipe::reopen,
    tls,
    transport::udp_socket,
 };
 
 use crate::{
    privsep::{
+      Ended,
       Reply,
       Request,
       serve,
@@ -165,7 +170,7 @@ impl Monitor {
       let signer = self
          .key
          .choose_scheme(&[SignatureScheme::ED25519])
-         .ok_or_eyre("host key is not ed25519")?;
+         .context("host key is not ed25519")?;
 
       Ok(Reply::Signature(signer.sign(message)?))
    }
@@ -203,13 +208,13 @@ impl Monitor {
    /// Makes the agent socket in a new directory that only the account can
    /// enter.
    fn agent(&mut self, grant: u64) -> Result<(Reply, Vec<OwnedFd>)> {
-      let grant = self.grants.get_mut(&grant).ok_or_eyre("unknown grant")?;
+      let grant = self.grants.get_mut(&grant).context("unknown grant")?;
       ensure!(grant.agent.is_none(), "agent socket already exists");
 
       let mut random = [0; 8];
       SystemRandom::new()
          .fill(&mut random)
-         .map_err(|_| eyre!("system random source failed"))?;
+         .map_err(|_| report!("system random source failed"))?;
 
       let directory = env::temp_dir().join(format!("ssh-quic-{:016x}", u64::from_ne_bytes(random)));
       let socket = directory.join("agent.sock");
@@ -217,10 +222,10 @@ impl Monitor {
       DirBuilder::new()
          .mode(0o700)
          .create(&directory)
-         .wrap_err_with(|| format!("creating {}", directory.display()))?;
+         .with_context(|| format!("creating {}", directory.display()))?;
 
       let created = grant.agent.insert(AgentDirectory { directory, socket });
-      let listener = UnixListener::bind(&created.socket)?;
+      let listener = bind_unix(&created.socket, 0o600)?;
 
       if geteuid().is_root() {
          for owned in [&created.directory, &created.socket] {
@@ -234,10 +239,10 @@ impl Monitor {
    /// Starts a session for the grant's account. The account is made owner
    /// of the terminal device, because programs such as tmux open it by path.
    fn spawn(&mut self, grant: u64, open: &Open) -> Result<(Reply, Vec<OwnedFd>)> {
-      let grant = self.grants.get(&grant).ok_or_eyre("unknown grant")?;
+      let grant = self.grants.get(&grant).context("unknown grant")?;
 
       let mut command = Command::new(env::current_exe()?);
-      command.arg("--session").arg(&grant.account.name);
+      command.arg("session").arg(&grant.account.name);
 
       if let Some(agent) = grant.agent.as_ref().filter(|_| open.agent) {
          command.arg("--agent-socket").arg(&agent.socket);
@@ -249,7 +254,7 @@ impl Monitor {
 
       let (mut child, mut descriptors) = if let Some(terminal) = &open.terminal {
          let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
-         let master = openpt(flags).wrap_err("opening a terminal")?;
+         let master = openpt(flags).context("opening a terminal")?;
          grantpt(&master)?;
          unlockpt(&master)?;
          tcsetwinsize(&master, winsize(terminal.size))?;
@@ -267,7 +272,7 @@ impl Monitor {
             .stdout(slave.try_clone()?)
             .stderr(slave);
 
-         let child = command.spawn().wrap_err("starting the session process")?;
+         let child = command.spawn().context("starting the session process")?;
          (child, vec![master])
       } else {
          command
@@ -275,10 +280,10 @@ impl Monitor {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-         let mut child = command.spawn().wrap_err("starting the session process")?;
-         let input = child.stdin.take().ok_or_eyre("child has no stdin")?;
-         let output = child.stdout.take().ok_or_eyre("child has no stdout")?;
-         let errors = child.stderr.take().ok_or_eyre("child has no stderr")?;
+         let mut child = command.spawn().context("starting the session process")?;
+         let input = child.stdin.take().context("child has no stdin")?;
+         let output = child.stdout.take().context("child has no stdout")?;
+         let errors = child.stderr.take().context("child has no stderr")?;
 
          (child, vec![input.into(), output.into(), errors.into()])
       };
@@ -295,7 +300,7 @@ impl Monitor {
 
       sessions
          .lock()
-         .map_err(|_| eyre!("a session thread died"))?
+         .map_err(|_| report!("a session thread died"))?
          .insert(session, Pid::from_child(&child));
 
       thread::spawn(move || {
@@ -337,14 +342,11 @@ impl Monitor {
 
       match request {
          Request::Hello => {
-            let listener = self
-               .listener
-               .take()
-               .ok_or_eyre("socket already handed over")?;
+            let listener = self.listener.take().context("socket already handed over")?;
             let key = self
                .key
                .public_key()
-               .ok_or_eyre("host key has no public half")?;
+               .context("host key has no public half")?;
 
             let reply = Reply::Hello {
                key:    key.to_vec(),
@@ -380,10 +382,10 @@ impl Monitor {
 /// Starts the network process and serves it until it exits.
 pub fn run(settings: Settings) -> Result<()> {
    let key_text = fs::read_to_string(&settings.host_key)
-      .wrap_err_with(|| format!("reading host key {}", settings.host_key.display()))?;
+      .with_context(|| format!("reading host key {}", settings.host_key.display()))?;
 
    let listener = udp_socket(settings.listen, None)
-      .wrap_err_with(|| format!("listening on {}", settings.listen))?;
+      .with_context(|| format!("listening on {}", settings.listen))?;
 
    let (channel, remote) = socketpair(
       AddressFamily::UNIX,
@@ -393,7 +395,7 @@ pub fn run(settings: Settings) -> Result<()> {
    )?;
 
    let mut network = Command::new(env::current_exe()?);
-   network.arg("--network").stdin(remote).env_clear();
+   network.arg("network").stdin(remote).env_clear();
 
    if geteuid().is_root() {
       let Some(account) = Account::lookup(&settings.user)? else {
@@ -406,11 +408,14 @@ pub fn run(settings: Settings) -> Result<()> {
       network.uid(account.uid).gid(account.gid);
    }
 
-   let mut child = network.spawn().wrap_err("starting the network process")?;
+   let mut child = network.spawn().context("starting the network process")?;
 
    // The monitor must hold no copy of the network process's end, or it
    // would never see that process exit.
    drop(network);
+
+   let signals = SignalPipe::install()?;
+   let signal = reopen(signals.read_fd())?;
 
    let mut monitor = Monitor {
       key:             tls::signing_key(&private_from_openssh(&key_text)?)?,
@@ -423,11 +428,18 @@ pub fn run(settings: Settings) -> Result<()> {
    };
 
    println!("listening on udp {}", settings.listen);
-   let served = serve(&channel, |request| monitor.handle(request));
+   let ended = serve(&channel, &signal, |request| monitor.handle(request));
 
    monitor.hangup(None);
+
+   if matches!(ended, Ok(Ended::Signal)) {
+      child.kill()?;
+      child.wait()?;
+      return Ok(());
+   }
+
    let status = child.wait()?;
 
-   served?;
+   ended?;
    bail!("the network process stopped with {status}")
 }

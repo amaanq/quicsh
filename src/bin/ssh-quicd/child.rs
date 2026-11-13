@@ -16,10 +16,10 @@ use std::{
    process::Command,
 };
 
-use eyre::{
+use misstep::{
    OptionExt as _,
    Result,
-   WrapErr as _,
+   ResultExt as _,
    bail,
 };
 use rustix::{
@@ -53,12 +53,12 @@ pub struct Launch {
 
 impl Launch {
    pub fn run(&self) -> Result<Infallible> {
-      let account = Account::lookup(&self.user)?.ok_or_eyre("account vanished after login")?;
+      let account = Account::lookup(&self.user)?.context("account vanished after login")?;
 
-      setsid().wrap_err("starting a session")?;
+      setsid().context("starting a session")?;
 
       if self.terminal.is_some() {
-         ioctl_tiocsctty(io::stdin()).wrap_err("taking the controlling terminal")?;
+         ioctl_tiocsctty(io::stdin()).context("taking the controlling terminal")?;
       }
 
       if geteuid().is_root() {
@@ -66,9 +66,9 @@ impl Launch {
 
          // Groups and gid go first, because dropping the uid removes the
          // right to change them.
-         set_thread_groups(&groups).wrap_err("setting groups")?;
-         set_thread_gid(Gid::from_raw(account.gid)).wrap_err("setting gid")?;
-         set_thread_uid(Uid::from_raw(account.uid)).wrap_err("setting uid")?;
+         set_thread_groups(&groups).context("setting groups")?;
+         set_thread_gid(Gid::from_raw(account.gid)).context("setting gid")?;
+         set_thread_uid(Uid::from_raw(account.uid)).context("setting uid")?;
       } else if geteuid().as_raw() != account.uid {
          bail!(
             "an unprivileged server cannot run sessions for {}",
@@ -116,6 +116,8 @@ impl Launch {
          shell.arg0(format!("-{}", name.to_string_lossy()));
       }
 
-      Err(shell.exec()).wrap_err_with(|| format!("running {}", account.shell.display()))
+      Err(shell.exec())
+         .with_context(|| format!("running {}", account.shell.display()))
+         .erase()
    }
 }
