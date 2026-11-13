@@ -4,6 +4,7 @@ use quinn_proto::{
    ConfigError,
    ConnectError,
    ReadError,
+   WriteError,
    crypto::rustls::NoInitialCipherSuite,
 };
 use thiserror::Error;
@@ -35,6 +36,8 @@ pub enum Error {
    Congestion(String),
    #[error("reading a stream failed")]
    Read(#[source] ReadError),
+   #[error("writing a stream failed")]
+   Write(#[source] WriteError),
    #[error("data ended early or has the wrong shape")]
    Truncated,
    #[error("invalid base64")]
@@ -57,7 +60,7 @@ pub enum Error {
    Exporter,
    #[error("control frame is oversized or unknown")]
    Frame,
-   #[error("reading /etc/passwd failed")]
+   #[error("reading the account database failed")]
    Passwd(#[source] io::Error),
    #[error("reading authorized keys failed")]
    AuthorizedKeys(#[source] io::Error),

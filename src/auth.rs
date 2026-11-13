@@ -11,6 +11,7 @@
 use std::{
    fs,
    io,
+   iter,
    os::unix::fs::MetadataExt as _,
    path::{
       Path,
@@ -27,19 +28,11 @@ use ring::digest::{
 use crate::{
    error::Error,
    key::PublicKey,
-   wire::{
-      Reader,
-      put_string,
-   },
+   wire::put_string,
 };
 
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-ssh-quic-auth";
 const NAMESPACE: &[u8] = b"ssh-quic-auth";
-const MAX_FRAME: usize = 8 << 10;
-const MAX_USER: usize = 64;
-const REQUEST: u8 = 1;
-const ACCEPTED: u8 = 2;
-const REJECTED: u8 = 3;
 
 /// The secret both sides derive from this connection's TLS handshake.
 ///
@@ -89,97 +82,6 @@ impl Request {
    }
 }
 
-pub enum Message {
-   Request(Request),
-   Accepted,
-   Rejected,
-}
-
-impl Message {
-   /// The length-prefixed frame to write to the control stream.
-   #[must_use]
-   pub fn encode(&self) -> Vec<u8> {
-      let mut payload = Vec::new();
-
-      match self {
-         Self::Request(request) => {
-            payload.push(REQUEST);
-            put_string(&mut payload, request.user.as_bytes());
-            put_string(&mut payload, &request.key.to_blob());
-            put_string(&mut payload, &request.signature);
-         },
-         Self::Accepted => payload.push(ACCEPTED),
-         Self::Rejected => payload.push(REJECTED),
-      }
-
-      let mut frame = Vec::with_capacity(payload.len() + 4);
-      put_string(&mut frame, &payload);
-      frame
-   }
-
-   fn decode(payload: &[u8]) -> Result<Self, Error> {
-      let mut reader = Reader::new(payload);
-
-      let message = match reader.byte()? {
-         REQUEST => {
-            let user = str::from_utf8(reader.string()?).map_err(|_| Error::Frame)?;
-
-            if user.is_empty() || user.len() > MAX_USER {
-               return Err(Error::Frame);
-            }
-
-            Self::Request(Request {
-               user:      user.to_owned(),
-               key:       PublicKey::from_blob(reader.string()?)?,
-               signature: reader.string()?.to_vec(),
-            })
-         },
-         ACCEPTED => Self::Accepted,
-         REJECTED => Self::Rejected,
-         _ => return Err(Error::Frame),
-      };
-
-      if reader.is_empty() {
-         Ok(message)
-      } else {
-         Err(Error::Frame)
-      }
-   }
-}
-
-/// Reassembles control stream bytes into messages.
-#[derive(Default)]
-pub struct Deframer(Vec<u8>);
-
-impl Deframer {
-   pub fn push(&mut self, bytes: &[u8]) {
-      self.0.extend_from_slice(bytes);
-   }
-
-   /// # Errors
-   ///
-   /// Fails on a frame over the size limit or with unknown content.
-   pub fn pop(&mut self) -> Result<Option<Message>, Error> {
-      let Some((prefix, rest)) = self.0.split_first_chunk::<4>() else {
-         return Ok(None);
-      };
-
-      let length = usize::try_from(u32::from_be_bytes(*prefix)).map_err(|_| Error::Frame)?;
-
-      if length > MAX_FRAME {
-         return Err(Error::Frame);
-      }
-
-      let Some(payload) = rest.get(..length) else {
-         return Ok(None);
-      };
-
-      let message = Message::decode(payload)?;
-      self.0.drain(..length + 4);
-      Ok(Some(message))
-   }
-}
-
 /// A local user from `/etc/passwd`. Users that exist only in NSS sources such
 /// as LDAP are not found.
 pub struct Account {
@@ -213,6 +115,30 @@ impl Account {
             shell: PathBuf::from(shell),
          })
       }))
+   }
+
+   /// The primary group followed by every group in `/etc/group` that lists
+   /// this account as a member.
+   ///
+   /// # Errors
+   ///
+   /// Fails when `/etc/group` cannot be read.
+   pub fn groups(&self) -> Result<Vec<u32>, Error> {
+      let group = fs::read_to_string("/etc/group").map_err(Error::Passwd)?;
+
+      let supplementary = group.lines().filter_map(|line| {
+         let fields: Vec<&str> = line.split(':').collect();
+         let [_name, _password, gid, members] = fields.as_slice() else {
+            return None;
+         };
+
+         members
+            .split(',')
+            .any(|member| member == self.name)
+            .then(|| gid.parse().ok())?
+      });
+
+      Ok(iter::once(self.gid).chain(supplementary).collect())
    }
 
    /// Whether `key` may log in to this account.

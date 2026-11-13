@@ -87,7 +87,10 @@ use rustix::{
    time::Timespec,
 };
 
-use crate::error::Error;
+use crate::{
+   error::Error,
+   pipe::Waker,
+};
 
 /// Send window floor for a connection that carries keystrokes.
 pub const INTERACTIVE_WINDOW: u64 = 256 << 10;
@@ -188,6 +191,12 @@ pub trait App {
    ) -> Result<Option<Instant>, Self::Error>;
 
    fn done(&self) -> bool;
+
+   /// A waker whose signal should also end the loop's wait. The app clears
+   /// it from [`App::tick`].
+   fn waker(&self) -> Option<&Waker> {
+      None
+   }
 }
 
 /// Takes everything a stream has buffered. The flag reports that the peer
@@ -534,11 +543,11 @@ impl Transport {
          self
             .sessions
             .retain(|_, session| !session.connection.is_drained());
-         self.wait(deadline)?;
+         self.wait(deadline, app.waker())?;
       }
    }
 
-   fn wait(&self, deadline: Option<Instant>) -> Result<(), Error> {
+   fn wait(&self, deadline: Option<Instant>, waker: Option<&Waker>) -> Result<(), Error> {
       let timeout = deadline.map(|at| {
          let wait = at.saturating_duration_since(Instant::now());
 
@@ -554,6 +563,7 @@ impl Transport {
          .map(|listener| &listener.socket)
          .chain(self.sessions.values().map(|session| &session.socket))
          .map(|socket| PollFd::new(&socket.io, PollFlags::IN))
+         .chain(waker.map(|waker| PollFd::new(waker, PollFlags::IN)))
          .collect();
 
       poll(&mut sockets, timeout.as_ref()).map_err(|errno| Error::Poll(errno.into()))?;
