@@ -27,7 +27,7 @@ afford to lose :)
 - Reattaching. A terminal session survives up to an hour without a
   connection, and `qsh` picks it up again. The server keeps the last 256 KiB
   of output for that, and `qsh` says so when more was produced
-- `ed25519` keys, signed through `ssh-agent`
+- `ed25519` keys, signed through `ssh-agent` or `ssh-keygen`
 - `ed25519-sk` keys in the same way, with the PIN and the touch
 
 ## Usage
@@ -50,10 +50,12 @@ qsh -A host
 qsh -N -L 8080:localhost:80 -D 1080 host
 ```
 
-Keys come from `ssh-agent` only. `qsh` never reads a private key file, so
-encrypted keys and FIDO keys work the same way plain ones do. `-i` takes a
-public key file and picks which agent key to offer, which is worth doing with
-security keys since every wrong one costs you a touch.
+Keys come from `ssh-agent` when one is running. Without one, `ssh-keygen`
+signs with `~/.ssh/id_ed25519`, `~/.ssh/id_ed25519_sk` or the file you pass to
+`-i`, and it asks for the passphrase, PIN or touch itself. `qsh` never reads a
+private key file either way, so encrypted keys and FIDO keys work the same way
+plain ones do. `-i` also picks which agent key to offer, which is worth doing
+with security keys since every wrong one costs you a touch.
 
 Host keys are checked against `~/.ssh/known_hosts` first. Keys you accept at
 the prompt are written to `~/.ssh/known_hosts_quicsh`, and your OpenSSH file is

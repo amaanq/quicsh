@@ -37,6 +37,8 @@ pub struct Login {
    pub port:     u16,
    /// The only key to offer, when one was named.
    pub identity: Option<PublicKey>,
+   /// The private key file that goes with it.
+   pub key_file: Option<PathBuf>,
 }
 
 /// SSH over QUIC client.
@@ -58,7 +60,8 @@ pub struct Options {
    /// The account to log in to, the local user name when not given.
    #[pound(short = 'l', value_name = "USER")]
    pub login:      Option<String>,
-   /// Offer only the agent key whose public half is in FILE.
+   /// Log in with the key in FILE, which may name either half. The agent
+   /// signs when it holds the key, and ssh-keygen does otherwise.
    #[pound(short = 'i', value_name = "FILE")]
    pub identity:   Option<PathBuf>,
    /// Listen locally and connect each connection to HOST:HOSTPORT from the
@@ -88,13 +91,22 @@ pub struct Options {
 impl Options {
    /// Resolves the account, host, port and identity the options name.
    pub fn login(&self) -> Result<Login> {
-      let identity = match self.identity {
+      let (identity, key_file) = match self.identity {
          Some(ref path) => {
-            let text = fs::read_to_string(path)
-               .with_context(|| format!("reading public key {}", path.display()))?;
-            Some(text.parse()?)
+            let (public, private) = if path.extension().is_some_and(|extension| extension == "pub")
+            {
+               (path.clone(), path.with_extension(""))
+            } else {
+               let mut name = path.clone().into_os_string();
+               name.push(".pub");
+               (PathBuf::from(name), path.clone())
+            };
+
+            let text = fs::read_to_string(&public)
+               .with_context(|| format!("reading public key {}", public.display()))?;
+            (Some(text.parse()?), Some(private))
          },
-         None => None,
+         None => (None, None),
       };
 
       let (named, host) = match self.target.split_once('@') {
@@ -112,6 +124,7 @@ impl Options {
          host: host.to_owned(),
          port: self.port.unwrap_or(DEFAULT_PORT),
          identity,
+         key_file,
       })
    }
 }

@@ -27,14 +27,20 @@ use ring::digest::{
 
 use crate::{
    error::Error,
-   key::PublicKey,
-   wire::put_string,
+   key::{
+      PublicKey,
+      decode,
+   },
+   wire::{
+      Reader,
+      put_string,
+   },
 };
 
 /// TLS exporter label that binds a login to one connection.
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-quicsh-auth";
 /// `SSHSIG` namespace that keeps these signatures out of other protocols.
-const NAMESPACE: &[u8] = b"quicsh-auth";
+pub const NAMESPACE: &str = "quicsh-auth";
 
 /// The secret both sides derive from this connection's TLS handshake.
 ///
@@ -52,15 +58,54 @@ pub fn exporter(connection: &Connection) -> Result<[u8; 32], Error> {
    Ok(secret)
 }
 
-/// The bytes a key signs to log `user` in on the connection behind `exporter`.
+/// What `ssh-keygen -Y sign` takes on standard input to produce the signature
+/// over [`challenge`], since it hashes and frames its input the same way.
 #[must_use]
-pub fn challenge(exporter: &[u8; 32], user: &str) -> Vec<u8> {
+pub fn message(exporter: &[u8; 32], user: &str) -> Vec<u8> {
    let mut message = Vec::new();
    put_string(&mut message, exporter);
    put_string(&mut message, user.as_bytes());
+   message
+}
+
+/// Reads the armored output of `ssh-keygen -Y sign` and returns the signing
+/// key with the signature blob.
+///
+/// # Errors
+///
+/// Fails when the text is malformed or was made for another namespace or
+/// hash.
+pub fn armored(text: &str) -> Result<(PublicKey, Vec<u8>), Error> {
+   let body = text
+      .lines()
+      .map(str::trim)
+      .filter(|line| !line.starts_with("-----"))
+      .collect::<String>();
+
+   let bytes = decode(&body)?;
+   let mut reader = Reader::new(bytes.strip_prefix(b"SSHSIG").ok_or(Error::Signature)?);
+
+   let version = reader.u32()?;
+   let key = PublicKey::from_blob(reader.string()?)?;
+   let namespace = reader.string()?;
+   let _reserved = reader.string()?;
+   let hash = reader.string()?;
+   let signature = reader.string()?.to_vec();
+
+   if version != 1 || namespace != NAMESPACE.as_bytes() || hash != b"sha512" || !reader.is_empty() {
+      return Err(Error::Signature);
+   }
+
+   Ok((key, signature))
+}
+
+/// The bytes a key signs to log `user` in on the connection behind `exporter`.
+#[must_use]
+pub fn challenge(exporter: &[u8; 32], user: &str) -> Vec<u8> {
+   let message = message(exporter, user);
 
    let mut signed = b"SSHSIG".to_vec();
-   put_string(&mut signed, NAMESPACE);
+   put_string(&mut signed, NAMESPACE.as_bytes());
    put_string(&mut signed, b"");
    put_string(&mut signed, b"sha512");
    put_string(&mut signed, digest(&SHA512, &message).as_ref());

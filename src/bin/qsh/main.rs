@@ -27,8 +27,15 @@ use std::{
          net::UnixStream,
       },
    },
-   path::PathBuf,
-   process,
+   path::{
+      Path,
+      PathBuf,
+   },
+   process::{
+      self,
+      Command,
+      Stdio,
+   },
    sync::{
       Arc,
       mpsc::{
@@ -63,9 +70,12 @@ use pound::Parse as _;
 use quicsh::{
    agent::Agent,
    auth::{
+      NAMESPACE,
       Request,
+      armored,
       challenge,
       exporter,
+      message,
    },
    control::{
       DETACH_LIMIT,
@@ -228,33 +238,100 @@ fn authenticate(
 ) -> Result<()> {
    trust_host(login, host_key)?;
 
-   let mut agent = Agent::connect()?;
-   let data = challenge(secret, &login.user);
+   // The main loop takes one login and asks for the next when the server
+   // refuses it.
+   let offer = |request| attempts.send(Ok(Some(request))).is_ok() && next.recv().is_ok();
+   let mut offered = false;
 
-   for identity in agent.identities()? {
-      if login
-         .identity
-         .as_ref()
-         .is_some_and(|wanted| *wanted != identity.key)
-      {
-         continue;
+   if env::var_os("SSH_AUTH_SOCK").is_some() {
+      let mut agent = Agent::connect()?;
+      let data = challenge(secret, &login.user);
+
+      for identity in agent.identities()? {
+         if login
+            .identity
+            .as_ref()
+            .is_some_and(|wanted| *wanted != identity.key)
+         {
+            continue;
+         }
+
+         let request = Request {
+            user:      login.user.clone(),
+            signature: agent
+               .sign(&identity.key, &data)
+               .with_context(|| format!("signing with {}", identity.comment))?,
+            key:       identity.key,
+         };
+
+         offered = true;
+
+         if !offer(request) {
+            return Ok(());
+         }
       }
+   }
 
-      let request = Request {
-         user:      login.user.clone(),
-         signature: agent
-            .sign(&identity.key, &data)
-            .with_context(|| format!("signing with {}", identity.comment))?,
-         key:       identity.key,
+   if !offered {
+      let files = if let Some(ref file) = login.key_file {
+         vec![file.clone()]
+      } else {
+         let ssh = home()?.join(".ssh");
+
+         ["id_ed25519", "id_ed25519_sk"]
+            .map(|name| ssh.join(name))
+            .into_iter()
+            .filter(|file| file.exists())
+            .collect()
       };
 
-      if attempts.send(Ok(Some(request))).is_err() || next.recv().is_err() {
-         return Ok(());
+      if files.is_empty() {
+         bail!("no key to log in with, start ssh-agent or name a key file with -i");
+      }
+
+      for file in files {
+         let (key, signature) = sign_with_file(&file, &message(secret, &login.user))?;
+
+         let request = Request {
+            user: login.user.clone(),
+            key,
+            signature,
+         };
+
+         if !offer(request) {
+            return Ok(());
+         }
       }
    }
 
    let _ = attempts.send(Ok(None));
    Ok(())
+}
+
+/// Signs a login with `ssh-keygen`, which reads the key file and asks for its
+/// passphrase, PIN or touch on the terminal.
+fn sign_with_file(file: &Path, message: &[u8]) -> Result<(PublicKey, Vec<u8>)> {
+   let mut child = Command::new("ssh-keygen")
+      .args(["-Y", "sign", "-q", "-n", NAMESPACE, "-f"])
+      .arg(file)
+      .stdin(Stdio::piped())
+      .stdout(Stdio::piped())
+      .spawn()
+      .context("starting ssh-keygen")?;
+
+   child
+      .stdin
+      .take()
+      .context("ssh-keygen has no stdin")?
+      .write_all(message)?;
+
+   let output = child.wait_with_output()?;
+
+   if !output.status.success() {
+      bail!("ssh-keygen could not sign with {}", file.display());
+   }
+
+   Ok(armored(&String::from_utf8_lossy(&output.stdout))?)
 }
 
 /// Puts the local terminal in raw mode and restores it when dropped.
@@ -714,7 +791,7 @@ impl Client {
             self.outbox.push(&Message::Request(request));
             Ok(())
          },
-         Ok(Ok(None)) => bail!("permission denied, the server accepted none of the agent's keys"),
+         Ok(Ok(None)) => bail!("permission denied, the server accepted none of the offered keys"),
          Ok(Err(error)) => Err(error),
          Err(TryRecvError::Empty) => Ok(()),
          Err(TryRecvError::Disconnected) => bail!("authentication worker stopped"),
