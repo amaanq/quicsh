@@ -3,6 +3,7 @@ use std::io;
 use quinn_proto::{
    ConfigError,
    ConnectError,
+   ReadError,
    crypto::rustls::NoInitialCipherSuite,
 };
 use thiserror::Error;
@@ -32,4 +33,32 @@ pub enum Error {
    PublicKey,
    #[error("unknown congestion controller {0:?}")]
    Congestion(String),
+   #[error("reading a stream failed")]
+   Read(#[source] ReadError),
+   #[error("data ended early or has the wrong shape")]
+   Truncated,
+   #[error("invalid base64")]
+   Base64,
+   #[error("unsupported key type")]
+   KeyType,
+   #[error("not an unencrypted OpenSSH ed25519 private key")]
+   PrivateKey,
+   #[error("signature does not verify")]
+   Signature,
+   #[error("SSH_AUTH_SOCK is not set")]
+   AgentUnavailable,
+   #[error("talking to the SSH agent failed")]
+   Agent(#[source] io::Error),
+   #[error("the SSH agent refused the request")]
+   AgentRefused,
+   #[error("peer presented no ed25519 key")]
+   PeerKey,
+   #[error("TLS exporter is unavailable")]
+   Exporter,
+   #[error("control frame is oversized or unknown")]
+   Frame,
+   #[error("reading /etc/passwd failed")]
+   Passwd(#[source] io::Error),
+   #[error("reading authorized keys failed")]
+   AuthorizedKeys(#[source] io::Error),
 }

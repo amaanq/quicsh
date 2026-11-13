@@ -23,10 +23,16 @@ use std::{
    },
    str::FromStr,
    sync::Arc,
-   time::Instant,
+   time::{
+      Duration,
+      Instant,
+   },
 };
 
-use bytes::BytesMut;
+use bytes::{
+   Bytes,
+   BytesMut,
+};
 use quinn_proto::{
    ClientConfig,
    Connection,
@@ -38,7 +44,9 @@ use quinn_proto::{
    Event,
    Incoming,
    MtuDiscoveryConfig,
+   ReadError,
    ServerConfig,
+   StreamId,
    Transmit,
    TransportConfig,
    VarInt,
@@ -95,7 +103,9 @@ const RATE_CEILING: f64 = 10.0e9 / 8.0;
 const MIN_UDP_PAYLOAD: u16 = 1200;
 const MAX_UDP_PAYLOAD: u16 = 65527;
 const MAX_UDP_PAYLOAD_V4: u16 = 65507;
-const IDLE_TIMEOUT_MS: u32 = 10_000;
+const IDLE_TIMEOUT_MS: u32 = 60_000;
+const KEEP_ALIVE: Duration = Duration::from_secs(15);
+const MAX_HANDSHAKES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Congestion {
@@ -136,6 +146,7 @@ impl Tuning {
          .receive_window(VarInt::from_u32(64 << 20))
          .send_window(INTERACTIVE_WINDOW)
          .max_idle_timeout(Some(VarInt::from_u32(IDLE_TIMEOUT_MS).into()))
+         .keep_alive_interval(Some(KEEP_ALIVE))
          .mtu_discovery_config(Some(discovery));
 
       match self.congestion {
@@ -177,6 +188,32 @@ pub trait App {
    ) -> Result<Option<Instant>, Self::Error>;
 
    fn done(&self) -> bool;
+}
+
+/// Takes everything a stream has buffered. The flag reports that the peer
+/// finished the stream.
+///
+/// # Errors
+///
+/// Fails when the peer reset the stream.
+pub fn drain(connection: &mut Connection, id: StreamId) -> Result<(Vec<Bytes>, bool), Error> {
+   let mut received = Vec::new();
+   let mut stream = connection.recv_stream(id);
+   let Ok(mut chunks) = stream.read(true) else {
+      return Ok((received, false));
+   };
+
+   let finished = loop {
+      match chunks.next(usize::MAX) {
+         Ok(Some(chunk)) => received.push(chunk.bytes),
+         Ok(None) => break true,
+         Err(ReadError::Blocked) => break false,
+         Err(error) => return Err(Error::Read(error)),
+      }
+   };
+
+   let _ = chunks.finalize();
+   Ok((received, finished))
 }
 
 struct Socket {
@@ -591,7 +628,19 @@ impl Transport {
          listener.local.port(),
       );
 
-      let Ok(socket) = Socket::open(local, Some(remote)) else {
+      // Each handshake costs a signature and a socket before the client has
+      // proved anything, so a flood of first packets is cut off here.
+      let handshaking = self
+         .sessions
+         .values()
+         .filter(|session| session.connection.is_handshaking())
+         .count();
+
+      let socket = (handshaking < MAX_HANDSHAKES)
+         .then(|| Socket::open(local, Some(remote)).ok())
+         .flatten();
+
+      let Some(socket) = socket else {
          let refusal = self.endpoint.refuse(incoming, &mut self.send);
          return listener.socket.transmit(&refusal, &self.send);
       };

@@ -5,15 +5,15 @@ edition = "2024"
 
 [dependencies]
 bytes       = "1.12.1"
+eyre        = "0.6.14"
+lexopt      = "0.3.2"
 quinn-proto = { default-features = false, features = [ "rustls-ring" ], version = "0.11.19" }
 quinn-udp   = { default-features = false, version = "0.6.3" }
 ring        = "0.17.14"
-rustix      = { features = [ "event", "net", "time" ], version = "1.1.6" }
+rustix      = { features = [ "event", "net", "process", "time" ], version = "1.1.6" }
 rustls      = { default-features = false, features = [ "ring", "std" ], version = "0.23.46" }
 thiserror   = "2.0.21"
-
-[dev-dependencies]
-eyre = "0.6.14"
+zeroize     = "1.9.1"
 
 [profile.release]
 lto   = "thin"

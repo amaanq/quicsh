@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
-use quinn_proto::crypto::rustls::{
-   QuicClientConfig,
-   QuicServerConfig,
+use quinn_proto::{
+   Connection,
+   crypto::rustls::{
+      QuicClientConfig,
+      QuicServerConfig,
+   },
 };
 use ring::{
    rand::SystemRandom,
@@ -40,9 +43,12 @@ use rustls::{
    version::TLS13,
 };
 
-use crate::error::Error;
+use crate::{
+   error::Error,
+   key::PublicKey,
+};
 
-const ALPN: &[u8] = b"ssh-quic-probe";
+const ALPN: &[u8] = b"ssh-quic";
 
 fn provider() -> Arc<CryptoProvider> {
    let mut provider = default_provider();
@@ -85,12 +91,14 @@ pub fn server(key: &PrivatePkcs8KeyDer<'_>) -> Result<Arc<QuicServerConfig>, Err
    Ok(Arc::new(quic))
 }
 
-/// Accepts any server key, so the peer is not authenticated.
+/// The handshake proves the server holds the key it presents and nothing
+/// more. The caller must check [`peer_key`] against its known hosts before it
+/// sends anything.
 ///
 /// # Errors
 ///
 /// Fails when rustls rejects the protocol configuration.
-pub fn client_unverified() -> Result<Arc<QuicClientConfig>, Error> {
+pub fn client() -> Result<Arc<QuicClientConfig>, Error> {
    let verifier = AcceptAnyKey(provider().signature_verification_algorithms);
 
    let mut tls = ClientConfig::builder_with_provider(provider())
@@ -103,6 +111,21 @@ pub fn client_unverified() -> Result<Arc<QuicClientConfig>, Error> {
 
    let quic = QuicClientConfig::try_from(tls).map_err(Error::InitialCipherSuite)?;
    Ok(Arc::new(quic))
+}
+
+/// The key the peer proved possession of during the handshake.
+///
+/// # Errors
+///
+/// Fails before the handshake completes or when the peer sent no ed25519 key.
+pub fn peer_key(connection: &Connection) -> Result<PublicKey, Error> {
+   let chain = connection
+      .crypto_session()
+      .peer_identity()
+      .and_then(|identity| identity.downcast::<Vec<CertificateDer<'static>>>().ok())
+      .ok_or(Error::PeerKey)?;
+
+   PublicKey::from_spki(chain.first().ok_or(Error::PeerKey)?)
 }
 
 #[derive(Debug)]
