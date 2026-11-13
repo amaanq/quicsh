@@ -83,6 +83,11 @@ wildcard_enum_match_arm         = "allow"
 [lints.rust]
 unsafe_code = "forbid"
 
+# quinn-proto 0.11.19 with the assembler from upstream pull request 2976,
+# which stops a lossy path from closing the connection (upstream issue 2955).
+[patch.crates-io]
+quinn-proto = { path = "vendor/quinn-proto" }
+
 [profile.release]
 strip = true
 lto   = "thin"

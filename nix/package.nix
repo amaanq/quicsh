@@ -18,6 +18,7 @@ rustPlatform.buildRustPackage {
       root = s;
       fileset = fs.unions [
         (s + /src)
+        (s + /vendor)
         (s + /Cargo.lock)
         (s + /Cargo.toml)
       ];
