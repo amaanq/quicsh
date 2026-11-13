@@ -1,4 +1,6 @@
 mod child;
+/// The process that owns one terminal session.
+mod hold;
 mod monitor;
 mod network;
 /// Command line options.
@@ -11,10 +13,14 @@ use std::net::Ipv6Addr;
 
 use misstep::Result;
 use pound::Parse as _;
-use quicsh::DEFAULT_PORT;
+use quicsh::{
+   DEFAULT_PORT,
+   control::Size,
+};
 
 use crate::{
    child::Launch,
+   hold::Hold,
    monitor::Settings,
    options::{
       Options,
@@ -38,6 +44,24 @@ fn main() -> Result<()> {
          })
       },
       Some(Stage::Network) => network::run(options.congestion),
+      Some(Stage::Hold {
+         user,
+         term,
+         columns,
+         rows,
+         command,
+         agent_socket,
+      }) => {
+         let hold = Hold {
+            user,
+            terminal: term,
+            command,
+            agent: agent_socket,
+            size: Size { columns, rows },
+         };
+
+         hold.run()
+      },
       Some(Stage::Session {
          user,
          term,

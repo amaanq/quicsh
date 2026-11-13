@@ -765,7 +765,7 @@ impl Client {
 
       while let Some(message) = self.deframer.pop()? {
          match message {
-            Message::Accepted { token } => {
+            Message::Accepted => {
                self.attempts = None;
                self.next = None;
                self.accepted = true;
@@ -773,14 +773,11 @@ impl Client {
 
                if self.session.is_some() {
                   self.rejoin(connection)?;
-               } else {
-                  self.token = Some(token);
-
-                  if let Some(shell) = self.shell.take() {
-                     self.start(shell, connection)?;
-                  }
+               } else if let Some(shell) = self.shell.take() {
+                  self.start(shell, connection)?;
                }
             },
+            Message::Resumable { token, .. } => self.token = Some(token),
             Message::Rejected => {
                if let Some(ref next) = self.next {
                   let _ = next.send(());

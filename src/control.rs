@@ -59,12 +59,14 @@ const RESUME: u8 = 13;
 const RESUMED: u8 = 14;
 /// Tag of [`Message::Gone`].
 const GONE: u8 = 15;
+/// Tag of [`Message::Resumable`].
+const RESUMABLE: u8 = 16;
 
 /// How long a terminal session waits for a client whose connection died.
 pub const DETACH_LIMIT: Duration = Duration::from_hours(1);
 
-/// A secret that names one login, which a client shows to get its sessions
-/// back on a new connection.
+/// A secret that names one terminal session, which a client shows to get the
+/// session back on a new connection.
 pub type Token = [u8; 16];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,9 +94,7 @@ pub struct Open {
 
 pub enum Message {
    Request(Request),
-   Accepted {
-      token: Token,
-   },
+   Accepted,
    Rejected,
    Open(Open),
    Resize {
@@ -146,6 +146,11 @@ pub enum Message {
    /// The server's answer to [`Message::Resume`] for a session that ended or
    /// was never there.
    Gone,
+   /// Tells the client that a session can be resumed, and with what.
+   Resumable {
+      session: u32,
+      token:   Token,
+   },
 }
 
 /// Appends a 32-bit number.
@@ -218,10 +223,7 @@ impl Message {
             put_string(&mut payload, &request.key.to_blob());
             put_string(&mut payload, &request.signature);
          },
-         Self::Accepted { ref token } => {
-            payload.push(ACCEPTED);
-            put_string(&mut payload, token);
-         },
+         Self::Accepted => payload.push(ACCEPTED),
          Self::Rejected => payload.push(REJECTED),
          Self::Open(ref open) => {
             payload.push(OPEN);
@@ -290,6 +292,11 @@ impl Message {
             put_string(&mut payload, &skipped.to_be_bytes());
          },
          Self::Gone => payload.push(GONE),
+         Self::Resumable { session, ref token } => {
+            payload.push(RESUMABLE);
+            put_u32(&mut payload, session);
+            put_string(&mut payload, token);
+         },
       }
 
       let mut frame = Vec::with_capacity(payload.len() + 4);
@@ -319,11 +326,7 @@ impl Message {
                signature: reader.string()?.to_vec(),
             })
          },
-         ACCEPTED => {
-            Self::Accepted {
-               token: reader.array()?,
-            }
-         },
+         ACCEPTED => Self::Accepted,
          REJECTED => Self::Rejected,
          OPEN => Self::Open(open(&mut reader)?),
          RESIZE => {
@@ -381,6 +384,12 @@ impl Message {
             }
          },
          GONE => Self::Gone,
+         RESUMABLE => {
+            Self::Resumable {
+               session: reader.u32()?,
+               token:   reader.array()?,
+            }
+         },
          _ => return Err(Error::Frame),
       };
 

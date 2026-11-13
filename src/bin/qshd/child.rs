@@ -8,12 +8,18 @@ use std::{
    convert::Infallible,
    env,
    io,
-   os::unix::process::CommandExt as _,
+   os::unix::process::{
+      CommandExt as _,
+      ExitStatusExt as _,
+   },
    path::{
       Path,
       PathBuf,
    },
-   process::Command,
+   process::{
+      Command,
+      ExitStatus,
+   },
 };
 
 use misstep::{
@@ -43,6 +49,40 @@ use rustix::{
 /// `PATH` for sessions when the server has none.
 const FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
+/// Gives up root for `account`. An unprivileged server can only be the
+/// account already.
+pub fn become_account(account: &Account) -> Result<()> {
+   if geteuid().is_root() {
+      let groups = account
+         .groups()?
+         .into_iter()
+         .map(Gid::from_raw)
+         .collect::<Vec<Gid>>();
+
+      // Groups and gid go first, because dropping the uid removes the
+      // right to change them.
+      set_thread_groups(&groups).context("setting groups")?;
+      set_thread_gid(Gid::from_raw(account.gid)).context("setting gid")?;
+      set_thread_uid(Uid::from_raw(account.uid)).context("setting uid")?;
+   } else if geteuid().as_raw() != account.uid {
+      bail!(
+         "an unprivileged server cannot run sessions for {}",
+         account.name
+      );
+   }
+
+   Ok(())
+}
+
+/// The status a shell would report for a process that ended this way.
+pub fn exit_code(status: ExitStatus) -> u32 {
+   status
+      .code()
+      .or_else(|| status.signal().map(|signal| 128 + signal))
+      .and_then(|code| u32::try_from(code).ok())
+      .unwrap_or(255)
+}
+
 /// What one session process runs.
 pub struct Launch {
    /// Account the session runs as.
@@ -66,24 +106,7 @@ impl Launch {
          ioctl_tiocsctty(io::stdin()).context("taking the controlling terminal")?;
       }
 
-      if geteuid().is_root() {
-         let groups = account
-            .groups()?
-            .into_iter()
-            .map(Gid::from_raw)
-            .collect::<Vec<Gid>>();
-
-         // Groups and gid go first, because dropping the uid removes the
-         // right to change them.
-         set_thread_groups(&groups).context("setting groups")?;
-         set_thread_gid(Gid::from_raw(account.gid)).context("setting gid")?;
-         set_thread_uid(Uid::from_raw(account.uid)).context("setting uid")?;
-      } else if geteuid().as_raw() != account.uid {
-         bail!(
-            "an unprivileged server cannot run sessions for {}",
-            account.name
-         );
-      }
+      become_account(&account)?;
 
       // The kernel clears this setting when the uid changes, so it comes
       // after the switch. A monitor that dies can hang nothing up itself.

@@ -7,6 +7,7 @@ use std::{
    fs::{
       self,
       DirBuilder,
+      OpenOptions,
    },
    io::{
       self,
@@ -18,16 +19,17 @@ use std::{
       unix::{
          fs::{
             DirBuilderExt as _,
+            FileTypeExt as _,
+            OpenOptionsExt as _,
             chown,
-            fchown,
          },
-         process::{
-            CommandExt as _,
-            ExitStatusExt as _,
-         },
+         process::CommandExt as _,
       },
    },
-   path::PathBuf,
+   path::{
+      Path,
+      PathBuf,
+   },
    process::{
       Command,
       Stdio,
@@ -56,7 +58,11 @@ use quicsh::{
       self,
       Account,
    },
-   control::Open,
+   control::{
+      Open,
+      Terminal,
+      Token,
+   },
    key::private_from_openssh,
    pipe::reopen,
    tls,
@@ -72,8 +78,13 @@ use ring::rand::{
 use rustix::{
    net::{
       AddressFamily,
+      SocketAddrUnix,
       SocketFlags,
       SocketType,
+      bind,
+      connect,
+      listen,
+      socket_with,
       socketpair,
    },
    process::{
@@ -82,14 +93,6 @@ use rustix::{
       geteuid,
       kill_process_group,
    },
-   pty::{
-      OpenptFlags,
-      grantpt,
-      ioctl_tiocgptpeer,
-      openpt,
-      unlockpt,
-   },
-   termios::tcsetwinsize,
 };
 use rustls::{
    SignatureScheme,
@@ -97,14 +100,20 @@ use rustls::{
 };
 
 use crate::{
+   child::exit_code,
    privsep::{
       Ended,
       Reply,
       Request,
       serve,
    },
-   session::winsize,
 };
+
+/// File in the holders directory with the keys a restarted server shares
+/// with the old one. It sits on a runtime directory, so a reboot replaces it.
+const RESTART_SECRET: &str = "restart-secret";
+/// Bytes in the restart secret.
+const RESTART_SECRET_LEN: usize = 64;
 
 /// What a TLS 1.3 server signs in `CertificateVerify` (RFC 8446 section
 /// 4.4.3), up to the transcript hash.
@@ -164,8 +173,10 @@ struct Monitor {
    authorized_keys: Option<PathBuf>,
    /// Logins the network process may start sessions for.
    grants:          HashMap<u64, Grant>,
-   /// The process group of every session that has not exited.
+   /// The process group of every session on pipes that has not exited.
    sessions:        Arc<Mutex<HashMap<u64, Pid>>>,
+   /// Directory of the sockets that reach session holders.
+   holders:         PathBuf,
    /// The last grant or session number handed out.
    issued:          u64,
 }
@@ -260,9 +271,137 @@ impl Monitor {
       Ok((Reply::Done, vec![listener.into()]))
    }
 
-   /// Starts a session for the grant's account. The account is made owner
-   /// of the terminal device, because programs such as tmux open it by path.
+   /// Where the socket of the holder for `token` and `uid` lives. The uid in
+   /// the name keeps one account from taking another's session.
+   fn holder_path(&self, uid: u32, token: Token) -> PathBuf {
+      let name = token
+         .iter()
+         .fold(format!("{uid}-"), |name, byte| format!("{name}{byte:02x}"));
+
+      self.holders.join(name)
+   }
+
+   /// Connects to the holder that listens at `path`.
+   fn holder(path: &Path) -> io::Result<OwnedFd> {
+      let link = socket_with(
+         AddressFamily::UNIX,
+         SocketType::SEQPACKET,
+         SocketFlags::CLOEXEC,
+         None,
+      )?;
+
+      connect(&link, &SocketAddrUnix::new(path)?)?;
+      Ok(link)
+   }
+
+   /// Starts a holder process with a terminal session for the grant's
+   /// account. The holder listens on a socket made here, since it gives up
+   /// root and could not make one in a directory only root can enter.
+   fn hold(&self, id: u64, open: &Open, terminal: &Terminal) -> Result<(Reply, Vec<OwnedFd>)> {
+      let grant = self.grants.get(&id).context("unknown grant")?;
+
+      let mut token = Token::default();
+      SystemRandom::new()
+         .fill(&mut token)
+         .map_err(|_| report!("system random source failed"))?;
+
+      let path = self.holder_path(grant.account.uid, token);
+
+      let listener = socket_with(
+         AddressFamily::UNIX,
+         SocketType::SEQPACKET,
+         SocketFlags::CLOEXEC,
+         None,
+      )?;
+
+      bind(&listener, &SocketAddrUnix::new(&path)?)
+         .with_context(|| format!("binding {}", path.display()))?;
+      listen(&listener, 4)?;
+
+      let mut command = Command::new(env::current_exe()?);
+      command
+         .arg("hold")
+         .arg(&grant.account.name)
+         .arg("--term")
+         .arg(&terminal.name)
+         .arg("--columns")
+         .arg(terminal.size.columns.to_string())
+         .arg("--rows")
+         .arg(terminal.size.rows.to_string());
+
+      if let Some(agent) = grant.agent.as_ref().filter(|_| open.agent) {
+         command.arg("--agent-socket").arg(&agent.socket);
+      }
+
+      if let Some(ref text) = open.command {
+         command.arg("--command").arg(text);
+      }
+
+      let mut child = command
+         .stdin(listener)
+         .spawn()
+         .context("starting the session holder")?;
+
+      // The holder outlives this process on purpose. While both run, it is
+      // reaped here.
+      thread::spawn(move || {
+         let _ = child.wait();
+         let _ = fs::remove_file(path);
+      });
+
+      let link = Self::holder(&self.holder_path(grant.account.uid, token))?;
+      Ok((Reply::Held { token }, vec![link]))
+   }
+
+   /// Reads the restart secret, making one when this boot has none yet.
+   fn secret(&self) -> Result<Vec<u8>> {
+      let path = self.holders.join(RESTART_SECRET);
+
+      if let Ok(secret) = fs::read(&path)
+         && secret.len() == RESTART_SECRET_LEN
+      {
+         return Ok(secret);
+      }
+
+      let mut secret = vec![0; RESTART_SECRET_LEN];
+      SystemRandom::new()
+         .fill(&mut secret)
+         .map_err(|_| report!("system random source failed"))?;
+
+      let _ = fs::remove_file(&path);
+
+      OpenOptions::new()
+         .write(true)
+         .create_new(true)
+         .mode(0o600)
+         .open(&path)
+         .and_then(|mut file| file.write_all(&secret))
+         .with_context(|| format!("writing {}", path.display()))?;
+
+      Ok(secret)
+   }
+
+   /// Connects a login to a running session of its account.
+   fn attach(&self, id: u64, token: Token) -> Result<(Reply, Vec<OwnedFd>)> {
+      let grant = self.grants.get(&id).context("unknown grant")?;
+      let path = self.holder_path(grant.account.uid, token);
+
+      Ok(Self::holder(&path).map_or_else(
+         |_| {
+            // No holder listens there any more.
+            let _ = fs::remove_file(&path);
+            (Reply::Denied, Vec::new())
+         },
+         |link| (Reply::Held { token }, vec![link]),
+      ))
+   }
+
+   /// Starts a session on pipes for the grant's account.
    fn spawn(&mut self, id: u64, open: &Open) -> Result<(Reply, Vec<OwnedFd>)> {
+      if let Some(ref terminal) = open.terminal {
+         return self.hold(id, open, terminal);
+      }
+
       let grant = self.grants.get(&id).context("unknown grant")?;
 
       let mut command = Command::new(env::current_exe()?);
@@ -276,48 +415,17 @@ impl Monitor {
          command.arg("--command").arg(text);
       }
 
-      let (mut child, mut descriptors) = if let Some(ref terminal) = open.terminal {
-         let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
-         let master = openpt(flags).context("opening a terminal")?;
-         grantpt(&master)?;
-         unlockpt(&master)?;
-         tcsetwinsize(&master, winsize(terminal.size))?;
+      command
+         .stdin(Stdio::piped())
+         .stdout(Stdio::piped())
+         .stderr(Stdio::piped());
 
-         let slave = ioctl_tiocgptpeer(&master, flags)?;
-
-         if geteuid().is_root() {
-            fchown(&slave, Some(grant.account.uid), None)?;
-         }
-
-         command
-            .arg("--term")
-            .arg(&terminal.name)
-            .stdin(slave.try_clone()?)
-            .stdout(slave.try_clone()?)
-            .stderr(slave);
-
-         let child = command.spawn().context("starting the session process")?;
-         (child, vec![master])
-      } else {
-         command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-         let mut child = command.spawn().context("starting the session process")?;
-         let input = child.stdin.take().context("child has no stdin")?;
-         let output = child.stdout.take().context("child has no stdout")?;
-         let errors = child.stderr.take().context("child has no stderr")?;
-
-         (child, vec![input.into(), output.into(), errors.into()])
-      };
-
-      // The monitor's copies of the terminal's child side live in `command`,
-      // and the terminal reports end of output only once they are closed.
-      drop(command);
+      let mut child = command.spawn().context("starting the session process")?;
+      let input = child.stdin.take().context("child has no stdin")?;
+      let output = child.stdout.take().context("child has no stdout")?;
+      let errors = child.stderr.take().context("child has no stderr")?;
 
       let (exit, mut report) = io::pipe()?;
-      descriptors.push(exit.into());
 
       let session = self.issue();
       let sessions = Arc::clone(&self.sessions);
@@ -328,13 +436,7 @@ impl Monitor {
          .insert(session, Pid::from_child(&child));
 
       thread::spawn(move || {
-         let code = child.wait().map_or(255, |status| {
-            status
-               .code()
-               .or_else(|| status.signal().map(|signal| 128 + signal))
-               .and_then(|code| u32::try_from(code).ok())
-               .unwrap_or(255)
-         });
+         let code = child.wait().map_or(255, exit_code);
 
          if let Ok(mut running) = sessions.lock() {
             running.remove(&session);
@@ -343,6 +445,7 @@ impl Monitor {
          let _ = report.write_all(&code.to_be_bytes());
       });
 
+      let descriptors = vec![input.into(), output.into(), errors.into(), exit.into()];
       Ok((Reply::Spawned { session }, descriptors))
    }
 
@@ -377,6 +480,7 @@ impl Monitor {
             let reply = Reply::Hello {
                key:    key.to_vec(),
                listen: self.listen,
+               secret: self.secret()?,
             };
 
             Ok((reply, vec![listener]))
@@ -401,8 +505,37 @@ impl Monitor {
             self.grants.remove(&grant);
             plain(Reply::Done)
          },
+         Request::Attach { grant, token } => self.attach(grant, token),
       }
    }
+}
+
+/// Makes the directory for holder sockets, which only this user can enter,
+/// and removes the sockets that no holder listens on any more.
+fn holders() -> Result<PathBuf> {
+   let directory = if geteuid().is_root() {
+      PathBuf::from("/run/qshd")
+   } else {
+      env::var_os("XDG_RUNTIME_DIR")
+         .map_or_else(env::temp_dir, PathBuf::from)
+         .join(format!("qshd-{}", geteuid().as_raw()))
+   };
+
+   DirBuilder::new()
+      .recursive(true)
+      .mode(0o700)
+      .create(&directory)
+      .with_context(|| format!("creating {}", directory.display()))?;
+
+   for entry in fs::read_dir(&directory)?.filter_map(io::Result::ok) {
+      let socket = entry.file_type().is_ok_and(|kind| kind.is_socket());
+
+      if socket && Monitor::holder(&entry.path()).is_err() {
+         let _ = fs::remove_file(entry.path());
+      }
+   }
+
+   Ok(directory)
 }
 
 /// Starts the network process and serves it until it exits.
@@ -455,6 +588,7 @@ pub fn run(settings: Settings) -> Result<()> {
       authorized_keys: settings.authorized_keys,
       grants:          HashMap::new(),
       sessions:        Arc::new(Mutex::new(HashMap::new())),
+      holders:         holders()?,
       issued:          0,
    };
 

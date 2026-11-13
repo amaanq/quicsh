@@ -27,6 +27,8 @@ afford to lose :)
 - Reattaching. A terminal session survives up to an hour without a
   connection, and `qsh` picks it up again. The server keeps the last 256 KiB
   of output for that, and `qsh` says so when more was produced
+- Restarting `qshd` under a terminal session. The session lives in a process
+  of its own, and `qsh` reattaches about a second after the server is back
 - `ed25519` keys, signed through `ssh-agent` or `ssh-keygen`
 - `ed25519-sk` keys in the same way, with the PIN and the touch
 
@@ -86,12 +88,22 @@ never modified.
 ## Design
 
 `qshd` is two processes. The one that runs QUIC and TLS and parses everything a
-client sends has no privileges and holds no secrets. The other keeps root and
-the host key, and it only ever answers a small set of requests over a socket
-pair. It signs TLS handshake transcripts and nothing else, it checks logins
-itself, and it starts sessions only for accounts that logged in. If someone
-finds a parsing bug, they get a process running as `sshd` that can't sign
-anything or become anyone.
+client sends has no privileges and never sees the host key. The other keeps
+root and the host key, and it only ever answers a small set of requests over
+a socket pair. It signs TLS handshake transcripts and nothing else, it checks
+logins itself, and it starts sessions only for accounts that logged in. If
+someone finds a parsing bug, they get a process running as `sshd` that can't
+sign anything or become anyone.
+
+That process does hold one secret, a random value that lets a restarted
+server tell old clients their connection is gone. Whoever steals it can cut
+connections they can observe until the next reboot, and that's all it's good
+for.
+
+Each terminal session gets a third process that runs as the account, owns the
+terminal and keeps recent output. The server talks to it over a socket in a
+directory only root can enter, which is how a session outlives both a lost
+connection and a restarted server.
 
 Login doesn't use TLS client certificates. The client signs a value derived
 from the TLS handshake with its SSH key and sends that on the first stream. A
@@ -139,8 +151,10 @@ switch. I'd like to close that gap, but it isn't closed.
   instead of being honored without its restriction.
 - Accounts that only exist in LDAP or another NSS source. Lookups read
   `/etc/passwd`.
-- Sessions that outlive the server. Restarting `qshd` ends every session,
-  so don't upgrade it from inside one.
+- Restarts for anything but terminal sessions. Remote commands on pipes and
+  open forwarded connections end with the server.
+- Agent forwarding after a reattach. The forwarded agent goes away with the
+  connection that carried it.
 - Anything but Linux.
 
 ## Building

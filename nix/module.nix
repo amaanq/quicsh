@@ -103,9 +103,6 @@ in
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" ];
 
-      # A restart ends every session, the one running the switch included.
-      restartIfChanged = false;
-
       # Sessions inherit this and their shells add to it.
       environment.PATH = lib.mkForce "/run/wrappers/bin:/run/current-system/sw/bin";
 
@@ -135,6 +132,9 @@ in
           ]
         );
         Restart = "on-failure";
+        # Terminal sessions live in holder processes that a restarted server
+        # picks up again, so only the server itself gets the signal.
+        KillMode = "process";
       };
     };
   };

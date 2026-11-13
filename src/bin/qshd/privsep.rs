@@ -39,6 +39,7 @@ use quicsh::{
    control::{
       Message,
       Open,
+      Token,
    },
    error::Error,
    wire::{
@@ -87,6 +88,8 @@ const SPAWN: u8 = 6;
 const HANGUP: u8 = 7;
 /// Tag of [`Request::Logout`].
 const LOGOUT: u8 = 8;
+/// Tag of [`Request::Attach`].
+const ATTACH: u8 = 9;
 
 /// Tag of [`Reply::Signature`].
 const SIGNATURE: u8 = 2;
@@ -100,6 +103,8 @@ const SPAWNED: u8 = 6;
 const DONE: u8 = 7;
 /// Tag of [`Reply::Failed`].
 const FAILED: u8 = 8;
+/// Tag of [`Reply::Held`].
+const HELD: u8 = 9;
 
 /// What the network process asks of the monitor.
 pub enum Request {
@@ -143,6 +148,13 @@ pub enum Request {
       /// The login to end.
       grant: u64,
    },
+   /// Asks for a connection to the holder of a session that is running.
+   Attach {
+      /// The login that wants the session.
+      grant: u64,
+      /// What the client showed for it.
+      token: Token,
+   },
 }
 
 /// The monitor's answer to one request.
@@ -153,6 +165,8 @@ pub enum Reply {
       key:    Vec<u8>,
       /// Address the server listens on.
       listen: SocketAddr,
+      /// Key material that stays the same across restarts.
+      secret: Vec<u8>,
    },
    /// A host key signature.
    Signature(Vec<u8>),
@@ -163,11 +177,15 @@ pub enum Reply {
    },
    /// The login was refused.
    Denied,
-   /// Comes with the terminal and a status pipe, or with standard input,
-   /// output and error and a status pipe.
+   /// Comes with standard input, output and error and a status pipe.
    Spawned {
       /// The number that names this session.
       session: u64,
+   },
+   /// Comes with a connection to the holder of a terminal session.
+   Held {
+      /// What a client shows to get the session back.
+      token: Token,
    },
    /// Success with nothing to say, or with one descriptor that the request
    /// asked for.
@@ -237,6 +255,11 @@ impl Request {
             out.push(LOGOUT);
             put_u64(&mut out, grant);
          },
+         Self::Attach { grant, token } => {
+            out.push(ATTACH);
+            put_u64(&mut out, grant);
+            put_string(&mut out, &token);
+         },
       }
 
       out
@@ -288,6 +311,12 @@ impl Request {
                grant: u64_from(&mut reader)?,
             }
          },
+         ATTACH => {
+            Self::Attach {
+               grant: u64_from(&mut reader)?,
+               token: reader.array()?,
+            }
+         },
          _ => return Err(Error::Frame),
       };
 
@@ -305,10 +334,15 @@ impl Reply {
       let mut out = Vec::new();
 
       match *self {
-         Self::Hello { ref key, listen } => {
+         Self::Hello {
+            ref key,
+            listen,
+            ref secret,
+         } => {
             out.push(HELLO);
             put_string(&mut out, key);
             put_address(&mut out, listen);
+            put_string(&mut out, secret);
          },
          Self::Signature(ref signature) => {
             out.push(SIGNATURE);
@@ -322,6 +356,10 @@ impl Reply {
          Self::Spawned { session } => {
             out.push(SPAWNED);
             put_u64(&mut out, session);
+         },
+         Self::Held { ref token } => {
+            out.push(HELD);
+            put_string(&mut out, token);
          },
          Self::Done => out.push(DONE),
          Self::Failed(ref text) => {
@@ -342,6 +380,7 @@ impl Reply {
             Self::Hello {
                key:    reader.string()?.to_vec(),
                listen: address(&mut reader)?,
+               secret: reader.string()?.to_vec(),
             }
          },
          SIGNATURE => Self::Signature(reader.string()?.to_vec()),
@@ -354,6 +393,11 @@ impl Reply {
          SPAWNED => {
             Self::Spawned {
                session: u64_from(&mut reader)?,
+            }
+         },
+         HELD => {
+            Self::Held {
+               token: reader.array()?,
             }
          },
          DONE => Self::Done,
@@ -465,12 +509,25 @@ where
    }
 }
 
-/// What the monitor returns for a started session.
+/// What the monitor returns for a session on pipes.
 pub struct Spawned {
    /// The number that names the session.
    pub session:     u64,
-   /// The terminal or pipes, followed by the status pipe.
+   /// Standard input, output and error, followed by the status pipe.
    pub descriptors: Vec<OwnedFd>,
+}
+
+/// What the monitor returns for a started session.
+pub enum Started {
+   /// A session on pipes, which ends with its connection.
+   Pipes(Spawned),
+   /// A terminal session in a holder process.
+   Held {
+      /// What a client shows to get the session back.
+      token: Token,
+      /// The connection to the holder.
+      link:  OwnedFd,
+   },
 }
 
 /// The network process's end of the channel.
@@ -512,16 +569,16 @@ impl Helper {
       }
    }
 
-   /// The host public key, the listening address and its socket.
-   pub fn hello(&self) -> Result<(Vec<u8>, SocketAddr, OwnedFd)> {
+   /// The monitor's greeting and the listening socket.
+   pub fn hello(&self) -> Result<(Reply, OwnedFd)> {
       match self.call(Request::Hello)? {
-         (Reply::Hello { key, listen }, descriptors) => {
+         (reply @ Reply::Hello { .. }, descriptors) => {
             let socket = descriptors
                .into_iter()
                .next()
                .context("monitor sent no listening socket")?;
 
-            Ok((key, listen, socket))
+            Ok((reply, socket))
          },
          _ => bail!("unexpected reply from the monitor"),
       }
@@ -555,14 +612,32 @@ impl Helper {
    }
 
    /// Asks the monitor to start a session.
-   pub fn spawn(&self, grant: u64, open: Open) -> Result<Spawned> {
+   pub fn spawn(&self, grant: u64, open: Open) -> Result<Started> {
       match self.call(Request::Spawn { grant, open })? {
          (Reply::Spawned { session }, descriptors) => {
-            Ok(Spawned {
+            Ok(Started::Pipes(Spawned {
                session,
                descriptors,
-            })
+            }))
          },
+         (Reply::Held { token }, descriptors) => {
+            let link = descriptors
+               .into_iter()
+               .next()
+               .context("monitor sent no holder connection")?;
+
+            Ok(Started::Held { token, link })
+         },
+         _ => bail!("unexpected reply from the monitor"),
+      }
+   }
+
+   /// Asks for the holder of the session `token` names, which is `None` when
+   /// the session is over or belongs to another account.
+   pub fn attach(&self, grant: u64, token: Token) -> Result<Option<OwnedFd>> {
+      match self.call(Request::Attach { grant, token })? {
+         (Reply::Held { .. }, descriptors) => Ok(descriptors.into_iter().next()),
+         (Reply::Denied, _) => Ok(None),
          _ => bail!("unexpected reply from the monitor"),
       }
    }

@@ -51,7 +51,7 @@ const TAIL_LIMIT: usize = 256 << 10;
 /// The newest bytes sent in one direction, kept so that a peer whose
 /// connection died can get the ones it never received.
 #[derive(Default)]
-struct Tail {
+pub struct Tail {
    /// The kept bytes, oldest first.
    bytes: VecDeque<u8>,
    /// How many bytes were ever recorded.
@@ -60,7 +60,7 @@ struct Tail {
 
 impl Tail {
    /// Adds `chunk` and forgets the oldest bytes beyond the limit.
-   fn record(&mut self, chunk: &[u8]) {
+   pub fn record(&mut self, chunk: &[u8]) {
       self.total += chunk.len() as u64;
       self.bytes.extend(chunk);
 
@@ -69,7 +69,8 @@ impl Tail {
    }
 
    /// How many of the bytes after the first `received` are no longer kept.
-   const fn dropped(&self, received: u64) -> u64 {
+   #[must_use]
+   pub const fn dropped(&self, received: u64) -> u64 {
       self
          .total
          .saturating_sub(received)
@@ -77,7 +78,8 @@ impl Tail {
    }
 
    /// The bytes after the first `received`, or as many of them as are kept.
-   fn since(&self, received: u64) -> Vec<u8> {
+   #[must_use]
+   pub fn since(&self, received: u64) -> Vec<u8> {
       let missing = usize::try_from(self.total.saturating_sub(received)).unwrap_or(usize::MAX);
       let start = self.bytes.len().saturating_sub(missing);
 
@@ -194,13 +196,6 @@ impl Relay {
       self.taken += bytes;
    }
 
-   /// How much input a peer that has the first `received` bytes cannot get
-   /// back from [`Relay::resume`].
-   #[must_use]
-   pub fn dropped(&self, received: u64) -> u64 {
-      self.tail.as_ref().map_or(0, |tail| tail.dropped(received))
-   }
-
    /// Moves the relay to `stream` on a new connection. `frame` goes out
    /// first, then the input the peer lacks after its first `received` bytes.
    /// `buffered` and `finished` mean what they do in [`Relay::new`].
@@ -230,39 +225,6 @@ impl Relay {
       if self.outbound.is_none() {
          let _ = connection.send_stream(stream).finish();
          self.unsent = None;
-      }
-   }
-
-   /// Runs the relay while it has no connection. Local input is taken and
-   /// remembered, so the program that writes it is not blocked, and stream
-   /// data that already arrived goes to the sink.
-   pub fn idle(&mut self) {
-      while let Some(ref outbound) = self.outbound {
-         match outbound.try_recv() {
-            Ok(chunk) => {
-               if let Some(ref mut tail) = self.tail {
-                  tail.record(&chunk);
-               }
-            },
-            Err(TryRecvError::Empty) => break,
-            Err(TryRecvError::Disconnected) => self.outbound = None,
-         }
-      }
-
-      while let Some(ref inbound) = self.inbound
-         && let Some(chunk) = self.unwritten.pop_front()
-      {
-         match inbound.try_send(chunk) {
-            Ok(()) => {},
-            Err(TrySendError::Full(rejected)) => {
-               self.unwritten.push_front(rejected);
-               break;
-            },
-            Err(TrySendError::Disconnected(_)) => {
-               self.unwritten.clear();
-               self.inbound = None;
-            },
-         }
       }
    }
 

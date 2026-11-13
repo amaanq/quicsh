@@ -48,6 +48,7 @@ use quinn_proto::{
    Endpoint,
    EndpointConfig,
    Event,
+   HashedConnectionIdGenerator,
    Incoming,
    MtuDiscoveryConfig,
    ReadError,
@@ -71,6 +72,7 @@ use quinn_udp::{
    UdpSocketState,
    is_msg_size_err,
 };
+use ring::hmac;
 use rustix::{
    event::{
       PollFd,
@@ -663,7 +665,7 @@ impl Transport {
    ///
    /// Fails when the endpoint rejects its configuration.
    pub fn new(congestion: Congestion) -> Result<Self, Error> {
-      Self::build(None, congestion)
+      Self::build(None, congestion, None)
    }
 
    /// A transport that accepts connections on `socket`, which is bound to
@@ -678,6 +680,7 @@ impl Transport {
       crypto: Arc<QuicServerConfig>,
       congestion: Congestion,
       opener: Opener,
+      secret: &[u8],
    ) -> Result<Self, Error> {
       let listener = Listener {
          socket: Socket::adopt(socket)?,
@@ -686,12 +689,34 @@ impl Transport {
          opener,
       };
 
-      Self::build(Some(listener), congestion)
+      Self::build(Some(listener), congestion, Some(secret))
    }
 
    /// Builds the endpoint around an optional listener.
-   fn build(listener: Option<Listener>, congestion: Congestion) -> Result<Self, Error> {
+   fn build(
+      listener: Option<Listener>,
+      congestion: Congestion,
+      restart: Option<&[u8]>,
+   ) -> Result<Self, Error> {
       let mut config = EndpointConfig::default();
+
+      // A restarted server must recognize the old one's connection IDs and
+      // sign the same reset tokens, or its clients wait out the idle timeout.
+      if let Some(secret) = restart {
+         let ids = hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA256, secret),
+            b"connection ids",
+         );
+         let seed = ids
+            .as_ref()
+            .first_chunk()
+            .map_or(0, |bytes| u64::from_be_bytes(*bytes));
+
+         config
+            .reset_key(Arc::new(hmac::Key::new(hmac::HMAC_SHA256, secret)))
+            .cid_generator(move || Box::new(HashedConnectionIdGenerator::from_key(seed)));
+      }
+
       config
          .max_udp_payload_size(MAX_UDP_PAYLOAD)
          .map_err(Error::Config)?;

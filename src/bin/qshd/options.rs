@@ -44,6 +44,27 @@ pub enum Stage {
    /// The unprivileged network process.
    #[pound(hidden)]
    Network,
+   /// The process that owns one terminal session.
+   #[pound(hidden)]
+   Hold {
+      /// Account the session runs as.
+      user:         String,
+      /// The client's `TERM`.
+      #[pound(long)]
+      term:         String,
+      /// Width of the terminal.
+      #[pound(long)]
+      columns:      u16,
+      /// Height of the terminal.
+      #[pound(long)]
+      rows:         u16,
+      /// The command, absent for a login shell.
+      #[pound(long, allow_hyphen_values)]
+      command:      Option<String>,
+      /// Socket that reaches the client's SSH agent.
+      #[pound(long)]
+      agent_socket: Option<PathBuf>,
+   },
    /// One session, run as its account.
    #[pound(hidden)]
    Session {
