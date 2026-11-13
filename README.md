@@ -150,17 +150,19 @@ event loop. There is no async runtime and no unsafe code in this crate.
 
 ## Performance
 
-These came from a loopback benchmark with `netem` adding delay and loss, on
-one machine, so treat them as rough.
+These came from `qsh` and OpenSSH 10.6 on one loaded machine, over loopback
+with `netem` adding delay and loss, so treat them as rough.
 
-- At 50 ms of round trip time, connecting takes 103 ms. OpenSSH takes 648 ms.
-- At 1% packet loss, bulk transfer runs at 1.3 Gbit/s. OpenSSH manages 0.2.
-- On a clean path with a 1500 byte MTU, OpenSSH is about 1.6x faster per core.
-  QUIC pays per packet and TCP gets segmentation offload for free. With jumbo
-  frames it goes the other way.
+- At 50 ms of round trip time, running `true` on the server takes 246 ms
+  from start to finish. OpenSSH takes 693 ms.
+- At 50 ms and 1% packet loss, a bulk upload runs at 1.3 Gbit/s. OpenSSH
+  manages 0.2.
+- On a clean path with a 1500 byte MTU, an upload moves about 4.4 Gbit/s per
+  core, counting both ends. OpenSSH moves about 3.6.
 
-So it's better on real networks and worse between two machines on the same
-switch. I'd like to close that gap, but it isn't closed.
+So it's a lot better on a slow or lossy network and about even on a clean
+one. Loopback is kind to QUIC though, since the kernel never has to split a
+batch into real packets there, and I haven't measured it between two machines.
 
 ## What's missing
 
