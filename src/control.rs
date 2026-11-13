@@ -3,6 +3,11 @@
 //! - The control stream carries login, window resizes and exit statuses.
 //! - Each session stream starts with one [`Message::Open`] frame. Raw standard
 //!   input follows it, and raw standard output comes back.
+//! - A client whose connection died starts the session stream of its next
+//!   connection with [`Message::Resume`], and the server answers on that stream
+//!   with [`Message::Resumed`] or [`Message::Gone`].
+
+use std::time::Duration;
 
 use quinn_proto::{
    Connection,
@@ -48,6 +53,19 @@ const REFUSED: u8 = 10;
 const FORWARDED: u8 = 11;
 /// Tag of [`Message::Agent`].
 const AGENT: u8 = 12;
+/// Tag of [`Message::Resume`].
+const RESUME: u8 = 13;
+/// Tag of [`Message::Resumed`].
+const RESUMED: u8 = 14;
+/// Tag of [`Message::Gone`].
+const GONE: u8 = 15;
+
+/// How long a terminal session waits for a client whose connection died.
+pub const DETACH_LIMIT: Duration = Duration::from_hours(1);
+
+/// A secret that names one login, which a client shows to get its sessions
+/// back on a new connection.
+pub type Token = [u8; 16];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Size {
@@ -74,7 +92,9 @@ pub struct Open {
 
 pub enum Message {
    Request(Request),
-   Accepted,
+   Accepted {
+      token: Token,
+   },
    Rejected,
    Open(Open),
    Resize {
@@ -108,6 +128,22 @@ pub enum Message {
    },
    /// Opens a server stream for a program that wants the client's SSH agent.
    Agent,
+   /// Opens a client stream that takes over a session from a dead connection.
+   Resume {
+      token:    Token,
+      session:  u32,
+      /// How many bytes of the session's output the client has.
+      received: u64,
+   },
+   /// The server's answer to [`Message::Resume`], followed by the output the
+   /// client is missing.
+   Resumed {
+      /// How many bytes of the session's input the server has.
+      received: u64,
+   },
+   /// The server's answer to [`Message::Resume`] for a session that ended or
+   /// was never there.
+   Gone,
 }
 
 /// Appends a 32-bit number.
@@ -140,6 +176,33 @@ fn text(reader: &mut Reader<'_>) -> Result<String, Error> {
    Ok(str::from_utf8(bytes).map_err(|_| Error::Frame)?.to_owned())
 }
 
+/// Reads the fields of [`Message::Open`].
+fn open(reader: &mut Reader<'_>) -> Result<Open, Error> {
+   let session = reader.u32()?;
+
+   let terminal = match reader.byte()? {
+      0 => None,
+      _ => {
+         Some(Terminal {
+            name: text(reader)?,
+            size: size(reader)?,
+         })
+      },
+   };
+
+   let command = match reader.byte()? {
+      0 => None,
+      _ => Some(text(reader)?),
+   };
+
+   Ok(Open {
+      session,
+      terminal,
+      command,
+      agent: reader.byte()? != 0,
+   })
+}
+
 impl Message {
    /// The length-prefixed frame to write to a stream.
    #[must_use]
@@ -153,7 +216,10 @@ impl Message {
             put_string(&mut payload, &request.key.to_blob());
             put_string(&mut payload, &request.signature);
          },
-         Self::Accepted => payload.push(ACCEPTED),
+         Self::Accepted { ref token } => {
+            payload.push(ACCEPTED);
+            put_string(&mut payload, token);
+         },
          Self::Rejected => payload.push(REJECTED),
          Self::Open(ref open) => {
             payload.push(OPEN);
@@ -206,6 +272,21 @@ impl Message {
             put_u32(&mut payload, listener);
          },
          Self::Agent => payload.push(AGENT),
+         Self::Resume {
+            ref token,
+            session,
+            received,
+         } => {
+            payload.push(RESUME);
+            put_string(&mut payload, token);
+            put_u32(&mut payload, session);
+            put_string(&mut payload, &received.to_be_bytes());
+         },
+         Self::Resumed { received } => {
+            payload.push(RESUMED);
+            put_string(&mut payload, &received.to_be_bytes());
+         },
+         Self::Gone => payload.push(GONE),
       }
 
       let mut frame = Vec::with_capacity(payload.len() + 4);
@@ -235,33 +316,13 @@ impl Message {
                signature: reader.string()?.to_vec(),
             })
          },
-         ACCEPTED => Self::Accepted,
-         REJECTED => Self::Rejected,
-         OPEN => {
-            let session = reader.u32()?;
-
-            let terminal = match reader.byte()? {
-               0 => None,
-               _ => {
-                  Some(Terminal {
-                     name: text(&mut reader)?,
-                     size: size(&mut reader)?,
-                  })
-               },
-            };
-
-            let command = match reader.byte()? {
-               0 => None,
-               _ => Some(text(&mut reader)?),
-            };
-
-            Self::Open(Open {
-               session,
-               terminal,
-               command,
-               agent: reader.byte()? != 0,
-            })
+         ACCEPTED => {
+            Self::Accepted {
+               token: reader.array()?,
+            }
          },
+         REJECTED => Self::Rejected,
+         OPEN => Self::Open(open(&mut reader)?),
          RESIZE => {
             Self::Resize {
                session: reader.u32()?,
@@ -303,6 +364,19 @@ impl Message {
             }
          },
          AGENT => Self::Agent,
+         RESUME => {
+            Self::Resume {
+               token:    reader.array()?,
+               session:  reader.u32()?,
+               received: u64::from_be_bytes(reader.array()?),
+            }
+         },
+         RESUMED => {
+            Self::Resumed {
+               received: u64::from_be_bytes(reader.array()?),
+            }
+         },
+         GONE => Self::Gone,
          _ => return Err(Error::Frame),
       };
 

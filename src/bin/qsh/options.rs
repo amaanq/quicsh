@@ -26,6 +26,7 @@ use crate::forward::{
 };
 
 /// Where to connect and who to log in as.
+#[derive(Clone)]
 pub struct Login {
    /// Account name on the server.
    pub user:     String,

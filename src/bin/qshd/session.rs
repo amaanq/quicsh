@@ -21,7 +21,10 @@ use misstep::{
    bail,
 };
 use quicsh::{
-   control::Size,
+   control::{
+      Message,
+      Size,
+   },
    pipe::{
       Waker,
       reader,
@@ -128,8 +131,14 @@ impl Session {
       let outbound = reader(File::from(output), Arc::clone(waker));
       let (inbound, _) = writer(File::from(input), Arc::clone(waker));
 
+      let mut relay = Relay::new(stream, Some(outbound), Some(inbound), buffered, finished);
+
+      if terminal.is_some() {
+         relay.remember();
+      }
+
       Ok(Self {
-         relay: Relay::new(stream, Some(outbound), Some(inbound), buffered, finished),
+         relay,
          errors,
          terminal,
          id: spawned.session,
@@ -148,14 +157,46 @@ impl Session {
       Ok(())
    }
 
-   /// Moves data and returns the exit status once the session is over.
-   pub fn pump(&mut self, now: Instant, connection: &mut Connection) -> Result<Option<u32>> {
-      self.relay.pump(connection)?;
+   /// Whether the session can wait for a client whose connection died. A
+   /// session on pipes cannot, because its peer is a program that would take
+   /// replayed bytes as new ones.
+   pub const fn resumable(&self) -> bool {
+      self.terminal.is_some() && self.exited.is_none() && !self.relay.sent_all()
+   }
 
-      if let Some(ref mut errors) = self.errors {
-         errors.pump(connection)?;
-      }
+   /// Runs the session while it has no connection and returns whether it is
+   /// over.
+   pub fn idle(&mut self, now: Instant) -> bool {
+      self.relay.idle();
+      self.reap(now);
 
+      !self.resumable()
+   }
+
+   /// Joins the session to `stream` on a new connection. `received` is how
+   /// much output the client has, and `pending` is input already read from
+   /// `stream`.
+   pub fn resume(
+      &mut self,
+      connection: &mut Connection,
+      stream: StreamId,
+      received: u64,
+      pending: (Vec<u8>, bool),
+   ) -> Result<()> {
+      connection.send_stream(stream).set_priority(1)?;
+
+      let answer = Message::Resumed {
+         received: self.relay.taken(),
+      };
+
+      self
+         .relay
+         .resume(connection, stream, answer.encode(), received, pending);
+      Ok(())
+   }
+
+   /// Notes the exit status once the monitor reports it.
+   fn reap(&mut self, now: Instant) {
       if self.exited.is_none() {
          let status = match self.exit.try_recv() {
             Ok(bytes) => {
@@ -171,6 +212,17 @@ impl Session {
 
          self.exited = status.map(|code| (code, now));
       }
+   }
+
+   /// Moves data and returns the exit status once the session is over.
+   pub fn pump(&mut self, now: Instant, connection: &mut Connection) -> Result<Option<u32>> {
+      self.relay.pump(connection)?;
+
+      if let Some(ref mut errors) = self.errors {
+         errors.pump(connection)?;
+      }
+
+      self.reap(now);
 
       let Some((status, at)) = self.exited else {
          return Ok(None);

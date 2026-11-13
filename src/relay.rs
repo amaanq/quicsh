@@ -39,6 +39,38 @@ use crate::{
    transport::drain,
 };
 
+/// How much sent data a relay keeps for a peer that reconnects.
+const TAIL_LIMIT: usize = 256 << 10;
+
+/// The newest bytes sent in one direction, kept so that a peer whose
+/// connection died can get the ones it never received.
+#[derive(Default)]
+struct Tail {
+   /// The kept bytes, oldest first.
+   bytes: VecDeque<u8>,
+   /// How many bytes were ever recorded.
+   total: u64,
+}
+
+impl Tail {
+   /// Adds `chunk` and forgets the oldest bytes beyond the limit.
+   fn record(&mut self, chunk: &[u8]) {
+      self.total += chunk.len() as u64;
+      self.bytes.extend(chunk);
+
+      let excess = self.bytes.len().saturating_sub(TAIL_LIMIT);
+      self.bytes.drain(..excess);
+   }
+
+   /// The bytes after the first `received`, or as many of them as are kept.
+   fn since(&self, received: u64) -> Vec<u8> {
+      let missing = usize::try_from(self.total.saturating_sub(received)).unwrap_or(usize::MAX);
+      let start = self.bytes.len().saturating_sub(missing);
+
+      self.bytes.range(start..).copied().collect()
+   }
+}
+
 pub struct Relay {
    /// The stream this relay serves.
    stream:    StreamId,
@@ -52,6 +84,10 @@ pub struct Relay {
    unwritten: VecDeque<Bytes>,
    /// Whether the peer finished the stream.
    finished:  bool,
+   /// How many stream bytes this relay has taken.
+   taken:     u64,
+   /// Local input already sent, for a relay that can resume.
+   tail:      Option<Tail>,
    /// Kept so that dropping the relay unblocks the thread reading the socket.
    socket:    Option<OwnedFd>,
 }
@@ -81,6 +117,8 @@ impl Relay {
          outbound,
          unsent: None,
          inbound,
+         taken: buffered.len() as u64,
+         tail: None,
          unwritten: (!buffered.is_empty())
             .then(|| Bytes::from(buffered))
             .into_iter()
@@ -122,6 +160,83 @@ impl Relay {
    #[must_use]
    pub const fn stream(&self) -> StreamId {
       self.stream
+   }
+
+   /// Starts keeping sent input so that the relay can [`Relay::resume`].
+   pub fn remember(&mut self) {
+      self.tail = Some(Tail::default());
+   }
+
+   /// How many stream bytes the relay has taken, which the peer needs to know
+   /// to resume.
+   #[must_use]
+   pub const fn taken(&self) -> u64 {
+      self.taken
+   }
+
+   /// Moves the relay to `stream` on a new connection. `frame` goes out
+   /// first, then the input the peer lacks after its first `received` bytes.
+   /// `buffered` and `finished` mean what they do in [`Relay::new`].
+   pub fn resume(
+      &mut self,
+      connection: &mut Connection,
+      stream: StreamId,
+      frame: Vec<u8>,
+      received: u64,
+      (buffered, finished): (Vec<u8>, bool),
+   ) {
+      let mut replay = frame;
+
+      if let Some(ref tail) = self.tail {
+         replay.extend(tail.since(received));
+      }
+
+      self.stream = stream;
+      self.unsent = (!replay.is_empty()).then(|| replay.into());
+      self.taken += buffered.len() as u64;
+      self.finished = finished;
+
+      if !buffered.is_empty() {
+         self.unwritten.push_back(buffered.into());
+      }
+
+      if self.outbound.is_none() {
+         let _ = connection.send_stream(stream).finish();
+         self.unsent = None;
+      }
+   }
+
+   /// Runs the relay while it has no connection. Local input is taken and
+   /// remembered, so the program that writes it is not blocked, and stream
+   /// data that already arrived goes to the sink.
+   pub fn idle(&mut self) {
+      while let Some(ref outbound) = self.outbound {
+         match outbound.try_recv() {
+            Ok(chunk) => {
+               if let Some(ref mut tail) = self.tail {
+                  tail.record(&chunk);
+               }
+            },
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => self.outbound = None,
+         }
+      }
+
+      while let Some(ref inbound) = self.inbound
+         && let Some(chunk) = self.unwritten.pop_front()
+      {
+         match inbound.try_send(chunk) {
+            Ok(()) => {},
+            Err(TrySendError::Full(rejected)) => {
+               self.unwritten.push_front(rejected);
+               break;
+            },
+            Err(TrySendError::Disconnected(_)) => {
+               self.unwritten.clear();
+               self.inbound = None;
+            },
+         }
+      }
    }
 
    /// Whether both directions have ended.
@@ -172,7 +287,13 @@ impl Relay {
       while let Some(ref outbound) = self.outbound {
          if self.unsent.is_none() {
             match outbound.try_recv() {
-               Ok(chunk) => self.unsent = Some(chunk),
+               Ok(chunk) => {
+                  if let Some(ref mut tail) = self.tail {
+                     tail.record(&chunk);
+                  }
+
+                  self.unsent = Some(chunk);
+               },
                Err(TryRecvError::Empty) => return Ok(()),
                Err(TryRecvError::Disconnected) => {
                   let _ = connection.send_stream(self.stream).finish();
@@ -216,6 +337,7 @@ impl Relay {
 
             let (chunks, finished) = drain(connection, self.stream)?;
             self.finished = finished;
+            self.taken += chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>();
 
             if chunks.is_empty() && !finished {
                return Ok(());
@@ -243,5 +365,31 @@ impl Relay {
       }
 
       Ok(())
+   }
+}
+
+#[cfg(test)]
+mod tests {
+   use crate::relay::{
+      TAIL_LIMIT,
+      Tail,
+   };
+
+   /// A peer gets the bytes after its count, all that are kept when its
+   /// count is older than that, and none when it claims more than was sent.
+   #[test]
+   fn tail_replays_what_the_peer_lacks() {
+      let mut tail = Tail::default();
+      tail.record(b"hello ");
+      tail.record(b"world");
+
+      assert_eq!(tail.since(6), b"world", "second chunk only");
+      assert_eq!(tail.since(11), b"", "peer has everything");
+      assert_eq!(tail.since(99), b"", "peer claims too much");
+
+      tail.record(&vec![b'x'; TAIL_LIMIT]);
+
+      assert_eq!(tail.since(0).len(), TAIL_LIMIT, "older bytes are gone");
+      assert_eq!(tail.since(tail.total - 3), b"xxx", "count still lines up");
    }
 }

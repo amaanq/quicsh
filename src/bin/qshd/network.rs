@@ -27,13 +27,16 @@ use misstep::{
    OptionExt as _,
    Result,
    bail,
+   report,
 };
 use quicsh::{
    auth::exporter,
    control::{
+      DETACH_LIMIT,
       Deframer,
       Message,
       Outbox,
+      Token,
    },
    forward::{
       Acceptor,
@@ -51,12 +54,17 @@ use quicsh::{
 };
 use quinn_proto::{
    Connection,
+   ConnectionError,
    ConnectionHandle,
    Dir,
    Event,
    StreamEvent,
    StreamId,
    VarInt,
+};
+use ring::rand::{
+   SecureRandom as _,
+   SystemRandom,
 };
 use rustix::{
    process::{
@@ -150,6 +158,10 @@ impl Signer for RemoteSigner {
 struct Grant {
    /// The number the monitor gave this login.
    id:     u64,
+   /// The account that logged in.
+   user:   String,
+   /// What the client shows to resume this login's sessions.
+   token:  Token,
    /// Reaches the monitor.
    helper: Helper,
 }
@@ -186,10 +198,25 @@ struct Peer {
    agent:     Option<Acceptor>,
 }
 
+/// What is left of a connection that died, until its client returns or the
+/// wait runs out.
+struct Parked {
+   /// The login, which keeps the agent socket in place.
+   grant:    Grant,
+   /// The terminal sessions that were running.
+   sessions: BTreeMap<u32, Session>,
+   /// Accepts programs that want the client's SSH agent.
+   agent:    Option<Acceptor>,
+   /// When the sessions are hung up.
+   expires:  Instant,
+}
+
 /// State of the network process.
 struct Server {
    /// Every connection whose handshake finished.
    peers:  HashMap<ConnectionHandle, Peer>,
+   /// Sessions of dead connections by their login's token.
+   parked: HashMap<Token, Parked>,
    /// Reaches the monitor.
    helper: Helper,
    /// Wakes the loop from I/O threads.
@@ -231,21 +258,26 @@ impl Server {
                }
 
                let label = format!("{} for {}", request.key.fingerprint(), request.user);
-               let granted = self.helper.login(request, exporter(connection)?)?;
+               let user = request.user.clone();
 
-               let reply = if granted.is_some() {
-                  println!("accepted {label} from {}", origin(connection));
-                  Message::Accepted
-               } else {
-                  Message::Rejected
+               let Some(id) = self.helper.login(request, exporter(connection)?)? else {
+                  peer.outbox.push(&Message::Rejected);
+                  continue;
                };
-               peer.outbox.push(&reply);
 
-               peer.grant = granted.map(|id| {
-                  Grant {
-                     id,
-                     helper: self.helper.clone(),
-                  }
+               let mut token = Token::default();
+               SystemRandom::new()
+                  .fill(&mut token)
+                  .map_err(|_| report!("system random source failed"))?;
+
+               println!("accepted {label} from {}", origin(connection));
+               peer.outbox.push(&Message::Accepted { token });
+
+               peer.grant = Some(Grant {
+                  id,
+                  user,
+                  token,
+                  helper: self.helper.clone(),
                });
             },
             Message::Resize { session, size } => {
@@ -287,10 +319,100 @@ impl Server {
       Ok(())
    }
 
+   /// Sets aside the terminal sessions of a connection that died and drops
+   /// the rest of its state.
+   fn park(&mut self, now: Instant, handle: ConnectionHandle) {
+      let Some(Peer {
+         grant: Some(grant),
+         mut sessions,
+         agent,
+         ..
+      }) = self.peers.remove(&handle)
+      else {
+         return;
+      };
+
+      sessions.retain(|_, session| session.resumable());
+
+      if sessions.is_empty() {
+         return;
+      }
+
+      self.parked.insert(grant.token, Parked {
+         grant,
+         sessions,
+         agent,
+         expires: now + DETACH_LIMIT,
+      });
+   }
+
+   /// Gives a parked session to the connection that asked for it on `stream`
+   /// and returns whether there was one for this client.
+   fn resume(
+      &mut self,
+      now: Instant,
+      handle: ConnectionHandle,
+      connection: &mut Connection,
+      stream: StreamId,
+      (token, label, received): (Token, u32, u64),
+      pending: (Vec<u8>, bool),
+   ) -> Result<bool> {
+      // A client can notice a dead path before the server does, and then the
+      // old connection still holds the session.
+      let stale = self
+         .peers
+         .iter()
+         .find(|&(&other, peer)| {
+            other != handle
+               && peer
+                  .grant
+                  .as_ref()
+                  .is_some_and(|grant| grant.token == token)
+         })
+         .map(|(&other, _)| other);
+
+      if let Some(other) = stale {
+         self.park(now, other);
+      }
+
+      let peer = self
+         .peers
+         .get_mut(&handle)
+         .context("stream on an unknown connection")?;
+      let user = &peer.grant.as_ref().context("stream before login")?.user;
+
+      let found = self
+         .parked
+         .get(&token)
+         .is_some_and(|parked| parked.grant.user == *user && parked.sessions.contains_key(&label));
+
+      if !found || peer.sessions.contains_key(&label) {
+         return Ok(false);
+      }
+
+      let Some(mut parked) = self.parked.remove(&token) else {
+         return Ok(false);
+      };
+      let Some(mut session) = parked.sessions.remove(&label) else {
+         return Ok(false);
+      };
+
+      session.resume(connection, stream, received, pending)?;
+      peer.sessions.insert(label, session);
+
+      // The old login owns the agent socket that the session's environment
+      // names, so it replaces the new one.
+      peer.grant = Some(parked.grant);
+      peer.agent = parked.agent.or_else(|| peer.agent.take());
+
+      Ok(true)
+   }
+
    /// Reads a new client stream until its opening frame is complete, then
    /// starts what the frame asks for.
    fn opening(
       &mut self,
+      now: Instant,
       handle: ConnectionHandle,
       connection: &mut Connection,
       stream: StreamId,
@@ -346,6 +468,27 @@ impl Server {
 
             peer.sessions.insert(label, session);
          },
+         Message::Resume {
+            token,
+            session,
+            received: had,
+         } => {
+            let wanted = (token, session, had);
+
+            if !self.resume(
+               now,
+               handle,
+               connection,
+               stream,
+               wanted,
+               (buffered, finished),
+            )? {
+               let _ = connection
+                  .send_stream(stream)
+                  .write(&Message::Gone.encode());
+               let _ = connection.send_stream(stream).finish();
+            }
+         },
          Message::Connect { host, port } => {
             if peer.forwards.len() >= MAX_FORWARDS {
                Relay::abort(connection, stream);
@@ -398,7 +541,7 @@ impl Server {
                   self.control(now, handle, connection)?;
                } else {
                   peer.opening.insert(id, Deframer::default());
-                  self.opening(handle, connection, id)?;
+                  self.opening(now, handle, connection, id)?;
                }
             }
          },
@@ -414,9 +557,14 @@ impl Server {
             if peer.control == Some(id) {
                self.control(now, handle, connection)?;
             } else {
-               self.opening(handle, connection, id)?;
+               self.opening(now, handle, connection, id)?;
             }
          },
+         // A client that closed the connection is done with its sessions, and
+         // one that went silent may come back for them.
+         Event::ConnectionLost {
+            reason: ConnectionError::TimedOut | ConnectionError::Reset,
+         } => self.park(now, handle),
          Event::ConnectionLost { .. } => {
             self.peers.remove(&handle);
          },
@@ -523,8 +671,6 @@ impl App for Server {
       handle: ConnectionHandle,
       connection: &mut Connection,
    ) -> Result<Option<Instant>> {
-      self.waker.clear();
-
       let deadline = match self.pump(now, handle, connection) {
          Ok(deadline) => deadline,
          Err(error) => {
@@ -546,6 +692,15 @@ impl App for Server {
       }
 
       Ok(deadline)
+   }
+
+   fn idle(&mut self, now: Instant) -> Result<Option<Instant>> {
+      self.parked.retain(|_, parked| {
+         parked.sessions.retain(|_, session| !session.idle(now));
+         !parked.sessions.is_empty() && now < parked.expires
+      });
+
+      Ok(self.parked.values().map(|parked| parked.expires).min())
    }
 
    fn done(&self) -> bool {
@@ -580,6 +735,7 @@ pub fn run() -> Result<()> {
 
    let mut server = Server {
       peers: HashMap::new(),
+      parked: HashMap::new(),
       helper,
       waker: Arc::new(Waker::new()?),
    };

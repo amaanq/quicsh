@@ -68,12 +68,14 @@ use quicsh::{
       exporter,
    },
    control::{
+      DETACH_LIMIT,
       Deframer,
       Message,
       Open,
       Outbox,
       Size,
       Terminal,
+      Token,
    },
    forward::Forwards,
    key::PublicKey,
@@ -100,6 +102,7 @@ use quicsh::{
 };
 use quinn_proto::{
    Connection,
+   ConnectionError,
    ConnectionHandle,
    Dir,
    Event,
@@ -132,6 +135,10 @@ use crate::{
 const WORKER_POLL: Duration = Duration::from_millis(20);
 /// How often the loop checks the terminal size.
 const RESIZE_POLL: Duration = Duration::from_millis(250);
+/// How long one attempt to reach the server again may take.
+const ATTEMPT: Duration = Duration::from_secs(5);
+/// Pause between attempts while no network reaches the server.
+const REDIAL: Duration = Duration::from_secs(1);
 /// TLS server name, unused because the host key is checked instead.
 const SERVER_NAME: &str = "quicsh";
 /// The number this client gives its one session.
@@ -293,8 +300,20 @@ struct Shell {
 
 /// Event loop state for one connection to a server.
 struct Client {
-   /// Who to log in as, until the handshake finishes.
-   login:    Option<Login>,
+   /// The connection in use. `None` asks `main` to dial again.
+   current:  Option<ConnectionHandle>,
+   /// Who to log in as.
+   login:    Login,
+   /// What the server takes to give the session to a new connection.
+   token:    Option<Token>,
+   /// When the connection died, until the session is resumed.
+   lost:     Option<Instant>,
+   /// When the current attempt to reach the server again began, until its
+   /// handshake finishes.
+   dialed:   Option<Instant>,
+   /// The stream that asks for the session back, with the server's answer
+   /// so far and the request not yet sent.
+   resuming: Option<(StreamId, Deframer, Outbox)>,
    /// The session to start after login.
    shell:    Option<Shell>,
    /// Whether to forward the local SSH agent.
@@ -384,8 +403,106 @@ impl Client {
       let mut session = Relay::new(stream, Some(input), Some(output), Vec::new(), false);
       session.prefix(Message::Open(open).encode());
 
+      if interactive {
+         session.remember();
+      }
+
       self.writers.push(handle);
       self.session = Some(session);
+      Ok(())
+   }
+
+   /// Whether a new connection could take over the session. Only a terminal
+   /// session can, since the server keeps no other kind.
+   const fn resumable(&self) -> bool {
+      self.token.is_some() && self.size.is_some() && self.session.is_some() && self.status.is_none()
+   }
+
+   /// Gives up the dead connection. The terminal leaves raw mode so that
+   /// Ctrl-C reaches this process while it has no server to send it to.
+   fn suspend(&mut self, now: Instant) {
+      self.current = None;
+
+      if self.lost.is_none() {
+         self.raw = None;
+         self.lost = Some(now);
+         eprintln!("\r\nqsh: connection lost, reconnecting. Ctrl-C gives up.");
+      }
+   }
+
+   /// Forgets everything that belonged to the dead connection.
+   fn reset(&mut self, now: Instant) {
+      self.dialed = Some(now);
+      self.accepted = false;
+      self.control = None;
+      self.deframer = Deframer::default();
+      self.outbox = Outbox::default();
+      self.attempts = None;
+      self.next = None;
+      self.resuming = None;
+      self.opening.clear();
+      self.forwards = Forwards::default();
+      self.heading = None;
+      self.errors = None;
+   }
+
+   /// Asks the server for the session on a new stream.
+   fn rejoin(&mut self, connection: &mut Connection) -> Result<()> {
+      let token = self.token.context("no session to resume")?;
+      let session = self.session.as_ref().context("no session to resume")?;
+
+      let stream = connection
+         .streams()
+         .open(Dir::Bi)
+         .context("no stream credit")?;
+      connection.send_stream(stream).set_priority(1)?;
+
+      let mut outbox = Outbox::default();
+      outbox.push(&Message::Resume {
+         token,
+         session: SESSION,
+         received: session.taken(),
+      });
+
+      self.resuming = Some((stream, Deframer::default(), outbox));
+      Ok(())
+   }
+
+   /// Reads the server's answer to [`Client::rejoin`] and continues the
+   /// session on the new stream.
+   fn resumed(&mut self, connection: &mut Connection) -> Result<()> {
+      let Some((stream, ref mut deframer, _)) = self.resuming else {
+         return Ok(());
+      };
+
+      let (chunks, finished) = drain(connection, stream)?;
+
+      for bytes in chunks {
+         deframer.push(&bytes);
+      }
+
+      let received = match deframer.pop()? {
+         Some(Message::Resumed { received }) => received,
+         Some(Message::Gone) => bail!("the session ended while the connection was down"),
+         Some(_) => bail!("unexpected answer to a resume request"),
+         None if finished => bail!("the server gave no answer to a resume request"),
+         None => return Ok(()),
+      };
+
+      let rest = self
+         .resuming
+         .take()
+         .map_or_else(Vec::new, |(_, answer, _)| answer.into_rest());
+
+      self
+         .session
+         .as_mut()
+         .context("no session to resume")?
+         .resume(connection, stream, Vec::new(), received, (rest, finished));
+
+      self.lost = None;
+      self.raw = Some(RawMode::enable()?);
+      eprint!("qsh: reconnected\r\n");
       Ok(())
    }
 
@@ -521,6 +638,60 @@ impl Client {
       Ok(())
    }
 
+   /// Handles what arrived on the control stream.
+   fn control(&mut self, connection: &mut Connection, id: StreamId) -> Result<()> {
+      for bytes in drain(connection, id)?.0 {
+         self.deframer.push(&bytes);
+      }
+
+      while let Some(message) = self.deframer.pop()? {
+         match message {
+            Message::Accepted { token } => {
+               self.attempts = None;
+               self.next = None;
+               self.accepted = true;
+               self.listen();
+
+               if self.session.is_some() {
+                  self.rejoin(connection)?;
+               } else {
+                  self.token = Some(token);
+
+                  if let Some(shell) = self.shell.take() {
+                     self.start(shell, connection)?;
+                  }
+               }
+            },
+            Message::Rejected => {
+               if let Some(ref next) = self.next {
+                  let _ = next.send(());
+               }
+            },
+            Message::Exit { status, .. } => self.status = Some(status),
+            Message::Listening { listener, port } => {
+               let chosen = usize::try_from(listener)
+                  .ok()
+                  .and_then(|index| self.remotes.get(index))
+                  .is_some_and(|remote| remote.port == 0);
+
+               if chosen {
+                  eprintln!("Allocated port {port} for remote forward\r");
+               }
+            },
+            Message::Refused { listener } => {
+               let port = usize::try_from(listener)
+                  .ok()
+                  .and_then(|index| self.remotes.get(index))
+                  .map_or(0, |remote| remote.port);
+               eprintln!("Warning: remote port forwarding failed for listen port {port}\r");
+            },
+            _ => bail!("unexpected control message from the server"),
+         }
+      }
+
+      Ok(())
+   }
+
    /// Sends the next signed login when the authentication thread has one.
    fn login(&mut self, connection: &mut Connection) -> Result<()> {
       let Some(ref attempts) = self.attempts else {
@@ -553,14 +724,20 @@ impl App for Client {
 
    fn event(
       &mut self,
-      _now: Instant,
-      _handle: ConnectionHandle,
+      now: Instant,
+      handle: ConnectionHandle,
       connection: &mut Connection,
       event: Event,
    ) -> Result<()> {
+      if Some(handle) != self.current {
+         return Ok(());
+      }
+
       match event {
          Event::Connected => {
-            let login = self.login.take().context("connected twice")?;
+            self.dialed = None;
+
+            let login = self.login.clone();
             let host_key = tls::peer_key(connection)?;
             let secret = exporter(connection)?;
 
@@ -577,49 +754,16 @@ impl App for Client {
                }
             });
          },
+         Event::Stream(StreamEvent::Readable { id })
+            if self
+               .resuming
+               .as_ref()
+               .is_some_and(|&(stream, ..)| stream == id) =>
+         {
+            self.resumed(connection)?;
+         },
          Event::Stream(StreamEvent::Readable { id }) if Some(id) == self.control => {
-            for bytes in drain(connection, id)?.0 {
-               self.deframer.push(&bytes);
-            }
-
-            while let Some(message) = self.deframer.pop()? {
-               match message {
-                  Message::Accepted => {
-                     self.attempts = None;
-                     self.next = None;
-                     self.accepted = true;
-                     self.listen();
-
-                     if let Some(shell) = self.shell.take() {
-                        self.start(shell, connection)?;
-                     }
-                  },
-                  Message::Rejected => {
-                     if let Some(ref next) = self.next {
-                        let _ = next.send(());
-                     }
-                  },
-                  Message::Exit { status, .. } => self.status = Some(status),
-                  Message::Listening { listener, port } => {
-                     let chosen = usize::try_from(listener)
-                        .ok()
-                        .and_then(|index| self.remotes.get(index))
-                        .is_some_and(|remote| remote.port == 0);
-
-                     if chosen {
-                        eprintln!("Allocated port {port} for remote forward\r");
-                     }
-                  },
-                  Message::Refused { listener } => {
-                     let port = usize::try_from(listener)
-                        .ok()
-                        .and_then(|index| self.remotes.get(index))
-                        .map_or(0, |remote| remote.port);
-                     eprintln!("Warning: remote port forwarding failed for listen port {port}\r");
-                  },
-                  _ => bail!("unexpected control message from the server"),
-               }
-            }
+            self.control(connection, id)?;
          },
          Event::Stream(StreamEvent::Opened { dir: Dir::Uni }) => {
             while let Some(stream) = connection.streams().accept(Dir::Uni) {
@@ -641,7 +785,15 @@ impl App for Client {
             self.opened(connection, id)?;
          },
          Event::Stream(StreamEvent::Readable { .. }) => self.heading(connection)?,
-         Event::ConnectionLost { reason } => bail!("connection lost: {reason}"),
+         Event::ConnectionLost { reason } => {
+            let silent = matches!(reason, ConnectionError::TimedOut | ConnectionError::Reset);
+
+            if !silent || !self.resumable() {
+               bail!("connection lost: {reason}");
+            }
+
+            self.suspend(now);
+         },
          _ => {},
       }
 
@@ -651,16 +803,36 @@ impl App for Client {
    fn tick(
       &mut self,
       now: Instant,
-      _handle: ConnectionHandle,
+      handle: ConnectionHandle,
       connection: &mut Connection,
    ) -> Result<Option<Instant>> {
-      self.waker.clear();
+      if Some(handle) != self.current {
+         return Ok(None);
+      }
+
+      // A handshake retransmits ever more slowly, so a new attempt reaches a
+      // server that just became reachable sooner than a long one does.
+      let limit = self
+         .dialed
+         .filter(|_| self.lost.is_some())
+         .map(|at| at + ATTEMPT);
+
+      if limit.is_some_and(|at| now >= at) {
+         connection.close(now, VarInt::from_u32(0), Bytes::new());
+         self.suspend(now);
+         return Ok(None);
+      }
+
       self.login(connection)?;
       self.connect(connection)?;
       self.forwards.pump(connection, &self.waker)?;
 
-      for relay in self.session.iter_mut().chain(&mut self.errors) {
-         relay.pump(connection)?;
+      if let Some((stream, _, ref mut request)) = self.resuming {
+         request.flush(connection, stream)?;
+      } else if self.accepted {
+         for relay in self.session.iter_mut().chain(&mut self.errors) {
+            relay.pump(connection)?;
+         }
       }
 
       if let Some(last) = self.size {
@@ -692,6 +864,7 @@ impl App for Client {
       // No handler reports a changed window, so a resize is noticed by
       // polling the terminal size.
       Ok([
+         limit,
          self.attempts.is_some().then_some(now + WORKER_POLL),
          self.size.is_some().then_some(now + RESIZE_POLL),
       ]
@@ -701,7 +874,7 @@ impl App for Client {
    }
 
    fn done(&self) -> bool {
-      self.done
+      self.done || self.current.is_none()
    }
 
    fn waker(&self) -> Option<&Waker> {
@@ -742,16 +915,26 @@ fn main() -> Result<()> {
    }
 
    let mut transport = Transport::new(Tuning::default())?;
-   transport.connect(
-      Instant::now(),
-      address,
-      SERVER_NAME,
-      tls::client()?,
-      INTERACTIVE_WINDOW,
-   )?;
+
+   let dial = |endpoint: &mut Transport| -> Result<ConnectionHandle> {
+      let handle = endpoint.connect(
+         Instant::now(),
+         address,
+         SERVER_NAME,
+         tls::client()?,
+         INTERACTIVE_WINDOW,
+      )?;
+
+      Ok(handle)
+   };
 
    let mut client = Client {
-      login: Some(login),
+      current: Some(dial(&mut transport)?),
+      login,
+      token: None,
+      lost: None,
+      dialed: None,
+      resuming: None,
       shell: (!options.forward).then_some(Shell {
          command:  (!options.command.is_empty()).then(|| options.command.join(" ")),
          terminal: options.terminal,
@@ -778,7 +961,28 @@ fn main() -> Result<()> {
       done: false,
    };
 
-   transport.run(&mut client)?;
+   loop {
+      transport.run(&mut client)?;
+
+      let Some(since) = client.lost.filter(|_| !client.done) else {
+         break;
+      };
+
+      client.current = loop {
+         if shutdown_requested() || since.elapsed() >= DETACH_LIMIT {
+            bail!("connection lost");
+         }
+
+         client.reset(Instant::now());
+
+         // Dialing fails while no network reaches the server.
+         if let Ok(handle) = dial(&mut transport) {
+            break Some(handle);
+         }
+
+         thread::sleep(REDIAL);
+      };
+   }
 
    let status = client.status.unwrap_or(255);
    let writers = mem::take(&mut client.writers);

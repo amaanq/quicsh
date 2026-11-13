@@ -213,10 +213,21 @@ pub trait App {
       connection: &mut Connection,
    ) -> Result<Option<Instant>, Self::Error>;
 
+   /// Runs once per loop iteration after every [`App::tick`], also when
+   /// there is no connection, and returns the next instant the app wants to
+   /// run at.
+   ///
+   /// # Errors
+   ///
+   /// An error stops [`Transport::run`].
+   fn idle(&mut self, _now: Instant) -> Result<Option<Instant>, Self::Error> {
+      Ok(None)
+   }
+
    fn done(&self) -> bool;
 
-   /// A waker whose signal should also end the loop's wait. The app clears
-   /// it from [`App::tick`].
+   /// A waker whose signal should also end the loop's wait. The loop clears
+   /// it before it calls the app.
    fn waker(&self) -> Option<&Waker> {
       None
    }
@@ -748,6 +759,12 @@ impl Transport {
       loop {
          let now = Instant::now();
 
+         // Clearing before any work means a signal that arrives during the
+         // work ends the next wait.
+         if let Some(waker) = app.waker() {
+            waker.clear();
+         }
+
          handles.clear();
          handles.extend(self.sessions.keys().copied());
 
@@ -807,6 +824,10 @@ impl Transport {
             {
                deadline = Some(deadline.map_or(at, |current| current.min(at)));
             }
+         }
+
+         if let Some(at) = app.idle(now)? {
+            deadline = Some(deadline.map_or(at, |current| current.min(at)));
          }
 
          if app.done() {
