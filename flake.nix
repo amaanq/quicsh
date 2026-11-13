@@ -70,6 +70,7 @@
 
       checks = forAllSystems (system: {
         quicsh = self.packages.${system}.quicsh;
+        module = (pkgsFor system).callPackage ./nix/test.nix { inherit self; };
       });
 
       formatter = forAllSystems (system: (pkgsFor system).nixfmt-tree);
