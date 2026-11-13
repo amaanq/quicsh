@@ -60,24 +60,7 @@ use misstep::{
    bail,
 };
 use pound::Parse as _;
-use quinn_proto::{
-   Connection,
-   ConnectionHandle,
-   Dir,
-   Event,
-   StreamEvent,
-   StreamId,
-   VarInt,
-};
-use rustix::termios::{
-   OptionalActions,
-   Termios,
-   isatty,
-   tcgetattr,
-   tcgetwinsize,
-   tcsetattr,
-};
-use ssh_quic::{
+use quicsh::{
    agent::Agent,
    auth::{
       Request,
@@ -115,6 +98,23 @@ use ssh_quic::{
       drain,
    },
 };
+use quinn_proto::{
+   Connection,
+   ConnectionHandle,
+   Dir,
+   Event,
+   StreamEvent,
+   StreamId,
+   VarInt,
+};
+use rustix::termios::{
+   OptionalActions,
+   Termios,
+   isatty,
+   tcgetattr,
+   tcgetwinsize,
+   tcsetattr,
+};
 
 use crate::{
    forward::{
@@ -133,7 +133,7 @@ const WORKER_POLL: Duration = Duration::from_millis(20);
 /// How often the loop checks the terminal size.
 const RESIZE_POLL: Duration = Duration::from_millis(250);
 /// TLS server name, unused because the host key is checked instead.
-const SERVER_NAME: &str = "ssh-quic";
+const SERVER_NAME: &str = "quicsh";
 /// The number this client gives its one session.
 const SESSION: u32 = 1;
 
@@ -148,7 +148,7 @@ fn home() -> Result<PathBuf> {
 /// contact.
 fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
    let ssh = home()?.join(".ssh");
-   let own = ssh.join("known_hosts_quic");
+   let own = ssh.join("known_hosts_quicsh");
 
    let mut known = String::new();
 

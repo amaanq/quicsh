@@ -14,7 +14,7 @@ use misstep::{
    Result,
    ResultExt as _,
 };
-use ssh_quic::{
+use quicsh::{
    DEFAULT_PORT,
    key::PublicKey,
 };
@@ -39,7 +39,7 @@ pub struct Login {
 
 /// SSH over QUIC client.
 #[derive(pound::Parse)]
-#[pound(name = "ssh-quic", version = env!("CARGO_PKG_VERSION"))]
+#[pound(name = "qsh", version = env!("CARGO_PKG_VERSION"))]
 pub struct Options {
    /// Forward the local SSH agent to the session.
    #[pound(short = 'A')]

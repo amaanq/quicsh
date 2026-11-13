@@ -30,7 +30,7 @@ use misstep::{
    ResultExt as _,
    bail,
 };
-use ssh_quic::pipe::Waker;
+use quicsh::pipe::Waker;
 
 /// SOCKS protocol version this proxy speaks.
 const SOCKS_VERSION: u8 = 5;

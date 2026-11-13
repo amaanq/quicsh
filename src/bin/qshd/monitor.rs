@@ -51,6 +51,17 @@ use misstep::{
    ensure,
    report,
 };
+use quicsh::{
+   auth::{
+      self,
+      Account,
+   },
+   control::Open,
+   key::private_from_openssh,
+   pipe::reopen,
+   tls,
+   transport::udp_socket,
+};
 use ring::rand::{
    SecureRandom as _,
    SystemRandom,
@@ -80,17 +91,6 @@ use rustix::{
 use rustls::{
    SignatureScheme,
    sign::SigningKey,
-};
-use ssh_quic::{
-   auth::{
-      self,
-      Account,
-   },
-   control::Open,
-   key::private_from_openssh,
-   pipe::reopen,
-   tls,
-   transport::udp_socket,
 };
 
 use crate::{
@@ -235,7 +235,7 @@ impl Monitor {
          .fill(&mut random)
          .map_err(|_| report!("system random source failed"))?;
 
-      let directory = env::temp_dir().join(format!("ssh-quic-{:016x}", u64::from_be_bytes(random)));
+      let directory = env::temp_dir().join(format!("quicsh-{:016x}", u64::from_be_bytes(random)));
       let socket = directory.join("agent.sock");
 
       DirBuilder::new()

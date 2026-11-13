@@ -11,7 +11,7 @@ use std::net::Ipv6Addr;
 
 use misstep::Result;
 use pound::Parse as _;
-use ssh_quic::DEFAULT_PORT;
+use quicsh::DEFAULT_PORT;
 
 use crate::{
    child::Launch,

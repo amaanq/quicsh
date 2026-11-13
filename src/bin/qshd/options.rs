@@ -11,7 +11,7 @@ use std::{
 
 /// SSH over QUIC server.
 #[derive(pound::Parse)]
-#[pound(name = "ssh-quicd", version = env!("CARGO_PKG_VERSION"))]
+#[pound(name = "qshd", version = env!("CARGO_PKG_VERSION"))]
 pub struct Options {
    /// Address and UDP port to listen on. An IPv6 address also serves IPv4,
    /// and the default is [::]:22.

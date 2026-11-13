@@ -52,7 +52,7 @@ use crate::{
 };
 
 /// ALPN protocol name.
-const ALPN: &[u8] = b"ssh-quic";
+const ALPN: &[u8] = b"quicsh";
 
 /// The ring provider limited to one cipher suite.
 fn provider() -> Arc<CryptoProvider> {

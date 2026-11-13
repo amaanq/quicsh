@@ -32,9 +32,9 @@ use crate::{
 };
 
 /// TLS exporter label that binds a login to one connection.
-const EXPORTER_LABEL: &[u8] = b"EXPORTER-ssh-quic-auth";
+const EXPORTER_LABEL: &[u8] = b"EXPORTER-quicsh-auth";
 /// `SSHSIG` namespace that keeps these signatures out of other protocols.
-const NAMESPACE: &[u8] = b"ssh-quic-auth";
+const NAMESPACE: &[u8] = b"quicsh-auth";
 
 /// The secret both sides derive from this connection's TLS handshake.
 ///

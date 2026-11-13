@@ -22,6 +22,7 @@ use misstep::{
    ResultExt as _,
    bail,
 };
+use quicsh::auth::Account;
 use rustix::{
    process::{
       Gid,
@@ -38,7 +39,6 @@ use rustix::{
       set_thread_uid,
    },
 };
-use ssh_quic::auth::Account;
 
 /// `PATH` for sessions when the server has none.
 const FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin";

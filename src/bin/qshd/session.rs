@@ -20,6 +20,15 @@ use misstep::{
    Result,
    bail,
 };
+use quicsh::{
+   control::Size,
+   pipe::{
+      Waker,
+      reader,
+      writer,
+   },
+   relay::Relay,
+};
 use quinn_proto::{
    Connection,
    Dir,
@@ -28,15 +37,6 @@ use quinn_proto::{
 use rustix::termios::{
    Winsize,
    tcsetwinsize,
-};
-use ssh_quic::{
-   control::Size,
-   pipe::{
-      Waker,
-      reader,
-      writer,
-   },
-   relay::Relay,
 };
 
 use crate::privsep::{

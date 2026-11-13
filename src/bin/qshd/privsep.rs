@@ -34,6 +34,18 @@ use misstep::{
    bail,
    report,
 };
+use quicsh::{
+   auth,
+   control::{
+      Message,
+      Open,
+   },
+   error::Error,
+   wire::{
+      Reader,
+      put_string,
+   },
+};
 use rustix::{
    cmsg_space,
    event::{
@@ -51,18 +63,6 @@ use rustix::{
       SendFlags,
       recvmsg,
       sendmsg,
-   },
-};
-use ssh_quic::{
-   auth,
-   control::{
-      Message,
-      Open,
-   },
-   error::Error,
-   wire::{
-      Reader,
-      put_string,
    },
 };
 
