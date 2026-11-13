@@ -384,6 +384,8 @@ impl Monitor {
       let grant = self.grants.get(&id).context("unknown grant")?;
       ensure!(grant.permit.terminal, "this key may not open a terminal");
 
+      sweep(&self.holders);
+
       let mut token = Token::default();
       SystemRandom::new()
          .fill(&mut token)
@@ -611,15 +613,34 @@ fn holders() -> Result<PathBuf> {
       .create(&directory)
       .with_context(|| format!("creating {}", directory.display()))?;
 
-   for entry in fs::read_dir(&directory)?.filter_map(io::Result::ok) {
-      let socket = entry.file_type().is_ok_and(|kind| kind.is_socket());
-
-      if socket && Monitor::holder(&entry.path()).is_err() {
-         let _ = fs::remove_file(entry.path());
-      }
-   }
+   sweep(&directory);
 
    Ok(directory)
+}
+
+/// Removes the sockets of holders that are gone. A holder started by an
+/// earlier monitor has nobody waiting for it, and connecting to find out
+/// whether it lives would take a running session from its client, so the
+/// kernel's list of bound sockets decides.
+fn sweep(directory: &Path) {
+   let (Ok(bound), Ok(entries)) = (
+      fs::read_to_string("/proc/net/unix"),
+      fs::read_dir(directory),
+   ) else {
+      return;
+   };
+
+   for entry in entries.filter_map(io::Result::ok) {
+      let path = entry.path();
+      let socket = entry.file_type().is_ok_and(|kind| kind.is_socket());
+      let live = path
+         .to_str()
+         .is_none_or(|name| bound.lines().any(|line| line.ends_with(name)));
+
+      if socket && !live {
+         let _ = fs::remove_file(path);
+      }
+   }
 }
 
 /// Starts the network process and serves it until it exits.
