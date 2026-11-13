@@ -69,6 +69,9 @@ pub struct Login {
    /// The character that starts an order to this program at the start of
    /// a line, when there is one.
    pub escape:      Option<u8>,
+   /// How long the first connection may take per address, from
+   /// `ConnectTimeout`.
+   pub timeout:     Option<Duration>,
 }
 
 /// How a connection is shared with other runs of this program.
@@ -514,6 +517,16 @@ impl Options {
          control,
          environment: environment(&host)?,
          escape: escape(self.escape.as_deref().or(host.escape.as_deref()))?,
+         timeout: match host.connect_timeout.as_deref() {
+            None | Some("none" | "0") => None,
+            Some(seconds) => {
+               let count = seconds
+                  .parse::<u64>()
+                  .context("ConnectTimeout takes a number of seconds")?;
+
+               Some(Duration::from_secs(count))
+            },
+         },
          user,
          host: name,
          port,

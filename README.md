@@ -215,8 +215,8 @@ batch into real packets there, and I haven't measured it between two machines.
   `User`, `IdentityFile`, `IdentityAgent`, `ProxyJump`, `ForwardAgent`,
   `LocalForward`, `RemoteForward`, `DynamicForward`, `ClearAllForwardings`,
   `RequestTTY`, `RemoteCommand`, `StrictHostKeyChecking`, `HostKeyAlias`,
-  `ControlMaster`, `ControlPath`, `ControlPersist`, `EscapeChar`, `SendEnv`,
-  `SetEnv` and `QshPort` are read.
+  `ControlMaster`, `ControlPath`, `ControlPersist`, `ConnectTimeout`,
+  `EscapeChar`, `SendEnv`, `SetEnv` and `QshPort` are read.
   `ControlPath` takes `%h`, `%n`, `%p`, `%r`, `%u`, `%i` and `%C`, and `%C`
   is not the hash `ssh` computes. `StrictHostKeyChecking no` behaves like
   `accept-new`, so a changed host key is always refused. `Match` checks

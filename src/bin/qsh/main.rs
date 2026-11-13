@@ -1085,11 +1085,13 @@ impl App for Client {
 
       // A handshake retransmits ever more slowly, so a new attempt reaches a
       // server that just became reachable sooner than a long one does. The
-      // first attempts are cut short only while another address is left.
+      // first attempts are cut short only while another address is left, or
+      // by `ConnectTimeout`.
+      let again = (self.lost.is_some() || self.spares > 0).then_some(ATTEMPT);
+      let first = self.login.timeout.filter(|_| self.lost.is_none());
       let limit = self
          .dialed
-         .filter(|_| self.lost.is_some() || self.spares > 0)
-         .map(|at| at + ATTEMPT);
+         .and_then(|at| Some(at + again.into_iter().chain(first).min()?));
 
       if limit.is_some_and(|at| now >= at) {
          connection.close(now, VarInt::from_u32(0), Bytes::new());
