@@ -4,7 +4,10 @@
 use std::{
    collections::HashMap,
    io,
-   net::Ipv4Addr,
+   net::{
+      Ipv4Addr,
+      SocketAddr,
+   },
    os::{
       fd::AsFd as _,
       unix::net::UnixListener,
@@ -82,6 +85,13 @@ const MAX_FORWARDS: usize = 256;
 const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
 const PROTOCOL_ERROR: VarInt = VarInt::from_u32(1);
 const AUTH_FAILED: VarInt = VarInt::from_u32(2);
+
+/// The client's address, with an IPv4 client of the IPv6 socket in IPv4 form.
+fn origin(connection: &Connection) -> SocketAddr {
+   let address = connection.remote_address();
+   SocketAddr::new(address.ip().to_canonical(), address.port())
+}
+
 /// A host key that only the monitor can sign with.
 #[derive(Debug)]
 struct RemoteKey {
@@ -192,7 +202,7 @@ impl Server {
                let granted = self.helper.login(request, exporter(connection)?)?;
 
                let reply = if granted.is_some() {
-                  println!("accepted {label} from {}", connection.remote_address());
+                  println!("accepted {label} from {}", origin(connection));
                   Message::Accepted
                } else {
                   Message::Rejected
@@ -463,7 +473,7 @@ impl App for Server {
       // One client's protocol violation ends that connection and leaves the
       // server running.
       if let Err(error) = self.handle(now, handle, connection, &event) {
-         eprintln!("closing {}: {error}", connection.remote_address());
+         eprintln!("closing {}: {error}", origin(connection));
          self.drop_peer(now, handle, connection);
       }
 
@@ -481,7 +491,7 @@ impl App for Server {
       let deadline = match self.pump(now, handle, connection) {
          Ok(deadline) => deadline,
          Err(error) => {
-            eprintln!("closing {}: {error}", connection.remote_address());
+            eprintln!("closing {}: {error}", origin(connection));
             self.drop_peer(now, handle, connection);
             return Ok(None);
          },

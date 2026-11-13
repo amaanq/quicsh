@@ -5,7 +5,7 @@ mod options;
 mod privsep;
 mod session;
 
-use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 
 use misstep::Result;
 use pound::Parse as _;
@@ -28,7 +28,7 @@ fn main() -> Result<()> {
          monitor::run(Settings {
             listen:          options
                .listen
-               .unwrap_or_else(|| (Ipv4Addr::UNSPECIFIED, DEFAULT_PORT).into()),
+               .unwrap_or_else(|| (Ipv6Addr::UNSPECIFIED, DEFAULT_PORT).into()),
             host_key:        options.host_key,
             authorized_keys: options.authorized_keys,
             user:            options.user,

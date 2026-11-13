@@ -13,7 +13,8 @@ use std::{
 #[derive(pound::Parse)]
 #[pound(name = "ssh-quicd", version = env!("CARGO_PKG_VERSION"))]
 pub struct Options {
-   /// Address and UDP port to listen on, 0.0.0.0:22 when not given.
+   /// Address and UDP port to listen on. An IPv6 address also serves IPv4,
+   /// and the default is [::]:22.
    #[pound(long, value_name = "ADDR:PORT")]
    pub listen:          Option<SocketAddr>,
    /// The ed25519 host key in OpenSSH format.

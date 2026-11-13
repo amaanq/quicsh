@@ -83,6 +83,7 @@ use rustix::{
       sockopt::{
          ip_mtu,
          ipv6_mtu,
+         set_ipv6_v6only,
          set_socket_reuseport,
       },
    },
@@ -228,7 +229,8 @@ pub fn drain(connection: &mut Connection, id: StreamId) -> Result<(Vec<Bytes>, b
 }
 
 /// A UDP socket bound to `local` that shares the port with other sockets,
-/// and connected to `remote` when one is given.
+/// and connected to `remote` when one is given. An IPv6 `local` accepts IPv4
+/// peers too.
 ///
 /// # Errors
 ///
@@ -243,6 +245,13 @@ pub fn udp_socket(local: SocketAddr, remote: Option<SocketAddr>) -> io::Result<O
 
    let fd = socket_with(family, SocketType::DGRAM, SocketFlags::CLOEXEC, None)?;
    set_socket_reuseport(&fd, true)?;
+
+   // An IPv6 socket also carries IPv4, as IPv4-mapped addresses, whatever
+   // the `net.ipv6.bindv6only` sysctl says.
+   if local.is_ipv6() {
+      set_ipv6_v6only(&fd, false)?;
+   }
+
    bind(&fd, &local)?;
 
    if let Some(remote) = remote {
@@ -281,7 +290,9 @@ impl Socket {
 
    /// Largest UDP payload that fits the route this connected socket uses.
    fn payload_bound(&self, remote: SocketAddr) -> Result<u16, Error> {
-      let (mtu, overhead, ceiling) = if remote.is_ipv4() {
+      // An IPv4 peer of an IPv6 socket has an IPv4-mapped address and still
+      // travels in IPv4 packets.
+      let (mtu, overhead, ceiling) = if remote.ip().to_canonical().is_ipv4() {
          (ip_mtu(&self.io), 28, MAX_UDP_PAYLOAD_V4)
       } else {
          (ipv6_mtu(&self.io), 48, MAX_UDP_PAYLOAD)
@@ -678,10 +689,16 @@ impl Transport {
       // The reply must leave from the address the client sent to, so the
       // connected socket binds that address when the kernel reported it.
       let remote = incoming.remote_address();
-      let local = SocketAddr::new(
-         incoming.local_ip().unwrap_or_else(|| listener.local.ip()),
-         listener.local.port(),
-      );
+      let destination = incoming.local_ip().unwrap_or_else(|| listener.local.ip());
+
+      // The kernel reports an IPv4 destination in IPv4 form even on an IPv6
+      // socket, which can bind only the mapped form.
+      let local_ip = match (destination, remote) {
+         (IpAddr::V4(address), SocketAddr::V6(_)) => address.to_ipv6_mapped().into(),
+         (address, _) => address,
+      };
+
+      let local = SocketAddr::new(local_ip, listener.local.port());
 
       // Each handshake costs a signature and a socket before the client has
       // proved anything, so a flood of first packets is cut off here.
