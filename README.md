@@ -23,6 +23,7 @@ afford to lose :)
 - `-L`, `-R` and `-D` (SOCKS5) forwarding
 - Agent forwarding with `-A`
 - IPv4 and IPv6 on one socket
+- Roaming. A session carries on when the client changes networks
 - `ed25519` keys, signed through `ssh-agent`
 - `ed25519-sk` keys in the same way, though I haven't tried one against real
   hardware yet
@@ -106,8 +107,8 @@ switch. I'd like to close that gap, but it isn't closed.
   instead of being honored without its restriction.
 - Accounts that only exist in LDAP or another NSS source. Lookups read
   `/etc/passwd`.
-- Roaming between networks, reattaching to a session after a disconnect, and a
-  post-quantum key exchange. These are planned.
+- Reattaching to a session after a disconnect, and a post-quantum key
+  exchange. These are planned.
 - Anything but Linux.
 
 ## Building

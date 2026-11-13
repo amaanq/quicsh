@@ -75,10 +75,13 @@ use rustix::{
    io::Errno,
    net::{
       AddressFamily,
+      RecvFlags,
       SocketFlags,
       SocketType,
       bind,
       connect,
+      netlink::SocketAddrNetlink,
+      recv,
       socket_with,
       sockopt::{
          ip_mtu,
@@ -122,6 +125,12 @@ const IDLE_TIMEOUT_MS: u32 = 60_000;
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// Handshakes allowed in progress at once.
 const MAX_HANDSHAKES: usize = 64;
+/// Silence from the peer before a dialed connection tests its path.
+const PATIENCE: Duration = Duration::from_secs(1);
+/// Longest gap between attempts to move a silent connection to a new socket.
+const PATIENCE_CEILING: Duration = Duration::from_secs(8);
+/// The `RTMGRP` netlink groups for IPv4 and IPv6 address and route changes.
+const NETWORK_CHANGES: u32 = 0x10 | 0x40 | 0x100 | 0x400;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Congestion {
@@ -272,6 +281,20 @@ pub fn udp_socket(local: SocketAddr, remote: Option<SocketAddr>) -> io::Result<O
    Ok(fd)
 }
 
+/// Opens a netlink socket that turns readable when an address or a route
+/// changes.
+fn network_changes() -> io::Result<OwnedFd> {
+   let fd = socket_with(
+      AddressFamily::NETLINK,
+      SocketType::RAW,
+      SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
+      None,
+   )?;
+
+   bind(&fd, &SocketAddrNetlink::new(0, NETWORK_CHANGES))?;
+   Ok(fd)
+}
+
 /// Makes the socket for one accepted connection, bound to the first address
 /// and connected to the second.
 pub type Opener = Box<dyn Fn(SocketAddr, SocketAddr) -> io::Result<OwnedFd>>;
@@ -288,6 +311,17 @@ impl Socket {
    /// Opens a socket bound to `local`.
    fn open(local: SocketAddr, remote: Option<SocketAddr>) -> Result<Self, Error> {
       Self::adopt(udp_socket(local, remote).map_err(Error::Socket)?)
+   }
+
+   /// Opens a socket connected to `peer` from whichever address routes there.
+   fn dial(peer: SocketAddr) -> Result<Self, Error> {
+      let unspecified = if peer.is_ipv4() {
+         Ipv4Addr::UNSPECIFIED.into()
+      } else {
+         Ipv6Addr::UNSPECIFIED.into()
+      };
+
+      Self::open(SocketAddr::new(unspecified, 0), Some(peer))
    }
 
    /// Takes over a socket that is already bound.
@@ -328,7 +362,10 @@ impl Socket {
       buffer: &mut [u8],
       metas: &mut [RecvMeta; BATCH_SIZE],
    ) -> Result<Option<usize>, Error> {
-      let mut slices: Vec<_> = buffer.chunks_mut(RECV_LEN).map(IoSliceMut::new).collect();
+      let mut slices = buffer
+         .chunks_mut(RECV_LEN)
+         .map(IoSliceMut::new)
+         .collect::<Vec<IoSliceMut>>();
 
       match self.state.recv((&self.io).into(), &mut slices, metas) {
          Ok(count) => Ok(Some(count)),
@@ -378,25 +415,144 @@ impl Socket {
    }
 }
 
+/// Watches the path of a dialed connection for silence.
+///
+/// A laptop that changes networks keeps a socket whose source address no
+/// longer exists. The kernel reports local changes, but a path can also die
+/// further away, where the only evidence is a peer that stopped answering.
+struct Probe {
+   /// When the oldest packet the peer has not answered went out.
+   unanswered: Option<Instant>,
+   /// Whether a ping already tested this silence.
+   pinged:     bool,
+   /// How long the silence lasts before the next step.
+   patience:   Duration,
+}
+
+impl Default for Probe {
+   fn default() -> Self {
+      Self {
+         unanswered: None,
+         pinged:     false,
+         patience:   PATIENCE,
+      }
+   }
+}
+
+/// Which side started a connection, which decides how it follows its peer.
+enum Role {
+   /// This side dialed, so it moves to a new socket when the path goes silent.
+   Dialed(Probe),
+   /// The peer dialed, so the socket follows the address the peer sends from.
+   Accepted,
+}
+
 /// One connection and the socket it owns.
 struct Session {
    /// The QUIC state machine.
    connection:   Connection,
    /// The connected socket.
    socket:       Socket,
+   /// The address the socket is connected to.
+   peer:         SocketAddr,
+   /// Which side dialed.
+   role:         Role,
    /// Smallest send window this connection gets.
    window_floor: u64,
 }
 
 impl Session {
-   /// Returns whether the connection still has packets to send.
+   /// Notes that the peer answered.
+   fn heard(&mut self) {
+      if let Role::Dialed(ref mut probe) = self.role {
+         *probe = Probe::default();
+      }
+   }
+
+   /// Reacts to a local address or route change. Moves to a new socket when
+   /// the route to the peer now leaves from another address, and tests the
+   /// path with a ping otherwise.
+   fn moved(&mut self) {
+      let Role::Dialed(ref mut probe) = self.role else {
+         return;
+      };
+
+      let source = |socket: &Socket| socket.io.local_addr().ok().map(|local| local.ip());
+
+      match Socket::dial(self.peer) {
+         Ok(socket) if source(&socket) != source(&self.socket) => {
+            self.socket = socket;
+            self.connection.local_address_changed();
+         },
+         Ok(_) | Err(_) => self.connection.ping(),
+      }
+
+      probe.pinged = true;
+   }
+
+   /// Tests a silent path with a ping, then moves to a new socket each time
+   /// the silence lasts. Returns when to look again.
+   fn probe(&mut self, now: Instant) -> Option<Instant> {
+      let Role::Dialed(ref mut probe) = self.role else {
+         return None;
+      };
+
+      let patience = probe.patience.max(self.connection.rtt() * 3);
+      let due = probe.unanswered? + patience;
+
+      if now < due {
+         return Some(due);
+      }
+
+      if probe.pinged {
+         // Opening fails while no network reaches the peer, and the next
+         // attempt may find one.
+         if let Ok(socket) = Socket::dial(self.peer) {
+            self.socket = socket;
+            self.connection.local_address_changed();
+         }
+
+         probe.patience = (probe.patience * 2).min(PATIENCE_CEILING);
+      } else {
+         self.connection.ping();
+         probe.pinged = true;
+      }
+
+      probe.unanswered = Some(now);
+      Some(now + probe.patience)
+   }
+
+   /// Moves an accepted connection's socket to the address its peer now
+   /// sends from, so a client that changed networks keeps a queue of its own.
+   fn follow(&mut self, listener: &Listener) {
+      let remote = self.connection.remote_address();
+
+      if !matches!(self.role, Role::Accepted) || remote == self.peer {
+         return;
+      }
+
+      self.peer = remote;
+
+      let local = listener.bound(self.connection.local_ip(), remote);
+      let opened = (listener.opener)(local, remote)
+         .ok()
+         .and_then(|fd| Socket::adopt(fd).ok());
+
+      if let Some(socket) = opened {
+         self.socket = socket;
+      }
+   }
+
+   /// Returns whether the connection still has packets to send. A failed send
+   /// counts as a lost packet, which the connection recovers from or times
+   /// out on.
    fn flush(
       &mut self,
       now: Instant,
       handle: ConnectionHandle,
       endpoint: &mut Endpoint,
       buffer: &mut Vec<u8>,
-   ) -> Result<bool, Error> {
+   ) -> bool {
       for _ in 0..SEND_ROUNDS {
          while let Some(event) = self.connection.poll_endpoint_events() {
             if let Some(reply) = endpoint.handle_event(handle, event) {
@@ -412,13 +568,22 @@ impl Session {
 
          buffer.clear();
          let Some(meta) = self.connection.poll_transmit(now, segments, buffer) else {
-            return Ok(false);
+            return false;
          };
 
-         self.socket.transmit(&meta, buffer)?;
+         let sent = self.socket.transmit(&meta, buffer);
+
+         if let Role::Dialed(ref mut probe) = self.role {
+            probe.unanswered.get_or_insert(now);
+            probe.pinged |= sent.is_err();
+         }
+
+         if sent.is_err() {
+            return false;
+         }
       }
 
-      Ok(true)
+      true
    }
 }
 
@@ -432,6 +597,21 @@ struct Listener {
    config: ServerConfig,
    /// Makes the socket for each new connection.
    opener: Opener,
+}
+
+impl Listener {
+   /// The address a connection's socket binds, given where the peer sent to
+   /// and from. A reply must leave from the address the peer sent to.
+   fn bound(&self, destination: Option<IpAddr>, remote: SocketAddr) -> SocketAddr {
+      // The kernel reports an IPv4 destination in IPv4 form even on an IPv6
+      // socket, which can bind only the mapped form.
+      let ip = match (destination.unwrap_or_else(|| self.local.ip()), remote) {
+         (IpAddr::V4(address), SocketAddr::V6(_)) => address.to_ipv6_mapped().into(),
+         (address, _) => address,
+      };
+
+      SocketAddr::new(ip, self.local.port())
+   }
 }
 
 /// Where a datagram batch came from.
@@ -452,6 +632,9 @@ pub struct Transport {
    sessions: BTreeMap<ConnectionHandle, Session>,
    /// Settings for new connections.
    tuning:   Tuning,
+   /// Turns readable when a local address or route changes. Present once the
+   /// transport has dialed a connection.
+   changes:  Option<OwnedFd>,
    /// Receive buffer.
    recv:     Vec<u8>,
    /// Send buffer.
@@ -507,6 +690,7 @@ impl Transport {
          listener,
          sessions: BTreeMap::new(),
          tuning,
+         changes: None,
          recv: vec![0; RECV_LEN * BATCH_SIZE],
          send: Vec::with_capacity(RECV_LEN),
       })
@@ -526,12 +710,11 @@ impl Transport {
       crypto: Arc<QuicClientConfig>,
       window_floor: u64,
    ) -> Result<ConnectionHandle, Error> {
-      let unspecified: IpAddr = if remote.is_ipv4() {
-         Ipv4Addr::UNSPECIFIED.into()
-      } else {
-         Ipv6Addr::UNSPECIFIED.into()
-      };
-      let socket = Socket::open(SocketAddr::new(unspecified, 0), Some(remote))?;
+      if self.changes.is_none() {
+         self.changes = Some(network_changes().map_err(Error::Socket)?);
+      }
+
+      let socket = Socket::dial(remote)?;
 
       let mut config = ClientConfig::new(crypto);
       config.transport_config(self.tuning.transport(socket.payload_bound(remote)?));
@@ -544,6 +727,8 @@ impl Transport {
       self.sessions.insert(handle, Session {
          connection,
          socket,
+         peer: remote,
+         role: Role::Dialed(Probe::default()),
          window_floor,
       });
       Ok(handle)
@@ -572,9 +757,14 @@ impl Transport {
             self.receive(now, Source::Session(handle))?;
          }
 
-         let mut deadline: Option<Instant> = None;
+         let moved = self.changed()?;
+         let mut deadline = Option::<Instant>::None;
 
          for (&handle, session) in &mut self.sessions {
+            if let Some(ref listener) = self.listener {
+               session.follow(listener);
+            }
+
             let connection = &mut session.connection;
 
             if connection.poll_timeout().is_some_and(|at| at <= now) {
@@ -598,10 +788,17 @@ impl Transport {
             }
 
             let wake = app.tick(now, handle, connection)?;
-            let backlog = session.flush(now, handle, &mut self.endpoint, &mut self.send)?;
+
+            if moved {
+               session.moved();
+            }
+
+            let silence = session.probe(now);
+            let backlog = session.flush(now, handle, &mut self.endpoint, &mut self.send);
 
             for at in [
                wake,
+               silence,
                session.connection.poll_timeout(),
                backlog.then_some(now),
             ]
@@ -623,6 +820,25 @@ impl Transport {
       }
    }
 
+   /// Drains the netlink socket and returns whether it reported a change.
+   fn changed(&mut self) -> Result<bool, Error> {
+      let Some(ref netlink) = self.changes else {
+         return Ok(false);
+      };
+
+      let mut seen = false;
+
+      loop {
+         match recv(netlink, self.recv.as_mut_slice(), RecvFlags::empty()) {
+            // ENOBUFS means the queue overflowed and the kernel dropped
+            // messages, which is still a change.
+            Ok(_) | Err(Errno::NOBUFS) => seen = true,
+            Err(Errno::WOULDBLOCK) => return Ok(seen),
+            Err(errno) => return Err(Error::Receive(errno.into())),
+         }
+      }
+   }
+
    /// Sleeps until a socket is readable, the waker fires or `deadline` passes.
    fn wait(&self, deadline: Option<Instant>, waker: Option<&Waker>) -> Result<(), Error> {
       let timeout = deadline.map(|at| {
@@ -634,14 +850,20 @@ impl Transport {
          }
       });
 
-      let mut sockets: Vec<_> = self
+      let mut sockets = self
          .listener
          .iter()
          .map(|listener| &listener.socket)
          .chain(self.sessions.values().map(|session| &session.socket))
          .map(|socket| PollFd::new(&socket.io, PollFlags::IN))
          .chain(waker.map(|eventfd| PollFd::new(eventfd, PollFlags::IN)))
-         .collect();
+         .chain(
+            self
+               .changes
+               .iter()
+               .map(|netlink| PollFd::new(netlink, PollFlags::IN)),
+         )
+         .collect::<Vec<PollFd>>();
 
       match poll(&mut sockets, timeout.as_ref()) {
          // A signal handler ran. The caller's tick decides what that means.
@@ -696,6 +918,7 @@ impl Transport {
          Some(DatagramEvent::ConnectionEvent(target, routed)) => {
             if let Some(session) = self.sessions.get_mut(&target) {
                session.connection.handle_event(routed);
+               session.heard();
             }
 
             Ok(())
@@ -713,19 +936,8 @@ impl Transport {
          return Ok(());
       };
 
-      // The reply must leave from the address the client sent to, so the
-      // connected socket binds that address when the kernel reported it.
       let remote = incoming.remote_address();
-      let destination = incoming.local_ip().unwrap_or_else(|| listener.local.ip());
-
-      // The kernel reports an IPv4 destination in IPv4 form even on an IPv6
-      // socket, which can bind only the mapped form.
-      let local_ip = match (destination, remote) {
-         (IpAddr::V4(address), SocketAddr::V6(_)) => address.to_ipv6_mapped().into(),
-         (address, _) => address,
-      };
-
-      let local = SocketAddr::new(local_ip, listener.local.port());
+      let local = listener.bound(incoming.local_ip(), remote);
 
       // Each handshake costs a signature and a socket before the client has
       // proved anything, so a flood of first packets is cut off here.
@@ -756,6 +968,8 @@ impl Transport {
             let session = Session {
                connection,
                socket,
+               peer: remote,
+               role: Role::Accepted,
                window_floor: INTERACTIVE_WINDOW,
             };
             self.sessions.insert(handle, session);
