@@ -20,8 +20,48 @@ thiserror   = "2.0.21"
 zeroize     = "1.9.1"
 
 [lints.clippy]
-nursery  = { level = "warn", priority = -1 }
-pedantic = { level = "warn", priority = -1 }
+cargo       = { level = "warn", priority = -1 }
+nursery     = { level = "warn", priority = -1 }
+pedantic    = { level = "warn", priority = -1 }
+restriction = { level = "warn", priority = -1 }
+
+blanket_clippy_restriction_lints = "allow"
+
+arbitrary_source_item_ordering  = "allow"
+arithmetic_side_effects         = "allow"
+as_conversions                  = "allow"
+big_endian_bytes                = "allow"
+default_numeric_fallback        = "allow"
+else_if_without_else            = "allow"
+error_impl_error                = "allow"
+exhaustive_enums                = "allow"
+exhaustive_structs              = "allow"
+float_arithmetic                = "allow"
+implicit_return                 = "allow"
+indexing_slicing                = "allow"
+integer_division                = "allow"
+integer_division_remainder_used = "allow"
+let_underscore_must_use         = "allow"
+let_underscore_untyped          = "allow"
+map_err_ignore                  = "allow"
+missing_inline_in_public_items  = "allow"
+missing_trait_methods           = "allow"
+module_name_repetitions         = "allow"
+multiple_crate_versions         = "allow"
+must_use_without_reason         = "allow"
+print_stderr                    = "allow"
+print_stdout                    = "allow"
+question_mark_used              = "allow"
+ref_patterns                    = "allow"
+renamed_function_params         = "allow"
+rest_pat_in_fully_bound_structs = "allow"
+rest_pattern_accessible_field   = "allow"
+separated_literal_suffix        = "allow"
+single_call_fn                  = "allow"
+std_instead_of_alloc            = "allow"
+std_instead_of_core             = "allow"
+tests_outside_test_module       = "allow"
+wildcard_enum_match_arm         = "allow"
 
 [lints.rust]
 unsafe_code = "forbid"
