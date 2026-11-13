@@ -94,6 +94,9 @@ Host box
    QshPort 4222
 ```
 
+Accounts come from `/etc/passwd`, and from `getent` for the ones that live in
+LDAP or `systemd-homed`.
+
 Host keys are checked against `~/.ssh/known_hosts` first. Keys you accept at
 the prompt are written to `~/.ssh/known_hosts_quicsh`, and your OpenSSH file is
 never modified.
@@ -173,8 +176,6 @@ switch. I'd like to close that gap, but it isn't closed.
   line with any other option, such as `expiry-time=` or `environment=`, is
   skipped instead of being honored without its restriction. `from=` matches
   addresses and networks and never host names.
-- Accounts that only exist in LDAP or another NSS source. Lookups read
-  `/etc/passwd`.
 - Restarts for anything but terminal sessions. Remote commands on pipes and
   open forwarded connections end with the server.
 - Anything but Linux.

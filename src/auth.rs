@@ -18,6 +18,10 @@ use std::{
       Path,
       PathBuf,
    },
+   process::{
+      Command,
+      Stdio,
+   },
 };
 
 use quinn_proto::Connection;
@@ -130,8 +134,7 @@ impl Request {
    }
 }
 
-/// A local user from `/etc/passwd`. Users that exist only in NSS sources such
-/// as LDAP are not found.
+/// A user of this machine.
 pub struct Account {
    pub name:  String,
    pub uid:   u32,
@@ -141,13 +144,22 @@ pub struct Account {
 }
 
 impl Account {
+   /// Finds `name` in `/etc/passwd`, then in the other sources `getent`
+   /// knows.
+   ///
    /// # Errors
    ///
    /// Fails when `/etc/passwd` cannot be read.
    pub fn lookup(name: &str) -> Result<Option<Self>, Error> {
       let passwd = fs::read_to_string("/etc/passwd").map_err(Error::Passwd)?;
 
-      Ok(passwd.lines().find_map(|line| {
+      Ok(Self::listed(&passwd, name).or_else(|| Self::listed(&getent("passwd", name)?, name)))
+   }
+
+   /// The entry for `name` among `passwd` lines. `getent` also answers a
+   /// user ID with the entry it belongs to, so the name must match.
+   fn listed(passwd: &str, name: &str) -> Option<Self> {
+      passwd.lines().find_map(|line| {
          let fields = line.split(':').collect::<Vec<&str>>();
          let [user, _password, uid, gid, _gecos, home, shell] = *fields.as_slice() else {
             return None;
@@ -162,11 +174,11 @@ impl Account {
             home:  PathBuf::from(home),
             shell: PathBuf::from(shell),
          })
-      }))
+      })
    }
 
-   /// The primary group followed by every group in `/etc/group` that lists
-   /// this account as a member.
+   /// The primary group followed by every group that lists this account as
+   /// a member, in `/etc/group` or in the other sources `getent` knows.
    ///
    /// # Errors
    ///
@@ -186,7 +198,23 @@ impl Account {
             .then(|| gid.parse().ok())?
       });
 
-      Ok(iter::once(self.gid).chain(supplementary).collect())
+      let mut groups = iter::once(self.gid)
+         .chain(supplementary)
+         .collect::<Vec<u32>>();
+
+      let known = getent("initgroups", &self.name).unwrap_or_default();
+
+      for gid in known
+         .split_ascii_whitespace()
+         .skip(1)
+         .filter_map(|field| field.parse().ok())
+      {
+         if !groups.contains(&gid) {
+            groups.push(gid);
+         }
+      }
+
+      Ok(groups)
    }
 
    /// Whether `key` may log in to this account.
@@ -238,6 +266,34 @@ impl Account {
          (metadata.uid() == self.uid || metadata.uid() == 0) && metadata.mode() & 0o022 == 0
       })
    }
+}
+
+/// What `getent` prints for `key` in `database`, which covers LDAP,
+/// `systemd-homed` and whatever else the name service switch lists. `None`
+/// means it found nothing or is not installed. A name that could pass for
+/// an option is never handed over.
+fn getent(database: &str, key: &str) -> Option<String> {
+   let plain = !key.is_empty()
+      && !key.starts_with('-')
+      && key
+         .chars()
+         .all(|letter| letter.is_ascii_alphanumeric() || "._@-".contains(letter));
+
+   let output = plain
+      .then(|| {
+         Command::new("getent")
+            .args([database, "--", key])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+      })
+      .flatten()?;
+
+   output
+      .status
+      .success()
+      .then(|| String::from_utf8(output.stdout).ok())?
 }
 
 /// What a key may do, from the options on its `authorized_keys` line.
