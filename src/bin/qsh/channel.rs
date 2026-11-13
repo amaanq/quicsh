@@ -7,10 +7,18 @@ use std::{
       Write as _,
    },
    os::fd::OwnedFd,
-   sync::Arc,
+   sync::{
+      Arc,
+      mpsc::{
+         Receiver,
+         Sender,
+         channel,
+      },
+   },
    thread::JoinHandle,
 };
 
+use bytes::Bytes;
 use misstep::{
    OptionExt as _,
    Result,
@@ -26,6 +34,7 @@ use quicsh::{
       Token,
    },
    pipe::{
+      Filter,
       Waker,
       reader_until,
       writer,
@@ -42,12 +51,19 @@ use quinn_proto::{
    StreamId,
    VarInt,
 };
-use rustix::termios::{
-   OptionalActions,
-   Termios,
-   tcgetattr,
-   tcgetwinsize,
-   tcsetattr,
+use rustix::{
+   process::{
+      Signal,
+      getpid,
+      kill_process,
+   },
+   termios::{
+      OptionalActions,
+      Termios,
+      tcgetattr,
+      tcgetwinsize,
+      tcsetattr,
+   },
 };
 
 use crate::mux::Notice;
@@ -85,6 +101,70 @@ pub fn window(descriptor: &File) -> Result<Size> {
       columns: size.ws_col,
       rows:    size.ws_row,
    })
+}
+
+/// What the user asks of this program in the middle of a session.
+enum Order {
+   /// End the session without waiting for the server.
+   Disconnect,
+   /// Stop this program, as the shell's job control does.
+   Suspend,
+   /// List the escape sequences.
+   Help,
+}
+
+/// Takes the escape sequences out of a terminal's input, which are the
+/// escape character at the start of a line and one more character.
+struct Escapes {
+   /// The escape character.
+   key:    u8,
+   /// Whether the last character passed on ended a line.
+   fresh:  bool,
+   /// Whether the last character read was the escape character.
+   armed:  bool,
+   /// Takes the orders.
+   orders: Sender<Order>,
+   /// Tells the event loop about an order.
+   waker:  Arc<Waker>,
+}
+
+impl Escapes {
+   /// What of `input` goes to the session.
+   fn filter(&mut self, input: &[u8]) -> Bytes {
+      let mut passed = Vec::with_capacity(input.len() + 1);
+
+      for &byte in input {
+         if self.armed {
+            self.armed = false;
+
+            let order = match byte {
+               b'.' => Some(Order::Disconnect),
+               0x1A => Some(Order::Suspend),
+               b'?' => Some(Order::Help),
+               _ => None,
+            };
+
+            if let Some(given) = order {
+               let _ = self.orders.send(given);
+               self.waker.wake();
+               continue;
+            }
+
+            // The escape character twice sends it once.
+            if byte != self.key {
+               passed.push(self.key);
+            }
+         } else if self.fresh && byte == self.key {
+            self.armed = true;
+            continue;
+         }
+
+         self.fresh = matches!(byte, b'\r' | b'\n');
+         passed.push(byte);
+      }
+
+      passed.into()
+   }
 }
 
 /// Who started a session and hears how it goes.
@@ -137,6 +217,10 @@ pub struct Channel {
    writers:  Vec<JoinHandle<()>>,
    /// Exit status of the remote command.
    status:   Option<u32>,
+   /// The escape character for a session on a terminal.
+   escape:   Option<u8>,
+   /// Yields what the user asks for with escape sequences.
+   orders:   Option<Receiver<Order>>,
 }
 
 impl Drop for Channel {
@@ -147,7 +231,7 @@ impl Drop for Channel {
 
 impl Channel {
    /// A session that starts once the server accepted the login.
-   pub fn new(open: Open, stdio: Streams, owner: Owner) -> Result<Self> {
+   pub fn new(open: Open, stdio: Streams, owner: Owner, escape: Option<u8>) -> Result<Self> {
       Ok(Self {
          open: Some(open),
          stdio,
@@ -162,6 +246,8 @@ impl Channel {
          size: None,
          writers: Vec::new(),
          status: None,
+         escape,
+         orders: None,
       })
    }
 
@@ -267,9 +353,25 @@ impl Channel {
          self.raw(true)?;
       }
 
+      let filter = self.escape.filter(|_| self.interactive()).map(|key| {
+         let (orders, given) = channel();
+         self.orders = Some(given);
+
+         let mut escapes = Escapes {
+            key,
+            fresh: true,
+            armed: false,
+            orders,
+            waker: Arc::clone(waker),
+         };
+
+         Box::new(move |input: &[u8]| escapes.filter(input)) as Filter
+      });
+
       let input = reader_until(
          self.stdio.input.try_clone()?,
          Arc::clone(&self.stop),
+         filter,
          Arc::clone(waker),
       );
       let (output, handle) = writer(self.stdio.output.try_clone()?, Arc::clone(waker));
@@ -288,6 +390,40 @@ impl Channel {
 
       self.writers.push(handle);
       self.relay = Some(relay);
+      Ok(())
+   }
+
+   /// Does what the user asked for with escape sequences.
+   fn obey(&mut self) -> Result<()> {
+      while let Some(order) = self
+         .orders
+         .as_ref()
+         .and_then(|orders| orders.try_recv().ok())
+      {
+         match (order, &self.owner) {
+            (Order::Disconnect, _) => self.fail("disconnected"),
+            (Order::Suspend, &Owner::Process(_)) => {
+               self.raw(false)?;
+               kill_process(getpid(), Signal::TSTP)?;
+               self.raw(true)?;
+            },
+            // The qsh that holds the connection reads this terminal, and it
+            // would go on reading it while the other one is stopped.
+            (Order::Suspend, &Owner::Peer(_)) => {
+               self.notice("a session on a shared connection cannot be suspended");
+            },
+            (Order::Help, _) => {
+               let key = self.escape.map_or('~', char::from);
+               let _ = write!(
+                  self.stdio.errors,
+                  "{key}?\r\nSupported escape sequences:\r\n {key}.   end the session\r\n \
+                   {key}^Z  suspend qsh\r\n {key}?   this message\r\n {key}{key}   send the \
+                   escape character\r\n(Each one counts only at the start of a line.)\r\n"
+               );
+            },
+         }
+      }
+
       Ok(())
    }
 
@@ -424,6 +560,8 @@ impl Channel {
       connection: &mut Connection,
       outbox: &mut Outbox,
    ) -> Result<()> {
+      self.obey()?;
+
       if let Some((stream, _, ref mut request)) = self.resuming {
          request.flush(connection, stream)?;
          return Ok(());
@@ -511,5 +649,52 @@ impl Channel {
       if let Owner::Peer(ref socket) = self.owner {
          Notice::Exit(status).send(socket);
       }
+   }
+}
+
+#[cfg(test)]
+mod tests {
+   use std::sync::{
+      Arc,
+      mpsc::channel,
+   };
+
+   use quicsh::pipe::Waker;
+
+   use crate::channel::{
+      Escapes,
+      Order,
+   };
+
+   /// A sequence counts at the start of a line only, also when its two
+   /// characters arrive apart, and the escape character twice sends one.
+   #[test]
+   fn escape_sequences() {
+      let (orders, given) = channel();
+
+      let mut escapes = Escapes {
+         key: b'~',
+         fresh: true,
+         armed: false,
+         orders,
+         waker: Arc::new(Waker::new().unwrap()),
+      };
+
+      let mut passed = Vec::new();
+
+      for input in ["~", "?a~.\r~~b\n~", "x\r", "~."] {
+         passed.extend_from_slice(&escapes.filter(input.as_bytes()));
+      }
+
+      assert_eq!(passed, b"a~.\r~b\n~x\r", "what the session gets");
+      assert!(
+         matches!(given.try_recv(), Ok(Order::Help)),
+         "split over two reads"
+      );
+      assert!(
+         matches!(given.try_recv(), Ok(Order::Disconnect)),
+         "at the start of a line"
+      );
+      assert!(given.try_recv().is_err(), "not in the middle of a line");
    }
 }

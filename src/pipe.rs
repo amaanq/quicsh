@@ -150,22 +150,36 @@ pub fn reopen(descriptor: RawFd) -> io::Result<File> {
    File::open(format!("/proc/self/fd/{descriptor}"))
 }
 
+/// Turns what a reader read into what it passes on, which may be nothing.
+pub type Filter = Box<dyn FnMut(&[u8]) -> Bytes + Send>;
+
 /// Reads `source` until it ends. The channel closes at end of input, and a
 /// full channel pauses reading.
 #[must_use]
 pub fn reader(source: File, waker: Arc<Waker>) -> Receiver<Bytes> {
-   spawn_reader(source, None, waker)
+   spawn_reader(source, None, None, waker)
 }
 
 /// Reads like [`reader`] and also ends once `stop` is woken. The thread then
 /// leaves `source` alone, as it must when another program reads it next.
+/// Everything read goes through `filter` when there is one.
 #[must_use]
-pub fn reader_until(source: File, stop: Arc<Waker>, waker: Arc<Waker>) -> Receiver<Bytes> {
-   spawn_reader(source, Some(stop), waker)
+pub fn reader_until(
+   source: File,
+   stop: Arc<Waker>,
+   filter: Option<Filter>,
+   waker: Arc<Waker>,
+) -> Receiver<Bytes> {
+   spawn_reader(source, Some(stop), filter, waker)
 }
 
 /// Starts the thread behind [`reader`] and [`reader_until`].
-fn spawn_reader(mut source: File, stop: Option<Arc<Waker>>, waker: Arc<Waker>) -> Receiver<Bytes> {
+fn spawn_reader(
+   mut source: File,
+   stop: Option<Arc<Waker>>,
+   mut filter: Option<Filter>,
+   waker: Arc<Waker>,
+) -> Receiver<Bytes> {
    let (chunks, receiver) = sync_channel(QUEUE);
 
    thread::spawn(move || {
@@ -195,10 +209,16 @@ fn spawn_reader(mut source: File, stop: Option<Arc<Waker>>, waker: Arc<Waker>) -
             Ok(0) | Err(_) => break,
          };
 
-         if chunks
-            .send(Bytes::copy_from_slice(&buffer[..count]))
-            .is_err()
-         {
+         let read = &buffer[..count];
+         let chunk = filter
+            .as_mut()
+            .map_or_else(|| Bytes::copy_from_slice(read), |change| change(read));
+
+         if chunk.is_empty() {
+            continue;
+         }
+
+         if chunks.send(chunk).is_err() {
             break;
          }
 

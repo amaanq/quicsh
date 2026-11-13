@@ -66,6 +66,9 @@ pub struct Login {
    pub control:     Option<Control>,
    /// Variables for the session's environment, from `SendEnv` and `SetEnv`.
    pub environment: Vec<(String, String)>,
+   /// The character that starts an order to this program at the start of
+   /// a line, when there is one.
+   pub escape:      Option<u8>,
 }
 
 /// How a connection is shared with other runs of this program.
@@ -141,6 +144,10 @@ pub struct Options {
    /// Ask for the subsystem COMMAND names, as sftp and scp do.
    #[pound(short = 's')]
    pub subsystem:  bool,
+   /// The character that starts an escape sequence at the start of a line,
+   /// which may be written as ^X. none turns the sequences off.
+   #[pound(short = 'e', value_name = "CHAR")]
+   pub escape:     Option<String>,
    /// Accepted for scp and ignored, since nothing forwards X11.
    #[pound(short = 'x')]
    pub no_x11:     bool,
@@ -225,6 +232,18 @@ fn socket(named: Option<&str>) -> Option<PathBuf> {
          )
       },
    }
+}
+
+/// The escape character that `EscapeChar` or `-e` names, which is `~` when
+/// neither does.
+fn escape(named: Option<&str>) -> Result<Option<u8>> {
+   Ok(match named.map(str::as_bytes) {
+      None => Some(b'~'),
+      Some(text) if text.eq_ignore_ascii_case(b"none") => None,
+      Some(&[b'^', letter]) if letter.is_ascii() => Some(letter.to_ascii_uppercase() ^ 0x40),
+      Some(&[symbol]) if symbol.is_ascii() => Some(symbol),
+      Some(_) => bail!("the escape character is one character, ^X or none"),
+   })
 }
 
 /// The variables that `SendEnv` takes from this process and the ones that
@@ -494,6 +513,7 @@ impl Options {
       Ok(Login {
          control,
          environment: environment(&host)?,
+         escape: escape(self.escape.as_deref().or(host.escape.as_deref()))?,
          user,
          host: name,
          port,

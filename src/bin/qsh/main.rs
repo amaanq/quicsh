@@ -656,7 +656,7 @@ impl Client {
                self.issued += 1;
                self.agent |= open.agent;
 
-               let mut channel = Channel::new(open, stdio, Owner::Peer(socket))?;
+               let mut channel = Channel::new(open, stdio, Owner::Peer(socket), self.login.escape)?;
 
                if self.accepted {
                   channel.start(self.issued, connection, &self.waker)?;
@@ -1470,7 +1470,12 @@ fn first(options: &Options, login: &Login, relaying: bool) -> Result<BTreeMap<u3
 
       channels.insert(
          1,
-         Channel::new(request(options, login)?, stdio, Owner::Process(None))?,
+         Channel::new(
+            request(options, login)?,
+            stdio,
+            Owner::Process(None),
+            login.escape,
+         )?,
       );
    }
 

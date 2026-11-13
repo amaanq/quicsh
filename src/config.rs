@@ -7,9 +7,10 @@
 //! - `HostName`, `User`, `IdentityFile`, `IdentityAgent`, `ProxyJump`,
 //!   `ForwardAgent`, the three forward keywords, `ClearAllForwardings`,
 //!   `RequestTTY`, `RemoteCommand`, `StrictHostKeyChecking`, `HostKeyAlias`,
-//!   `ControlMaster`, `ControlPath`, `ControlPersist`, `SendEnv` and `SetEnv`.
-//!   As in OpenSSH, only the first `SetEnv` line counts. `Port` is ignored,
-//!   because it names sshd's TCP port and says nothing about the UDP port.
+//!   `ControlMaster`, `ControlPath`, `ControlPersist`, `EscapeChar`, `SendEnv`
+//!   and `SetEnv`. As in OpenSSH, only the first `SetEnv` line counts. `Port`
+//!   is ignored, because it names sshd's TCP port and says nothing about the
+//!   UDP port.
 //! - `QshPort` for the UDP port, which OpenSSH skips once the file says
 //!   `IgnoreUnknown QshPort`.
 //! - As in OpenSSH, the first value found for a keyword wins and identity files
@@ -69,6 +70,8 @@ pub struct Host {
    pub control_path:    Option<String>,
    /// `ControlPersist`, as written.
    pub control_persist: Option<String>,
+   /// `EscapeChar`, as written.
+   pub escape:          Option<String>,
    /// The `SendEnv` patterns that name local variables to pass on.
    pub send_env:        Vec<String>,
    /// The `NAME=VALUE` words of the first `SetEnv` line.
@@ -238,6 +241,7 @@ impl Host {
             "controlmaster" => Some(&mut self.control_master),
             "controlpath" => Some(&mut self.control_path),
             "controlpersist" => Some(&mut self.control_persist),
+            "escapechar" => Some(&mut self.escape),
             _ => None,
          };
 
