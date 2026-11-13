@@ -33,8 +33,8 @@ afford to lose :)
 - Restarting `qshd` under a terminal session. The session lives in a process
   of its own, and `qsh` reattaches with the next packet it sends, a keystroke
   or the keep-alive that goes out every 15 seconds
-- `ed25519`, ECDSA (P-256 and P-384) and RSA keys, signed through `ssh-agent`
-  or `ssh-keygen`
+- `ed25519`, ECDSA (P-256, P-384 and P-521) and RSA keys, signed through
+  `ssh-agent` or `ssh-keygen`
 - `ed25519-sk` keys in the same way, with the PIN and the touch
 
 ## Usage
@@ -185,9 +185,9 @@ batch into real packets there, and I haven't measured it between two machines.
   `RequestTTY`, `RemoteCommand`, `StrictHostKeyChecking`, `HostKeyAlias` and
   `QshPort` are read. `StrictHostKeyChecking no` behaves like `accept-new`,
   so a changed host key is always refused.
-- P-521 keys, RSA keys under 2048 bits and RSA signatures over SHA-1.
+- RSA keys under 2048 bits and RSA signatures over SHA-1.
   `ecdsa-sk` keys are accepted but nobody has tried one.
-- RSA host keys. `qshd` takes an `ed25519`, P-256 or P-384 key.
+- RSA and P-521 host keys. `qshd` takes an `ed25519`, P-256 or P-384 key.
 - A few `authorized_keys` options. `command=`, `from=`, `expiry-time=`,
   `permitopen=`, `permitlisten=`, `restrict`, `no-touch-required`,
   `verify-required` and the `pty`, `agent-forwarding` and `port-forwarding`

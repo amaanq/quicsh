@@ -11,6 +11,11 @@ use std::{
    str::FromStr,
 };
 
+use p521::ecdsa::{
+   Signature,
+   VerifyingKey,
+   signature::Verifier as _,
+};
 use ring::{
    digest::{
       SHA256,
@@ -20,7 +25,6 @@ use ring::{
       ECDSA_P256_SHA256_FIXED,
       ECDSA_P384_SHA384_FIXED,
       ED25519,
-      EcdsaVerificationAlgorithm,
       RSA_PKCS1_2048_8192_SHA256,
       RSA_PKCS1_2048_8192_SHA512,
       RsaPublicKeyComponents,
@@ -80,12 +84,13 @@ const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwx
 pub enum Curve {
    P256,
    P384,
+   P521,
 }
 
 impl Curve {
    /// The curve an SSH key type name or curve name stands for.
    fn named(name: &[u8]) -> Option<Self> {
-      [Self::P256, Self::P384]
+      [Self::P256, Self::P384, Self::P521]
          .into_iter()
          .find(|curve| name == curve.key_name() || name == curve.name())
    }
@@ -95,6 +100,7 @@ impl Curve {
       match self {
          Self::P256 => b"nistp256",
          Self::P384 => b"nistp384",
+         Self::P521 => b"nistp521",
       }
    }
 
@@ -103,32 +109,37 @@ impl Curve {
       match self {
          Self::P256 => b"ecdsa-sha2-nistp256",
          Self::P384 => b"ecdsa-sha2-nistp384",
+         Self::P521 => b"ecdsa-sha2-nistp521",
       }
    }
 
-   /// DER bytes that precede the point in a `SubjectPublicKeyInfo` document.
-   const fn spki_prefix(self) -> &'static [u8] {
+   /// DER bytes that precede the point in a `SubjectPublicKeyInfo` document,
+   /// for the curves a host key may be on.
+   const fn spki_prefix(self) -> Option<&'static [u8]> {
       match self {
          Self::P256 => {
-            &[
+            Some(&[
                0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01, 0x06,
                0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
-            ]
+            ])
          },
          Self::P384 => {
-            &[
+            Some(&[
                0x30, 0x76, 0x30, 0x10, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01, 0x06,
                0x05, 0x2B, 0x81, 0x04, 0x00, 0x22, 0x03, 0x62, 0x00,
-            ]
+            ])
          },
+         Self::P521 => None,
       }
    }
 
-   /// Content of the DER object identifier of the curve.
-   const fn identifier(self) -> &'static [u8] {
+   /// Content of the DER object identifier of the curve, for the curves a
+   /// host key may be on.
+   const fn identifier(self) -> Option<&'static [u8]> {
       match self {
-         Self::P256 => &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07],
-         Self::P384 => &[0x2B, 0x81, 0x04, 0x00, 0x22],
+         Self::P256 => Some(&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]),
+         Self::P384 => Some(&[0x2B, 0x81, 0x04, 0x00, 0x22]),
+         Self::P521 => None,
       }
    }
 
@@ -137,15 +148,31 @@ impl Curve {
       match self {
          Self::P256 => 32,
          Self::P384 => 48,
+         Self::P521 => 66,
       }
    }
 
-   /// How ring checks a signature made on the curve.
-   fn algorithm(self) -> &'static EcdsaVerificationAlgorithm {
-      match self {
+   /// Checks the two numbers of an SSH signature, `raw`, over `message`.
+   /// ring has no P-521, so the `p521` crate checks that curve.
+   fn verify(self, point: &[u8], message: &[u8], raw: &[u8]) -> Result<(), Error> {
+      let joined = fixed(raw, self.width())?;
+
+      let algorithm = match self {
          Self::P256 => &ECDSA_P256_SHA256_FIXED,
          Self::P384 => &ECDSA_P384_SHA384_FIXED,
-      }
+         Self::P521 => {
+            let key = VerifyingKey::from_sec1_bytes(point).map_err(|_| Error::Signature)?;
+            let signature = Signature::from_slice(&joined).map_err(|_| Error::Signature)?;
+
+            return key
+               .verify(message, &signature)
+               .map_err(|_| Error::Signature);
+         },
+      };
+
+      UnparsedPublicKey::new(algorithm, point)
+         .verify(message, &joined)
+         .map_err(|_| Error::Signature)
    }
 }
 
@@ -290,7 +317,7 @@ impl PublicKey {
       [Curve::P256, Curve::P384]
          .into_iter()
          .find_map(|curve| {
-            let point = der.strip_prefix(curve.spki_prefix())?;
+            let point = der.strip_prefix(curve.spki_prefix()?)?;
 
             (point.len() == curve.width() * 2 + 1).then(|| {
                Self::Ecdsa {
@@ -382,12 +409,12 @@ impl PublicKey {
             UnparsedPublicKey::new(&ED25519, key).verify(&signed, raw)
          },
          Self::Ecdsa { curve, ref point } => {
-            UnparsedPublicKey::new(curve.algorithm(), point)
-               .verify(&signed, &fixed(raw, curve.width())?)
+            curve.verify(point, &signed, raw)?;
+            Ok(())
          },
          Self::SkEcdsa { ref point, .. } => {
-            UnparsedPublicKey::new(Curve::P256.algorithm(), point)
-               .verify(&signed, &fixed(raw, Curve::P256.width())?)
+            Curve::P256.verify(point, &signed, raw)?;
+            Ok(())
          },
          Self::Rsa {
             ref exponent,
@@ -477,7 +504,7 @@ fn sec1(curve: Curve, private: &mut Reader<'_>) -> Result<PrivateKeyDer<'static>
 
    let point = private.string()?;
    let scalar = unsigned(private.string()?);
-   let identifier = curve.identifier();
+   let identifier = curve.identifier().ok_or(Error::PrivateKey)?;
    let width = curve.width();
 
    let padding = width.checked_sub(scalar.len()).ok_or(Error::PrivateKey)?;

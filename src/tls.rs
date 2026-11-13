@@ -85,9 +85,12 @@ pub const fn scheme(key: &PublicKey) -> Result<SignatureScheme, Error> {
       PublicKey::Ecdsa {
          curve: Curve::P384, ..
       } => Ok(SignatureScheme::ECDSA_NISTP384_SHA384),
-      PublicKey::SkEd25519 { .. } | PublicKey::SkEcdsa { .. } | PublicKey::Rsa { .. } => {
-         Err(Error::KeyType)
-      },
+      PublicKey::Ecdsa {
+         curve: Curve::P521, ..
+      }
+      | PublicKey::SkEd25519 { .. }
+      | PublicKey::SkEcdsa { .. }
+      | PublicKey::Rsa { .. } => Err(Error::KeyType),
    }
 }
 
