@@ -460,11 +460,13 @@ impl Socket {
          Ok(count) => Ok(Some(count)),
          // A peer whose port closed answers with ICMP, which a connected socket
          // reports once as ECONNREFUSED. The idle timeout ends that connection.
+         // A router that drops an MTU probe answers the same way, as EMSGSIZE.
          Err(error)
-            if matches!(
-               error.kind(),
-               io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionRefused
-            ) =>
+            if is_msg_size_err(&error)
+               || matches!(
+                  error.kind(),
+                  io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionRefused
+               ) =>
          {
             Ok(None)
          },
