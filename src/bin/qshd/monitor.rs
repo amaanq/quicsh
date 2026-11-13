@@ -234,6 +234,7 @@ impl Monitor {
          now: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(u64::MAX, |since| since.as_secs()),
+         certificate: login.certificate.as_deref(),
       };
 
       let Some(permit) = account.authorizes(&login.key, keys_file, &attempt)? else {

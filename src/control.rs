@@ -19,6 +19,7 @@ use quinn_proto::{
 
 use crate::{
    auth::Request,
+   certificate::Certificate,
    error::Error,
    key::PublicKey,
    wire::{
@@ -344,6 +345,9 @@ impl Message {
             put_string(&mut payload, request.user.as_bytes());
             put_string(&mut payload, &request.key.to_blob());
             put_string(&mut payload, &request.signature);
+
+            let certificate = request.certificate.as_deref();
+            put_string(&mut payload, certificate.map_or(&[], Certificate::to_blob));
          },
          Self::Accepted => payload.push(ACCEPTED),
          Self::Rejected => payload.push(REJECTED),
@@ -494,6 +498,11 @@ impl Message {
                user,
                key: PublicKey::from_blob(reader.string()?)?,
                signature: reader.string()?.to_vec(),
+               certificate: Some(reader.string()?)
+                  .filter(|blob| !blob.is_empty())
+                  .map(Certificate::from_blob)
+                  .transpose()?
+                  .map(Box::new),
             })
          },
          ACCEPTED => Self::Accepted,

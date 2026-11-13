@@ -4,13 +4,13 @@
 //! - `Match` blocks with `all`, `host`, `originalhost`, `user` and `localuser`.
 //!   A block with any other condition is skipped, since nothing here runs a
 //!   command or reads the file twice.
-//! - `HostName`, `User`, `IdentityFile`, `IdentityAgent`, `ProxyJump`,
-//!   `ForwardAgent`, the three forward keywords, `ClearAllForwardings`,
-//!   `RequestTTY`, `RemoteCommand`, `StrictHostKeyChecking`, `HostKeyAlias`,
-//!   `ControlMaster`, `ControlPath`, `ControlPersist`, `ConnectTimeout`,
-//!   `EscapeChar`, `SendEnv` and `SetEnv`. As in OpenSSH, only the first
-//!   `SetEnv` line counts. `Port` is ignored, because it names sshd's TCP port
-//!   and says nothing about the UDP port.
+//! - `HostName`, `User`, `IdentityFile`, `CertificateFile`, `IdentityAgent`,
+//!   `ProxyJump`, `ForwardAgent`, the three forward keywords,
+//!   `ClearAllForwardings`, `RequestTTY`, `RemoteCommand`,
+//!   `StrictHostKeyChecking`, `HostKeyAlias`, `ControlMaster`, `ControlPath`,
+//!   `ControlPersist`, `ConnectTimeout`, `EscapeChar`, `SendEnv` and `SetEnv`.
+//!   As in OpenSSH, only the first `SetEnv` line counts. `Port` is ignored,
+//!   because it names sshd's TCP port and says nothing about the UDP port.
 //! - `QshPort` for the UDP port, which OpenSSH skips once the file says
 //!   `IgnoreUnknown QshPort`.
 //! - As in OpenSSH, the first value found for a keyword wins and identity files
@@ -70,6 +70,8 @@ pub struct Host {
    pub control_path:    Option<String>,
    /// `ControlPersist`, as written.
    pub control_persist: Option<String>,
+   /// Every `CertificateFile`, in order.
+   pub certificates:    Vec<PathBuf>,
    /// `ConnectTimeout`, as written.
    pub connect_timeout: Option<String>,
    /// `EscapeChar`, as written.
@@ -264,6 +266,7 @@ impl Host {
                self.hostname = Some(value.replace("%h", name));
             },
             "identityfile" => self.identity_files.push(expand(value)),
+            "certificatefile" => self.certificates.push(expand(value)),
             "localforward" => self.locals.push(value.to_owned()),
             "remoteforward" => self.remotes.push(value.to_owned()),
             "dynamicforward" => self.dynamics.push(value.to_owned()),

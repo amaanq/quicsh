@@ -182,6 +182,7 @@ use crate::{
       Login,
       Options,
       Strict,
+      beside,
    },
 };
 
@@ -312,26 +313,43 @@ fn authenticate(
    let offer = |request| attempts.send(Ok(Some(request))).is_ok() && next.recv().is_ok();
    let mut tried = Vec::new();
 
+   let certified = |key: &PublicKey| {
+      login
+         .certificates
+         .iter()
+         .find(|certificate| certificate.key() == key)
+         .cloned()
+   };
+
    if let Some(ref socket) = login.agent {
       let mut agent = Agent::connect(socket)?;
       let data = challenge(secret, &login.user);
 
-      for identity in agent.identities()? {
+      // An agent lists a key with a certificate twice, and the entry with
+      // the certificate logs in wherever the bare one does.
+      let mut identities = agent.identities()?;
+      identities.sort_by_key(|identity| identity.certificate.is_none());
+
+      for identity in identities {
          let wanted =
             login.keys.is_empty() || login.keys.iter().any(|named| named.public == identity.key);
 
-         if !wanted {
+         if !wanted || tried.contains(&identity.key) {
             continue;
          }
 
          tried.push(identity.key.clone());
 
          let request = Request {
-            user:      login.user.clone(),
-            signature: agent
-               .sign(&identity.key, &data)
+            user:        login.user.clone(),
+            signature:   agent
+               .sign(&identity, &data)
                .with_context(|| format!("signing with {}", identity.comment))?,
-            key:       identity.key,
+            certificate: identity
+               .certificate
+               .or_else(|| certified(&identity.key))
+               .map(Box::new),
+            key:         identity.key,
          };
 
          if !offer(request) {
@@ -372,6 +390,7 @@ fn authenticate(
 
       let request = Request {
          user: login.user.clone(),
+         certificate: certified(&key).or_else(|| beside(&file)).map(Box::new),
          key,
          signature,
       };

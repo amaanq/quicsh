@@ -219,8 +219,19 @@ impl PublicKey {
       let mut reader = Reader::new(blob);
 
       let name = reader.string()?;
+      let key = Self::read(name, &mut reader)?;
 
-      let key = match name {
+      if reader.is_empty() {
+         Ok(key)
+      } else {
+         Err(Error::Truncated)
+      }
+   }
+
+   /// Reads the fields of a key of the type `name`, which is how a key
+   /// sits inside a certificate.
+   pub(crate) fn read(name: &[u8], reader: &mut Reader<'_>) -> Result<Self, Error> {
+      Ok(match name {
          ED25519_NAME => Self::Ed25519(reader.array()?),
          SK_ED25519_NAME => {
             Self::SkEd25519 {
@@ -256,13 +267,7 @@ impl PublicKey {
                point: reader.string()?.to_vec(),
             }
          },
-      };
-
-      if reader.is_empty() {
-         Ok(key)
-      } else {
-         Err(Error::Truncated)
-      }
+      })
    }
 
    #[must_use]

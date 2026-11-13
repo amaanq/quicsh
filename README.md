@@ -49,6 +49,10 @@ afford to lose :)
   it
 - `ed25519`, ECDSA (P-256, P-384 and P-521) and RSA keys, signed through
   `ssh-agent` or `ssh-keygen`
+- User certificates. A `cert-authority` line in `authorized_keys` lets in
+  every key that authority signed for the account, or for one of the line's
+  `principals=`. `qsh` finds the certificate beside the key, in the agent or
+  through `CertificateFile`
 - `ed25519-sk` keys in the same way, with the PIN and the touch
 
 ## Usage
@@ -229,10 +233,14 @@ batch into real packets there, and I haven't measured it between two machines.
   `permitopen=`, `permitlisten=`, `restrict`, `no-touch-required`,
   `verify-required` and the `pty`, `agent-forwarding` and `port-forwarding`
   switches are enforced. `environment=` is ignored, as `sshd` does by default.
-  A line with any other option, such as `cert-authority` or `tunnel=`, is
-  skipped instead of being honored without its restriction. `from=` matches
-  addresses and networks and never host names. An `expiry-time=` without a
-  `Z` ends up to a day early, since `qshd` doesn't know your time zone.
+  A line with any other option, such as `tunnel=`, is skipped instead of
+  being honored without its restriction. A certificate's `force-command`,
+  `source-address`, `verify-required` and `permit-*` settings are enforced,
+  and one with any other critical option is refused. A certificate without
+  principals lets nobody in, where `sshd` takes some of those for anyone.
+  `from=` matches addresses and networks and never host names. An
+  `expiry-time=` without a `Z` ends up to a day early, since `qshd` doesn't
+  know your time zone.
 - Forwarded connections across a restart. The listeners come back, and the
   connections that were open are closed.
 - Anything but Linux.

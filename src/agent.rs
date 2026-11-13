@@ -11,6 +11,7 @@ use std::{
 };
 
 use crate::{
+   certificate::Certificate,
    error::Error,
    key::PublicKey,
    wire::{
@@ -35,8 +36,11 @@ const RSA_SHA2_512: u32 = 4;
 const MAX_REPLY: usize = 256 << 10;
 
 pub struct Identity {
-   pub key:     PublicKey,
-   pub comment: String,
+   pub key:         PublicKey,
+   pub comment:     String,
+   /// What a certificate authority says about the key, when the agent
+   /// holds the key under its certificate.
+   pub certificate: Option<Certificate>,
 }
 
 pub struct Agent(UnixStream);
@@ -65,8 +69,19 @@ impl Agent {
          let blob = reader.string()?;
          let comment = String::from_utf8_lossy(reader.string()?).into_owned();
 
-         if let Ok(key) = PublicKey::from_blob(blob) {
-            identities.push(Identity { key, comment });
+         let certificate = Certificate::from_blob(blob).ok();
+
+         let held = certificate.as_ref().map_or_else(
+            || PublicKey::from_blob(blob),
+            |found| Ok(found.key().clone()),
+         );
+
+         if let Ok(key) = held {
+            identities.push(Identity {
+               key,
+               comment,
+               certificate,
+            });
          }
       }
 
@@ -79,9 +94,16 @@ impl Agent {
    /// # Errors
    ///
    /// Fails when the agent is unreachable or declines to sign.
-   pub fn sign(&mut self, key: &PublicKey, data: &[u8]) -> Result<Vec<u8>, Error> {
+   pub fn sign(&mut self, identity: &Identity, data: &[u8]) -> Result<Vec<u8>, Error> {
+      let key = &identity.key;
+
+      // The agent knows a key that came with a certificate by the
+      // certificate alone.
       let mut request = vec![SIGN_REQUEST];
-      put_string(&mut request, &key.to_blob());
+      match identity.certificate {
+         Some(ref held) => put_string(&mut request, held.to_blob()),
+         None => put_string(&mut request, &key.to_blob()),
+      }
       put_string(&mut request, data);
 
       // Without the flag an agent signs RSA over SHA-1, which nothing here

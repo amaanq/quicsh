@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod auth;
+pub mod certificate;
 pub mod config;
 pub mod control;
 pub mod error;

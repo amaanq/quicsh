@@ -22,6 +22,7 @@ use misstep::{
 };
 use quicsh::{
    DEFAULT_PORT,
+   certificate::Certificate,
    config::{
       Host,
       Target,
@@ -47,31 +48,34 @@ use crate::forward::{
 #[derive(Clone)]
 pub struct Login {
    /// Account name on the server.
-   pub user:        String,
+   pub user:         String,
    /// Host name or address of the server.
-   pub host:        String,
+   pub host:         String,
    /// The server's UDP port.
-   pub port:        u16,
+   pub port:         u16,
    /// The only keys to offer, when any were named.
-   pub keys:        Vec<Identity>,
+   pub keys:         Vec<Identity>,
    /// The hosts to connect through, the nearest first.
-   pub jump:        Option<String>,
+   pub jump:         Option<String>,
    /// Socket of the SSH agent, when there is one to use.
-   pub agent:       Option<PathBuf>,
+   pub agent:        Option<PathBuf>,
    /// What to do about a host key nobody vouched for yet.
-   pub strict:      Strict,
+   pub strict:       Strict,
    /// The name to look the host key up under, in place of the host's.
-   pub alias:       Option<String>,
+   pub alias:        Option<String>,
    /// The connection to share, when the configuration names a socket.
-   pub control:     Option<Control>,
+   pub control:      Option<Control>,
    /// Variables for the session's environment, from `SendEnv` and `SetEnv`.
-   pub environment: Vec<(String, String)>,
+   pub environment:  Vec<(String, String)>,
    /// The character that starts an order to this program at the start of
    /// a line, when there is one.
-   pub escape:      Option<u8>,
+   pub escape:       Option<u8>,
    /// How long the first connection may take per address, from
    /// `ConnectTimeout`.
-   pub timeout:     Option<Duration>,
+   pub timeout:      Option<Duration>,
+   /// Certificates for the keys to log in with, from `CertificateFile` and
+   /// from beside the named key files.
+   pub certificates: Vec<Certificate>,
 }
 
 /// How a connection is shared with other runs of this program.
@@ -103,6 +107,15 @@ pub struct Identity {
    pub public: PublicKey,
    /// The private key file, for when no agent holds the key.
    pub file:   PathBuf,
+}
+
+/// The certificate in the file that `ssh-keygen -s` writes beside the key
+/// file at `path`, when there is one this program can read.
+pub fn beside(path: &Path) -> Option<Certificate> {
+   let mut name = path.to_owned().into_os_string();
+   name.push("-cert.pub");
+
+   fs::read_to_string(name).ok()?.parse().ok()
 }
 
 impl Identity {
@@ -485,6 +498,13 @@ impl Options {
          },
       };
 
+      let certificates = host
+         .certificates
+         .iter()
+         .filter_map(|file| fs::read_to_string(file).ok()?.parse().ok())
+         .chain(keys.iter().filter_map(|identity| beside(&identity.file)))
+         .collect();
+
       let user = match named.or(self.login.as_deref()) {
          Some(user) => user.to_owned(),
          None => {
@@ -515,6 +535,7 @@ impl Options {
 
       Ok(Login {
          control,
+         certificates,
          environment: environment(&host)?,
          escape: escape(self.escape.as_deref().or(host.escape.as_deref()))?,
          timeout: match host.connect_timeout.as_deref() {

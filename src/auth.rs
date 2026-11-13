@@ -31,6 +31,10 @@ use ring::digest::{
 };
 
 use crate::{
+   certificate::{
+      Certificate,
+      Kind,
+   },
    error::Error,
    key::{
       Presence,
@@ -119,16 +123,27 @@ pub fn challenge(exporter: &[u8; 32], user: &str) -> Vec<u8> {
 }
 
 pub struct Request {
-   pub user:      String,
-   pub key:       PublicKey,
-   pub signature: Vec<u8>,
+   pub user:        String,
+   pub key:         PublicKey,
+   pub signature:   Vec<u8>,
+   /// What a certificate authority says about the key.
+   pub certificate: Option<Box<Certificate>>,
 }
 
 impl Request {
    /// # Errors
    ///
-   /// Fails when the signature does not cover this connection and user.
+   /// Fails when the signature does not cover this connection and user, or
+   /// the certificate is about another key.
    pub fn verify(&self, exporter: &[u8; 32]) -> Result<Presence, Error> {
+      if self
+         .certificate
+         .as_ref()
+         .is_some_and(|certificate| *certificate.key() != self.key)
+      {
+         return Err(Error::Signature);
+      }
+
       self
          .key
          .verify(&challenge(exporter, &self.user), &self.signature)
@@ -225,9 +240,11 @@ impl Account {
    /// `keys_file` names a file the server operator vouches for instead.
    ///
    /// The answer is what the first line that lists `key` and applies to
-   /// `attempt` permits. A line with an option this server cannot
-   /// enforce is skipped, because honoring the key without the restriction
-   /// would grant more than the line allows.
+   /// `attempt` permits. A `cert-authority` line lists every key that the
+   /// attempt has a certificate for from that authority, when the
+   /// certificate names the account or one of the line's `principals`. A line
+   /// with an option this server cannot enforce is skipped, because honoring
+   /// the key without the restriction would grant more than the line allows.
    ///
    /// # Errors
    ///
@@ -236,7 +253,7 @@ impl Account {
       &self,
       key: &PublicKey,
       keys_file: Option<&Path>,
-      attempt: &Attempt,
+      attempt: &Attempt<'_>,
    ) -> Result<Option<Permit>, Error> {
       let default = self.home.join(".ssh/authorized_keys");
 
@@ -257,8 +274,7 @@ impl Account {
       Ok(text
          .lines()
          .filter_map(entry)
-         .filter(|found| found.1 == *key)
-         .find_map(|(options, _)| Permit::parse(options, attempt)))
+         .find_map(|(options, listed)| Permit::parse(options, &listed, (&self.name, key), attempt)))
    }
 
    /// Whether only the account or root can write `path`.
@@ -299,13 +315,23 @@ fn getent(database: &str, key: &str) -> Option<String> {
 
 /// The circumstances of one login, which the options on a key's line are
 /// checked against.
-pub struct Attempt {
+pub struct Attempt<'login> {
    /// Where the client is.
-   pub remote:   IpAddr,
+   pub remote:      IpAddr,
    /// What the signature says about the person at the key.
-   pub presence: Presence,
+   pub presence:    Presence,
    /// The time, in seconds since 1970.
-   pub now:      u64,
+   pub now:         u64,
+   /// What a certificate authority says about the key.
+   pub certificate: Option<&'login Certificate>,
+}
+
+/// What a login must show about the person at a FIDO key.
+struct Required {
+   /// A touch.
+   touch:  bool,
+   /// A PIN or a fingerprint.
+   verify: bool,
 }
 
 /// Which ports a key may forward.
@@ -374,11 +400,57 @@ pub struct Permit {
 }
 
 impl Permit {
-   /// Reads the options of one line for one login. `None` means the line
-   /// does not apply, which covers an option this server cannot enforce.
-   fn parse(options: &str, attempt: &Attempt) -> Option<Self> {
-      let mut touch = true;
-      let mut verify = false;
+   /// Takes on the limits of the certificate that let the key in. `None`
+   /// means it has one this server cannot enforce, or one that keeps this
+   /// login out.
+   fn narrow(
+      &mut self,
+      certificate: &Certificate,
+      remote: IpAddr,
+      required: &mut Required,
+   ) -> Option<()> {
+      for (name, value) in certificate.critical() {
+         let text = str::from_utf8(value).ok()?;
+
+         match name {
+            // As in sshd, a line and a certificate that force different
+            // commands let nobody in.
+            "force-command" => {
+               if self.command.as_deref().is_some_and(|forced| forced != text) {
+                  return None;
+               }
+
+               self.command = Some(text.to_owned());
+            },
+            "source-address" if admits(text, remote) => {},
+            "verify-required" => required.verify = true,
+            _ => return None,
+         }
+      }
+
+      self.terminal &= certificate.extends("permit-pty");
+      self.agent &= certificate.extends("permit-agent-forwarding");
+      self.forwarding.allowed &= certificate.extends("permit-port-forwarding");
+      required.touch &= !certificate.extends("no-touch-required");
+
+      Some(())
+   }
+
+   /// Reads the options of the line that lists `listed` for a login as
+   /// `user` with `key`. `None` means the line does not apply, which covers
+   /// an option this server cannot enforce.
+   fn parse(
+      options: &str,
+      listed: &PublicKey,
+      (user, key): (&str, &PublicKey),
+      attempt: &Attempt<'_>,
+   ) -> Option<Self> {
+      let mut required = Required {
+         touch:  true,
+         verify: false,
+      };
+      let mut authority = false;
+      let mut principals = None;
 
       let mut permit = Self {
          command:    None,
@@ -408,8 +480,10 @@ impl Permit {
             ("no-agent-forwarding", None) => permit.agent = false,
             ("port-forwarding", None) => permit.forwarding.allowed = true,
             ("no-port-forwarding", None) => permit.forwarding.allowed = false,
-            ("no-touch-required", None) => touch = false,
-            ("verify-required", None) => verify = true,
+            ("no-touch-required", None) => required.touch = false,
+            ("verify-required", None) => required.verify = true,
+            ("cert-authority", None) => authority = true,
+            ("principals", Some(list)) => principals = Some(list),
             // Nothing here forwards X11 or runs `~/.ssh/rc`, and sshd drops
             // `environment` too unless `PermitUserEnvironment` is set.
             ("x11-forwarding" | "no-x11-forwarding" | "user-rc" | "no-user-rc", None)
@@ -428,7 +502,27 @@ impl Permit {
          }
       }
 
-      let present = (!touch || attempt.presence.touched) && (!verify || attempt.presence.verified);
+      if authority {
+         let certificate = attempt
+            .certificate
+            .filter(|certificate| certificate.authority() == listed)?;
+
+         let named = principals.as_ref().map_or_else(
+            || certificate.admits(Kind::User, iter::once(user), attempt.now),
+            |list| certificate.admits(Kind::User, list.split(','), attempt.now),
+         );
+
+         if !named {
+            return None;
+         }
+
+         permit.narrow(certificate, attempt.remote, &mut required)?;
+      } else if listed != key {
+         return None;
+      }
+
+      let present = (!required.touch || attempt.presence.touched)
+         && (!required.verify || attempt.presence.verified);
       present.then_some(permit)
    }
 }
@@ -625,6 +719,7 @@ mod tests {
          user: "alice".to_owned(),
          key: PublicKey::Ed25519(pair.public_key().as_ref().try_into().unwrap()),
          signature,
+         certificate: None,
       };
 
       assert!(request.verify(&[3; 32]).is_ok(), "same connection and user");
@@ -675,6 +770,7 @@ mod tests {
             remote,
             presence,
             now,
+            certificate: None,
          };
 
          account.authorizes(key, Some(&path), &attempt).unwrap()
