@@ -446,6 +446,16 @@ impl Server {
                let _ = connection.send_stream(stream).finish();
             }
          },
+         Message::Associate { host, port } => {
+            if !forwarding || peer.forwards.len() >= MAX_FORWARDS {
+               Relay::abort(connection, stream);
+               return Ok(());
+            }
+
+            peer
+               .forwards
+               .associate(stream, (host, port), (buffered, finished), &self.waker);
+         },
          Message::Connect { host, port } => {
             if !forwarding || peer.forwards.len() >= MAX_FORWARDS {
                Relay::abort(connection, stream);

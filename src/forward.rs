@@ -2,21 +2,36 @@
 //!
 //! Accepting and connecting block, so each runs on a thread and hands its
 //! sockets to the event loop through a channel and a [`Waker`].
+//!
+//! A UDP socket is forwarded as a byte stream of length-prefixed datagrams,
+//! which is what carries a connection to a server behind a jump host.
 
 use std::{
-   io,
+   io::{
+      self,
+      Read as _,
+      Write as _,
+   },
    mem,
    net::{
+      Ipv4Addr,
+      Ipv6Addr,
       SocketAddr,
       TcpListener,
       TcpStream,
+      ToSocketAddrs as _,
+      UdpSocket,
    },
    os::{
       fd::OwnedFd,
-      unix::net::UnixListener,
+      unix::net::{
+         UnixListener,
+         UnixStream,
+      },
    },
    sync::{
       Arc,
+      Mutex,
       atomic::{
          AtomicBool,
          Ordering,
@@ -35,6 +50,7 @@ use quinn_proto::{
    Connection,
    StreamId,
 };
+use quinn_udp::UdpSocketState;
 use rustix::net::{
    Shutdown,
    shutdown,
@@ -145,6 +161,136 @@ impl Drop for Acceptor {
    }
 }
 
+/// Largest datagram a relay carries, which is what two length bytes count.
+const DATAGRAM_LIMIT: usize = 0xFFFF;
+/// How often an idle datagram relay checks whether its stream is gone.
+const RELAY_POLL: Duration = Duration::from_secs(1);
+
+/// Joins a UDP socket to a byte stream and returns the stream's other end.
+///
+/// Each datagram travels behind two bytes that hold its length. A socket
+/// that is not connected answers whoever sent to it last, which lets a new
+/// connection take the place of a dead one.
+///
+/// # Errors
+///
+/// Fails when the process is out of file descriptors.
+pub fn datagrams(socket: UdpSocket) -> io::Result<OwnedFd> {
+   let (mut near, far) = UnixStream::pair()?;
+   let mut framed = near.try_clone()?;
+   let inbound = socket.try_clone()?;
+   inbound.set_read_timeout(Some(RELAY_POLL))?;
+
+   let closed = Arc::new(AtomicBool::new(false));
+   let gone = Arc::clone(&closed);
+
+   let fixed = socket.peer_addr().is_ok();
+   let sender = Arc::new(Mutex::new(None));
+   let latest = Arc::clone(&sender);
+
+   thread::spawn(move || {
+      let mut buffer = vec![0; DATAGRAM_LIMIT + 2];
+
+      while !gone.load(Ordering::Relaxed) {
+         let (count, from) = match inbound.recv_from(&mut buffer[2..]) {
+            Ok(received) => received,
+            // A timeout only gives the loop its look at `gone`, and a refused
+            // datagram says nothing about the next one.
+            Err(error)
+               if matches!(
+                  error.kind(),
+                  io::ErrorKind::WouldBlock
+                     | io::ErrorKind::TimedOut
+                     | io::ErrorKind::Interrupted
+                     | io::ErrorKind::ConnectionRefused
+               ) =>
+            {
+               continue;
+            },
+            Err(_) => break,
+         };
+
+         if let Ok(mut known) = latest.lock() {
+            *known = Some(from);
+         }
+
+         let Ok(length) = u16::try_from(count) else {
+            continue;
+         };
+
+         buffer[..2].copy_from_slice(&length.to_be_bytes());
+
+         if framed.write_all(&buffer[..count + 2]).is_err() {
+            break;
+         }
+      }
+   });
+
+   thread::spawn(move || {
+      let mut header = [0; 2];
+      let mut buffer = vec![0; DATAGRAM_LIMIT];
+
+      while near.read_exact(&mut header).is_ok() {
+         let length = usize::from(u16::from_be_bytes(header));
+
+         if near.read_exact(&mut buffer[..length]).is_err() {
+            break;
+         }
+
+         // A datagram that is too big for the path or has nowhere to go yet
+         // is lost alone, as it would be on any network.
+         let _ = if fixed {
+            socket.send(&buffer[..length])
+         } else {
+            match sender.lock().map(|known| *known) {
+               Ok(Some(peer)) => socket.send_to(&buffer[..length], peer),
+               Ok(None) | Err(_) => continue,
+            }
+         };
+      }
+
+      closed.store(true, Ordering::Relaxed);
+   });
+
+   Ok(far.into())
+}
+
+/// Opens a UDP socket to `host:port` on a thread and wraps it with
+/// [`datagrams`]. The receiver yields the result once.
+fn associate(host: String, port: u16, waker: &Arc<Waker>) -> Receiver<io::Result<OwnedFd>> {
+   let (result, receiver) = channel();
+   let notifier = Arc::clone(waker);
+
+   thread::spawn(move || {
+      let joined = (host.as_str(), port)
+         .to_socket_addrs()
+         .and_then(|mut found| found.next().ok_or_else(|| io::Error::other("no address")))
+         .and_then(|remote| {
+            let local = if remote.is_ipv4() {
+               SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+            } else {
+               SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+            };
+
+            let socket = UdpSocket::bind(local)?;
+            socket.connect(remote)?;
+
+            // This sets the option that forbids fragments, which lets the
+            // connection inside find the real path MTU. It also makes the
+            // socket non-blocking, which the relay threads do not want.
+            UdpSocketState::new((&socket).into())?;
+            socket.set_nonblocking(false)?;
+
+            datagrams(socket)
+         });
+
+      let _ = result.send(joined);
+      notifier.wake();
+   });
+
+   receiver
+}
+
 /// Connects to `host:port` on a thread. The receiver yields the result once.
 fn dial(host: String, port: u16, waker: &Arc<Waker>) -> Receiver<io::Result<OwnedFd>> {
    let (result, receiver) = channel();
@@ -163,7 +309,7 @@ fn dial(host: String, port: u16, waker: &Arc<Waker>) -> Receiver<io::Result<Owne
    receiver
 }
 
-/// A stream waiting for its TCP connection.
+/// A stream waiting for its socket.
 struct Dial {
    /// The stream to join.
    stream:   StreamId,
@@ -207,6 +353,24 @@ impl Forwards {
       self.dials.push(Dial {
          stream,
          pending: dial(host, port, waker),
+         buffered,
+         finished,
+      });
+   }
+
+   /// Joins `stream` to a UDP socket that talks to `host:port`, once the name
+   /// resolves. `buffered` and `finished` describe data already read from
+   /// `stream`.
+   pub fn associate(
+      &mut self,
+      stream: StreamId,
+      (host, port): (String, u16),
+      (buffered, finished): (Vec<u8>, bool),
+      waker: &Arc<Waker>,
+   ) {
+      self.dials.push(Dial {
+         stream,
+         pending: associate(host, port, waker),
          buffered,
          finished,
       });

@@ -13,13 +13,17 @@ use std::{
    },
    io::{
       self,
+      BufRead as _,
+      BufReader,
       Read as _,
       Write as _,
    },
    mem,
    net::{
+      Ipv4Addr,
       SocketAddr,
       ToSocketAddrs as _,
+      UdpSocket,
    },
    os::{
       fd::{
@@ -40,6 +44,7 @@ use std::{
    },
    process::{
       self,
+      Child,
       Command,
       Stdio,
    },
@@ -97,7 +102,10 @@ use quicsh::{
       Terminal,
       Token,
    },
-   forward::Forwards,
+   forward::{
+      Forwards,
+      datagrams,
+   },
    key::PublicKey,
    known_hosts::{
       Trust,
@@ -133,13 +141,19 @@ use ring::rand::{
    SecureRandom as _,
    SystemRandom,
 };
-use rustix::termios::{
-   OptionalActions,
-   Termios,
-   isatty,
-   tcgetattr,
-   tcgetwinsize,
-   tcsetattr,
+use rustix::{
+   process::{
+      Signal,
+      set_parent_process_death_signal,
+   },
+   termios::{
+      OptionalActions,
+      Termios,
+      isatty,
+      tcgetattr,
+      tcgetwinsize,
+      tcsetattr,
+   },
 };
 
 use crate::{
@@ -410,6 +424,17 @@ fn window() -> Result<Size> {
    })
 }
 
+/// The UDP relay that `-W` asks for.
+struct Hop {
+   /// Host the server sends the datagrams to.
+   host:   String,
+   /// Port on that host.
+   port:   u16,
+   /// The local side, which stays the same across connections so that
+   /// whoever uses the relay never sees one of them end.
+   socket: Option<UdpSocket>,
+}
+
 /// What the session runs.
 struct Shell {
    /// The shell, a command or a subsystem.
@@ -442,6 +467,8 @@ struct Client {
    agent:    bool,
    /// The `-R` forwards, indexed by listener number.
    remotes:  Vec<Remote>,
+   /// What `-W` relays UDP to and from.
+   relay:    Option<Hop>,
    /// Connections the local listeners accepted.
    inbound:  Receiver<Inbound>,
    /// Streams the server opened, until their first frame arrived.
@@ -535,10 +562,15 @@ impl Client {
       Ok(())
    }
 
-   /// Whether a new connection could take over the session. Only a terminal
-   /// session can, since the server keeps no other kind.
+   /// Whether a new connection could take over. A terminal session can,
+   /// since the server keeps it, and so can a UDP relay, which has no state
+   /// on the server worth keeping.
    const fn resumable(&self) -> bool {
-      self.token.is_some() && self.size.is_some() && self.session.is_some() && self.status.is_none()
+      self.relay.is_some()
+         || self.token.is_some()
+            && self.size.is_some()
+            && self.session.is_some()
+            && self.status.is_none()
    }
 
    /// Gives up the dead connection. The terminal leaves raw mode so that
@@ -549,7 +581,11 @@ impl Client {
       if self.lost.is_none() {
          self.raw = None;
          self.lost = Some(now);
-         eprintln!("\r\nqsh: connection lost, reconnecting. Ctrl-C gives up.");
+
+         // The qsh that runs through a relay reports the outage itself.
+         if self.relay.is_none() {
+            eprintln!("\r\nqsh: connection lost, reconnecting. Ctrl-C gives up.");
+         }
       }
    }
 
@@ -660,6 +696,41 @@ impl Client {
          finished,
       ));
       self.heading = None;
+      Ok(())
+   }
+
+   /// Opens the UDP relay that `-W` asked for. The first time, it also
+   /// prints the local port that reaches it.
+   fn associate(&mut self, connection: &mut Connection) -> Result<()> {
+      let Some(ref mut hop) = self.relay else {
+         return Ok(());
+      };
+
+      let socket = if let Some(ref kept) = hop.socket {
+         kept.try_clone()?
+      } else {
+         let bound = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
+         println!("{}", bound.local_addr()?.port());
+         io::stdout().flush()?;
+
+         hop.socket.insert(bound).try_clone()?
+      };
+
+      let stream = connection
+         .streams()
+         .open(Dir::Bi)
+         .context("no stream credit")?;
+
+      let opening = Message::Associate {
+         host: hop.host.clone(),
+         port: hop.port,
+      };
+
+      self
+         .forwards
+         .open(stream, &opening, datagrams(socket)?, &self.waker)?;
+      self.lost = None;
+
       Ok(())
    }
 
@@ -778,6 +849,8 @@ impl Client {
                self.next = None;
                self.accepted = true;
                self.listen();
+
+               self.associate(connection)?;
 
                if self.session.is_some() {
                   self.rejoin(connection)?;
@@ -1076,14 +1149,102 @@ fn drive(transport: &mut Transport, client: &mut Client, addresses: &[SocketAddr
    Ok(())
 }
 
+/// Splits `HOST:PORT`, where brackets may enclose an IPv6 address. A text
+/// with no port at its end is all host.
+fn endpoint(text: &str) -> (&str, Option<u16>) {
+   let split = text.rsplit_once(':').and_then(|(host, port)| {
+      let whole = !host.contains(':') || host.ends_with(']');
+      whole.then_some((host, port.parse().ok()?))
+   });
+
+   let (host, port) = split.map_or((text, None), |(host, port)| (host, Some(port)));
+   (host.trim_matches(['[', ']']), port)
+}
+
+/// Starts a second `qsh` that relays UDP to the server through the last of
+/// `hops`. Returns it with the local port that reaches the server.
+fn jump(hops: &str, login: &Login) -> Result<(Child, u16)> {
+   let (earlier, last) = hops
+      .rsplit_once(',')
+      .map_or((None, hops), |(earlier, last)| (Some(earlier), last));
+
+   let (user, address) = last
+      .split_once('@')
+      .map_or((None, last), |(user, address)| (Some(user), address));
+   let (host, port) = endpoint(address);
+
+   let mut command = Command::new(env::current_exe()?);
+   command
+      .arg("-N")
+      .arg("-W")
+      .arg(format!("{}:{}", login.host, login.port));
+
+   if let Some(hosts) = earlier {
+      command.arg("-J").arg(hosts);
+   }
+
+   if let Some(name) = user {
+      command.arg("-l").arg(name);
+   }
+
+   if let Some(number) = port {
+      command.arg("-p").arg(number.to_string());
+   }
+
+   let mut child = command
+      .arg("--")
+      .arg(host)
+      .stdout(Stdio::piped())
+      .spawn()
+      .context("starting qsh for the jump host")?;
+
+   let mut line = String::new();
+   let output = child
+      .stdout
+      .take()
+      .context("jump host process has no output")?;
+   BufReader::new(output).read_line(&mut line)?;
+
+   let local = line
+      .trim()
+      .parse::<u16>()
+      .with_context(|| format!("no connection through {host}"))?;
+
+   Ok((child, local))
+}
+
 fn main() -> Result<()> {
    let options = Options::parse();
    let login = options.login()?;
 
-   let addresses = (login.host.as_str(), login.port)
-      .to_socket_addrs()
-      .with_context(|| format!("resolving {}", login.host))?
-      .collect::<Vec<SocketAddr>>();
+   let relay = match options.relay.as_deref().map(endpoint) {
+      Some((host, Some(port))) => {
+         // The process that asked for the relay is the only user of it.
+         set_parent_process_death_signal(Some(Signal::TERM))?;
+         Some(Hop {
+            host: host.to_owned(),
+            port,
+            socket: None,
+         })
+      },
+      Some((_, None)) => bail!("-W takes HOST:PORT"),
+      None => None,
+   };
+
+   let (addresses, _hop) = if let Some(ref hops) = login.jump {
+      let (child, local) = jump(hops, &login)?;
+      (
+         vec![SocketAddr::from((Ipv4Addr::LOCALHOST, local))],
+         Some(child),
+      )
+   } else {
+      let found = (login.host.as_str(), login.port)
+         .to_socket_addrs()
+         .with_context(|| format!("resolving {}", login.host))?
+         .collect::<Vec<SocketAddr>>();
+
+      (found, None)
+   };
 
    let waker = Arc::new(Waker::new()?);
 
@@ -1117,7 +1278,7 @@ fn main() -> Result<()> {
       dialed: None,
       spares: 0,
       resuming: None,
-      shell: (!options.forward).then_some(Shell {
+      shell: (!options.forward && relay.is_none()).then_some(Shell {
          program:  match (options.command.is_empty(), options.subsystem) {
             (true, _) => Program::Shell,
             (false, false) => Program::Command(options.command.join(" ")),
@@ -1127,6 +1288,7 @@ fn main() -> Result<()> {
       }),
       agent: options.agent,
       remotes: options.remote,
+      relay,
       inbound,
       opening: HashMap::new(),
       forwards: Forwards::default(),

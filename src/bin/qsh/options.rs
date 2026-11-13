@@ -41,6 +41,8 @@ pub struct Login {
    pub port: u16,
    /// The only keys to offer, when any were named.
    pub keys: Vec<Identity>,
+   /// The hosts to connect through, the nearest first.
+   pub jump: Option<String>,
 }
 
 /// A key to log in with.
@@ -122,6 +124,14 @@ pub struct Options {
    /// it, the OpenSSH client configuration picks the key.
    #[pound(short = 'i', value_name = "FILE")]
    pub identity:   Option<PathBuf>,
+   /// Connect through the qshd on each of these hosts in turn. The OpenSSH
+   /// client configuration may name them too.
+   #[pound(short = 'J', value_name = "[USER@]HOST[:PORT][,...]")]
+   pub jump:       Option<String>,
+   /// Relay UDP between a local port, which is printed, and HOST:PORT as the
+   /// server reaches it. This is what -J runs on the jump host.
+   #[pound(short = 'W', value_name = "HOST:PORT")]
+   pub relay:      Option<String>,
    /// Listen locally and connect each connection to HOST:HOSTPORT from the
    /// server.
    #[pound(short = 'L', value_name = "[BIND:]PORT:HOST:HOSTPORT")]
@@ -206,6 +216,11 @@ impl Options {
          host: host.hostname.unwrap_or_else(|| alias.to_owned()),
          port,
          keys,
+         jump: self
+            .jump
+            .clone()
+            .or(host.jump)
+            .filter(|jump| !jump.eq_ignore_ascii_case("none")),
       })
    }
 }

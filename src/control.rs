@@ -63,6 +63,8 @@ const GONE: u8 = 15;
 const RESUMABLE: u8 = 16;
 /// Tag of [`Message::Failed`].
 const FAILED: u8 = 17;
+/// Tag of [`Message::Associate`].
+const ASSOCIATE: u8 = 18;
 
 /// How long a terminal session waits for a client whose connection died.
 pub const DETACH_LIMIT: Duration = Duration::from_hours(1);
@@ -121,6 +123,12 @@ pub enum Message {
       host: String,
       port: u16,
    },
+   /// Opens a client stream that the server joins to a UDP socket. Each
+   /// datagram travels behind two bytes that hold its length.
+   Associate {
+      host: String,
+      port: u16,
+   },
    /// Asks the server to listen on a loopback port. Port 0 lets it choose.
    Listen {
       listener: u32,
@@ -167,6 +175,13 @@ pub enum Message {
       session: u32,
       reason:  String,
    },
+}
+
+/// Appends the tag and the fields of a message that names a host and a port.
+fn put_target(out: &mut Vec<u8>, tag: u8, host: &str, port: u16) {
+   out.push(tag);
+   put_string(out, host.as_bytes());
+   put_u32(out, port.into());
 }
 
 /// Appends a 32-bit number.
@@ -277,11 +292,8 @@ impl Message {
             put_u32(&mut payload, session);
             put_u32(&mut payload, status);
          },
-         Self::Connect { ref host, port } => {
-            payload.push(CONNECT);
-            put_string(&mut payload, host.as_bytes());
-            put_u32(&mut payload, (port).into());
-         },
+         Self::Connect { ref host, port } => put_target(&mut payload, CONNECT, host, port),
+         Self::Associate { ref host, port } => put_target(&mut payload, ASSOCIATE, host, port),
          Self::Listen { listener, port } => {
             payload.push(LISTEN);
             put_u32(&mut payload, listener);
@@ -376,6 +388,12 @@ impl Message {
          },
          CONNECT => {
             Self::Connect {
+               host: text(&mut reader)?,
+               port: port(&mut reader)?,
+            }
+         },
+         ASSOCIATE => {
+            Self::Associate {
                host: text(&mut reader)?,
                port: port(&mut reader)?,
             }

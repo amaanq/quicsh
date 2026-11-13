@@ -23,6 +23,8 @@ afford to lose :)
 - `-L`, `-R` and `-D` (SOCKS5) forwarding
 - Agent forwarding with `-A`, which keeps working after a reattach
 - `rsync -e qsh`, and `scp` and `sftp` with `-S qsh`
+- Jump hosts with `-J` or `ProxyJump`, as many as you chain. A jump host
+  runs `qshd` and only ever sees encrypted packets
 - IPv4 and IPv6 on one socket
 - Roaming. A session carries on when the client changes networks
 - Reattaching. A terminal session survives up to an hour without a
@@ -63,6 +65,7 @@ qsh user@host uname -a
 qsh -t host htop
 qsh -A host
 qsh -N -L 8080:localhost:80 -D 1080 host
+qsh -J bastion host
 ```
 
 `scp` and `sftp` take `qsh` as their transport. The server runs OpenSSH's
@@ -82,10 +85,11 @@ private key file either way, so encrypted keys and FIDO keys work the same way
 plain ones do. `-i` also picks which agent key to offer, which is worth doing
 with security keys since every wrong one costs you a touch.
 
-`qsh` reads `~/.ssh/config` and `/etc/ssh/ssh_config` for `HostName`, `User`
-and `IdentityFile`, so the names you already use with `ssh` work. `Port` is
-ignored, because that's sshd's TCP port and `qshd` may sit on another one.
-`QshPort` sets the UDP port, and `IgnoreUnknown` makes `ssh` skip it.
+`qsh` reads `~/.ssh/config` and `/etc/ssh/ssh_config` for `HostName`, `User`,
+`IdentityFile` and `ProxyJump`, so the names you already use with `ssh` work.
+`Port` is ignored, because that's sshd's TCP port and `qshd` may sit on
+another one. `QshPort` sets the UDP port, and `IgnoreUnknown` makes `ssh` skip
+it.
 
 ```
 IgnoreUnknown QshPort
@@ -139,6 +143,12 @@ browsers ship. Someone who records a session today can't decrypt it later
 unless both of them fall. Host keys and logins still use classical
 signatures, so this covers recorded traffic and not a forged login.
 
+A jump is a second `qsh` that logs in to the jump host and asks it to relay
+UDP to the next server. The real connection runs through that relay from end
+to end, so the jump host can drop your packets and can't read them. The two
+talk over a loopback UDP port, which another user on your machine could send
+junk to. That can stall the session and nothing more.
+
 Each client gets its own UDP socket on the server. Without that, one client's
 bulk transfer sits in the same kernel queue as another client's keystrokes.
 The send window is sized from the measured round trip time for the same
@@ -169,7 +179,7 @@ batch into real packets there, and I haven't measured it between two machines.
 - Passwords and PAM. Keys only.
 - X11 forwarding.
 - Most of `ssh_config`. Only `Host`, `Match all`, `Include`, `HostName`,
-  `User`, `IdentityFile` and `QshPort` are read.
+  `User`, `IdentityFile`, `ProxyJump` and `QshPort` are read.
 - P-521 keys, RSA keys under 2048 bits and RSA signatures over SHA-1.
   `ecdsa-sk` keys are accepted but nobody has tried one.
 - Host keys other than `ed25519`.

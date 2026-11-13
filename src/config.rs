@@ -35,6 +35,8 @@ pub struct Host {
    pub port:           Option<String>,
    /// Private key files to log in with, in order.
    pub identity_files: Vec<PathBuf>,
+   /// The hosts to connect through, as written.
+   pub jump:           Option<String>,
 }
 
 /// Replaces a leading `~/` with the home directory.
@@ -98,6 +100,7 @@ impl Host {
             },
             "user" if self.user.is_none() => self.user = Some(value.to_owned()),
             "qshport" if self.port.is_none() => self.port = Some(value.to_owned()),
+            "proxyjump" if self.jump.is_none() => self.jump = Some(value.to_owned()),
             "identityfile" => self.identity_files.push(expand(value)),
             "include" if depth < MAX_DEPTH => {
                for pattern in value.split_whitespace() {
