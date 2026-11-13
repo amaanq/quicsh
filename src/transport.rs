@@ -26,7 +26,11 @@ use std::{
       SocketAddr,
       UdpSocket,
    },
-   os::fd::OwnedFd,
+   os::fd::{
+      AsFd,
+      BorrowedFd,
+      OwnedFd,
+   },
    str::FromStr,
    sync::Arc,
    time::{
@@ -79,16 +83,21 @@ use rustix::{
       PollFlags,
       poll,
    },
-   io::Errno,
+   io::{
+      Errno,
+      ioctl_fionbio,
+   },
    net::{
       AddressFamily,
       RecvFlags,
+      SendFlags,
       SocketFlags,
       SocketType,
       bind,
       connect,
       netlink::SocketAddrNetlink,
       recv,
+      send,
       socket_with,
       sockopt::{
          ip_mtu,
@@ -316,12 +325,32 @@ fn network_changes() -> io::Result<OwnedFd> {
 /// and connected to the second.
 pub type Opener = Box<dyn Fn(SocketAddr, SocketAddr) -> io::Result<OwnedFd>>;
 
-/// A UDP socket with its offload state.
-struct Socket {
-   /// The socket.
-   io:    UdpSocket,
-   /// What the kernel supports for segmentation and receive batching.
-   state: UdpSocketState,
+/// What a connection sends its datagrams through.
+enum Socket {
+   /// A UDP socket.
+   Udp {
+      /// The socket.
+      io:    UdpSocket,
+      /// What the kernel supports for segmentation and receive batching.
+      state: UdpSocketState,
+   },
+   /// A socket pair whose other end relays each message as a datagram, which
+   /// is how a connection runs through a jump host.
+   Pipe {
+      /// This side of the pair.
+      io:   OwnedFd,
+      /// The address the connection believes its peer has.
+      peer: SocketAddr,
+   },
+}
+
+impl AsFd for Socket {
+   fn as_fd(&self) -> BorrowedFd<'_> {
+      match *self {
+         Self::Udp { ref io, .. } => io.as_fd(),
+         Self::Pipe { ref io, .. } => io.as_fd(),
+      }
+   }
 }
 
 impl Socket {
@@ -349,20 +378,42 @@ impl Socket {
          state.set_send_buffer_size((&io).into(), SOCKET_BUFFER)?;
          state.set_recv_buffer_size((&io).into(), SOCKET_BUFFER)?;
 
-         io::Result::Ok(Self { io, state })
+         io::Result::Ok(Self::Udp { io, state })
       };
 
       setup().map_err(Error::Socket)
    }
 
-   /// Largest UDP payload that fits the route this connected socket uses.
+   /// The local address a UDP socket sends from.
+   fn source(&self) -> Option<IpAddr> {
+      match *self {
+         Self::Udp { ref io, .. } => io.local_addr().ok().map(|local| local.ip()),
+         Self::Pipe { .. } => None,
+      }
+   }
+
+   /// Most datagrams one send may carry.
+   fn segments(&self) -> usize {
+      match *self {
+         Self::Udp { ref state, .. } => state.max_gso_segments(),
+         Self::Pipe { .. } => 1,
+      }
+   }
+
+   /// Largest UDP payload that fits the route this connected socket uses. A
+   /// relayed connection cannot see its route, so it probes up to the most a
+   /// datagram holds and the relay drops what does not fit.
    fn payload_bound(&self, remote: SocketAddr) -> Result<u16, Error> {
+      let Self::Udp { ref io, .. } = *self else {
+         return Ok(MAX_UDP_PAYLOAD_V4);
+      };
+
       // An IPv4 peer of an IPv6 socket has an IPv4-mapped address and still
       // travels in IPv4 packets.
       let (mtu, overhead, ceiling) = if remote.ip().to_canonical().is_ipv4() {
-         (ip_mtu(&self.io), 28, MAX_UDP_PAYLOAD_V4)
+         (ip_mtu(io), 28, MAX_UDP_PAYLOAD_V4)
       } else {
-         (ipv6_mtu(&self.io), 48, MAX_UDP_PAYLOAD)
+         (ipv6_mtu(io), 48, MAX_UDP_PAYLOAD)
       };
 
       let payload = mtu
@@ -379,12 +430,33 @@ impl Socket {
       buffer: &mut [u8],
       metas: &mut [RecvMeta; BATCH_SIZE],
    ) -> Result<Option<usize>, Error> {
+      let (io, state) = match *self {
+         Self::Udp { ref io, ref state } => (io, state),
+         Self::Pipe { ref io, peer } => {
+            return match recv(io, &mut buffer[..RECV_LEN], RecvFlags::DONTWAIT) {
+               Ok((0, _)) => Err(Error::Receive(io::ErrorKind::UnexpectedEof.into())),
+               Ok((len, _)) => {
+                  let meta = &mut metas[0];
+                  meta.addr = peer;
+                  meta.len = len;
+                  meta.stride = len;
+                  meta.ecn = None;
+                  meta.dst_ip = None;
+
+                  Ok(Some(1))
+               },
+               Err(Errno::WOULDBLOCK | Errno::INTR) => Ok(None),
+               Err(errno) => Err(Error::Receive(errno.into())),
+            };
+         },
+      };
+
       let mut slices = buffer
          .chunks_mut(RECV_LEN)
          .map(IoSliceMut::new)
          .collect::<Vec<IoSliceMut>>();
 
-      match self.state.recv((&self.io).into(), &mut slices, metas) {
+      match state.recv(io.into(), &mut slices, metas) {
          Ok(count) => Ok(Some(count)),
          // A peer whose port closed answers with ICMP, which a connected socket
          // reports once as ECONNREFUSED. The idle timeout ends that connection.
@@ -402,6 +474,29 @@ impl Socket {
 
    /// Sends one batch of datagrams.
    fn transmit(&self, meta: &Transmit, contents: &[u8]) -> Result<(), Error> {
+      let (io, state) = match *self {
+         Self::Udp { ref io, ref state } => (io, state),
+         Self::Pipe { ref io, .. } => {
+            let size = meta.segment_size.unwrap_or(meta.size).max(1);
+
+            for datagram in contents[..meta.size].chunks(size) {
+               loop {
+                  match send(io, datagram, SendFlags::NOSIGNAL) {
+                     Ok(_) | Err(Errno::MSGSIZE) => break,
+                     Err(Errno::WOULDBLOCK) => {
+                        poll(&mut [PollFd::new(io, PollFlags::OUT)], None)
+                           .map_err(|errno| Error::Poll(errno.into()))?;
+                     },
+                     Err(Errno::INTR) => {},
+                     Err(errno) => return Err(Error::Send(errno.into())),
+                  }
+               }
+            }
+
+            return Ok(());
+         },
+      };
+
       let datagrams = quinn_udp::Transmit {
          destination:  meta.destination,
          ecn:          meta
@@ -413,10 +508,10 @@ impl Socket {
       };
 
       loop {
-         match self.state.try_send((&self.io).into(), &datagrams) {
+         match state.try_send(io.into(), &datagrams) {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-               poll(&mut [PollFd::new(&self.io, PollFlags::OUT)], None)
+               poll(&mut [PollFd::new(io, PollFlags::OUT)], None)
                   .map_err(|errno| Error::Poll(errno.into()))?;
             },
             // An MTU probe larger than the path fails with EMSGSIZE, and a
@@ -494,14 +589,17 @@ impl Session {
          return;
       };
 
-      let source = |socket: &Socket| socket.io.local_addr().ok().map(|local| local.ip());
+      // The relay of a connection without a UDP socket follows the network.
+      let fresh = matches!(self.socket, Socket::Udp { .. })
+         .then(|| Socket::dial(self.peer).ok())
+         .flatten()
+         .filter(|socket| socket.source() != self.socket.source());
 
-      match Socket::dial(self.peer) {
-         Ok(socket) if source(&socket) != source(&self.socket) => {
-            self.socket = socket;
-            self.connection.local_address_changed();
-         },
-         Ok(_) | Err(_) => self.connection.ping(),
+      if let Some(socket) = fresh {
+         self.socket = socket;
+         self.connection.local_address_changed();
+      } else {
+         self.connection.ping();
       }
 
       probe.pinged = true;
@@ -524,7 +622,9 @@ impl Session {
       if probe.pinged {
          // Opening fails while no network reaches the peer, and the next
          // attempt may find one.
-         if let Ok(socket) = Socket::dial(self.peer) {
+         if matches!(self.socket, Socket::Udp { .. })
+            && let Ok(socket) = Socket::dial(self.peer)
+         {
             self.socket = socket;
             self.connection.local_address_changed();
          }
@@ -580,8 +680,7 @@ impl Session {
          // The kernel rejects a GSO send whose segments total more than one UDP
          // payload.
          let mtu = usize::from(self.connection.current_mtu());
-         let segments =
-            (usize::from(MAX_UDP_PAYLOAD_V4) / mtu).clamp(1, self.socket.state.max_gso_segments());
+         let segments = (usize::from(MAX_UDP_PAYLOAD_V4) / mtu).clamp(1, self.socket.segments());
 
          buffer.clear();
          let Some(meta) = self.connection.poll_transmit(now, segments, buffer) else {
@@ -736,7 +835,9 @@ impl Transport {
       })
    }
 
-   /// Starts a connection to `remote` on a socket of its own.
+   /// Starts a connection to `remote` on a socket of its own. With `link`,
+   /// the datagrams travel as messages on that socket pair, and `remote` is
+   /// only a name for whoever answers at its other end.
    ///
    /// # Errors
    ///
@@ -749,12 +850,19 @@ impl Transport {
       server_name: &str,
       crypto: Arc<QuicClientConfig>,
       window_floor: u64,
+      link: Option<OwnedFd>,
    ) -> Result<ConnectionHandle, Error> {
       if self.changes.is_none() {
          self.changes = Some(network_changes().map_err(Error::Socket)?);
       }
 
-      let socket = Socket::dial(remote)?;
+      let socket = match link {
+         Some(io) => {
+            ioctl_fionbio(&io, true).map_err(|errno| Error::Socket(errno.into()))?;
+            Socket::Pipe { io, peer: remote }
+         },
+         None => Socket::dial(remote)?,
+      };
 
       let mut config = ClientConfig::new(crypto);
       config.transport_config(self.congestion.transport(socket.payload_bound(remote)?));
@@ -905,7 +1013,7 @@ impl Transport {
          .iter()
          .map(|listener| &listener.socket)
          .chain(self.sessions.values().map(|session| &session.socket))
-         .map(|socket| PollFd::new(&socket.io, PollFlags::IN))
+         .map(|socket| PollFd::new(socket, PollFlags::IN))
          .chain(waker.map(|eventfd| PollFd::new(eventfd, PollFlags::IN)))
          .chain(
             self

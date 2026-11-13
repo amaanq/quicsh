@@ -13,8 +13,6 @@ use std::{
    },
    io::{
       self,
-      BufRead as _,
-      BufReader,
       Read as _,
       Write as _,
    },
@@ -23,7 +21,6 @@ use std::{
       Ipv4Addr,
       SocketAddr,
       ToSocketAddrs as _,
-      UdpSocket,
    },
    os::{
       fd::{
@@ -78,6 +75,7 @@ use misstep::{
    Result,
    ResultExt as _,
    bail,
+   ensure,
    report,
 };
 use pound::Parse as _;
@@ -142,6 +140,16 @@ use ring::rand::{
    SystemRandom,
 };
 use rustix::{
+   net::{
+      AddressFamily,
+      RecvFlags,
+      SendFlags,
+      SocketFlags,
+      SocketType,
+      recv,
+      send,
+      socketpair,
+   },
    process::{
       Signal,
       set_parent_process_death_signal,
@@ -427,12 +435,14 @@ fn window() -> Result<Size> {
 /// The UDP relay that `-W` asks for.
 struct Hop {
    /// Host the server sends the datagrams to.
-   host:   String,
+   host:  String,
    /// Port on that host.
-   port:   u16,
-   /// The local side, which stays the same across connections so that
-   /// whoever uses the relay never sees one of them end.
-   socket: Option<UdpSocket>,
+   port:  u16,
+   /// The socket pair whose other end the relay's user holds. It stays the
+   /// same across connections, so that user never sees one of them end.
+   link:  OwnedFd,
+   /// Whether the user was told that the relay is open.
+   ready: bool,
 }
 
 /// What the session runs.
@@ -469,6 +479,8 @@ struct Client {
    remotes:  Vec<Remote>,
    /// What `-W` relays UDP to and from.
    relay:    Option<Hop>,
+   /// The socket pair that reaches the server through a jump host.
+   link:     Option<OwnedFd>,
    /// Connections the local listeners accepted.
    inbound:  Receiver<Inbound>,
    /// Streams the server opened, until their first frame arrived.
@@ -699,21 +711,11 @@ impl Client {
       Ok(())
    }
 
-   /// Opens the UDP relay that `-W` asked for. The first time, it also
-   /// prints the local port that reaches it.
+   /// Opens the UDP relay that `-W` asked for. The first time, one byte
+   /// tells the relay's user that it may start.
    fn associate(&mut self, connection: &mut Connection) -> Result<()> {
       let Some(ref mut hop) = self.relay else {
          return Ok(());
-      };
-
-      let socket = if let Some(ref kept) = hop.socket {
-         kept.try_clone()?
-      } else {
-         let bound = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))?;
-         println!("{}", bound.local_addr()?.port());
-         io::stdout().flush()?;
-
-         hop.socket.insert(bound).try_clone()?
       };
 
       let stream = connection
@@ -726,10 +728,14 @@ impl Client {
          port: hop.port,
       };
 
-      self
-         .forwards
-         .open(stream, &opening, datagrams(socket)?, &self.waker)?;
+      let socket = datagrams(hop.link.try_clone()?)?;
+      self.forwards.open(stream, &opening, socket, &self.waker)?;
       self.lost = None;
+
+      if !hop.ready {
+         send(&hop.link, &[0], SendFlags::NOSIGNAL)?;
+         hop.ready = true;
+      }
 
       Ok(())
    }
@@ -1090,16 +1096,17 @@ impl App for Client {
 /// Runs `client` on the first of `addresses` that answers, and dials that
 /// address again for as long as a lost session can be resumed.
 fn drive(transport: &mut Transport, client: &mut Client, addresses: &[SocketAddr]) -> Result<()> {
-   let dial = |endpoint: &mut Transport, address| -> Result<ConnectionHandle> {
+   let dial = |endpoint: &mut Transport, address, link: Option<&OwnedFd>| {
       let handle = endpoint.connect(
          Instant::now(),
          address,
          SERVER_NAME,
          tls::client()?,
          INTERACTIVE_WINDOW,
+         link.map(OwnedFd::try_clone).transpose()?,
       )?;
 
-      Ok(handle)
+      Ok::<ConnectionHandle, Report>(handle)
    };
 
    let mut reached = None;
@@ -1108,7 +1115,7 @@ fn drive(transport: &mut Transport, client: &mut Client, addresses: &[SocketAddr
       client.reset(Instant::now());
       client.spares = addresses.len() - index - 1;
 
-      client.current = match dial(transport, address) {
+      client.current = match dial(transport, address, client.link.as_ref()) {
          Ok(handle) => Some(handle),
          Err(_) if client.spares > 0 => continue,
          Err(error) => return Err(error),
@@ -1136,7 +1143,7 @@ fn drive(transport: &mut Transport, client: &mut Client, addresses: &[SocketAddr
          client.reset(Instant::now());
 
          // Dialing fails while no network reaches the server.
-         if let Ok(handle) = dial(transport, address) {
+         if let Ok(handle) = dial(transport, address, client.link.as_ref()) {
             break Some(handle);
          }
 
@@ -1162,8 +1169,9 @@ fn endpoint(text: &str) -> (&str, Option<u16>) {
 }
 
 /// Starts a second `qsh` that relays UDP to the server through the last of
-/// `hops`. Returns it with the local port that reaches the server.
-fn jump(hops: &str, login: &Login) -> Result<(Child, u16)> {
+/// `hops`. Returns it with the socket pair that reaches the server, one
+/// message for each datagram.
+fn jump(hops: &str, login: &Login) -> Result<(Child, OwnedFd)> {
    let (earlier, last) = hops
       .rsplit_once(',')
       .map_or((None, hops), |(earlier, last)| (Some(earlier), last));
@@ -1191,26 +1199,29 @@ fn jump(hops: &str, login: &Login) -> Result<(Child, u16)> {
       command.arg("-p").arg(number.to_string());
    }
 
-   let mut child = command
+   let (link, remote) = socketpair(
+      AddressFamily::UNIX,
+      SocketType::SEQPACKET,
+      SocketFlags::CLOEXEC,
+      None,
+   )?;
+
+   // Standard input stays free for the question about an unknown host key.
+   let child = command
       .arg("--")
       .arg(host)
-      .stdout(Stdio::piped())
+      .stdout(remote)
       .spawn()
       .context("starting qsh for the jump host")?;
 
-   let mut line = String::new();
-   let output = child
-      .stdout
-      .take()
-      .context("jump host process has no output")?;
-   BufReader::new(output).read_line(&mut line)?;
+   // The copy of the other side lives in `command`, and the end of the
+   // helper shows only once it is closed.
+   drop(command);
 
-   let local = line
-      .trim()
-      .parse::<u16>()
-      .with_context(|| format!("no connection through {host}"))?;
+   let opened = recv(&link, &mut [0; 1], RecvFlags::empty()).is_ok_and(|(count, _)| count == 1);
+   ensure!(opened, "no connection through {host}");
 
-   Ok((child, local))
+   Ok((child, link))
 }
 
 fn main() -> Result<()> {
@@ -1221,29 +1232,33 @@ fn main() -> Result<()> {
       Some((host, Some(port))) => {
          // The process that asked for the relay is the only user of it.
          set_parent_process_death_signal(Some(Signal::TERM))?;
+
          Some(Hop {
             host: host.to_owned(),
             port,
-            socket: None,
+            link: io::stdout().as_fd().try_clone_to_owned()?,
+            ready: false,
          })
       },
       Some((_, None)) => bail!("-W takes HOST:PORT"),
       None => None,
    };
 
-   let (addresses, _hop) = if let Some(ref hops) = login.jump {
-      let (child, local) = jump(hops, &login)?;
-      (
-         vec![SocketAddr::from((Ipv4Addr::LOCALHOST, local))],
-         Some(child),
-      )
+   // A connection through a jump host has no address of its own to dial.
+   // The one below only names the peer, and the jump host looks the real
+   // one up.
+   let (addresses, link, _helper) = if let Some(ref hops) = login.jump {
+      let (child, link) = jump(hops, &login)?;
+      let named = SocketAddr::from((Ipv4Addr::LOCALHOST, login.port));
+
+      (vec![named], Some(link), Some(child))
    } else {
       let found = (login.host.as_str(), login.port)
          .to_socket_addrs()
          .with_context(|| format!("resolving {}", login.host))?
          .collect::<Vec<SocketAddr>>();
 
-      (found, None)
+      (found, None, None)
    };
 
    let waker = Arc::new(Waker::new()?);
@@ -1289,6 +1304,7 @@ fn main() -> Result<()> {
       agent: options.agent,
       remotes: options.remote,
       relay,
+      link,
       inbound,
       opening: HashMap::new(),
       forwards: Forwards::default(),

@@ -31,7 +31,6 @@ use std::{
    },
    sync::{
       Arc,
-      Mutex,
       atomic::{
          AtomicBool,
          Ordering,
@@ -51,9 +50,22 @@ use quinn_proto::{
    StreamId,
 };
 use quinn_udp::UdpSocketState;
-use rustix::net::{
-   Shutdown,
-   shutdown,
+use rustix::{
+   event::{
+      PollFd,
+      PollFlags,
+      poll,
+   },
+   io::Errno,
+   net::{
+      RecvFlags,
+      SendFlags,
+      Shutdown,
+      recv,
+      send,
+      shutdown,
+   },
+   time::Timespec,
 };
 
 use crate::{
@@ -164,55 +176,46 @@ impl Drop for Acceptor {
 /// Largest datagram a relay carries, which is what two length bytes count.
 const DATAGRAM_LIMIT: usize = 0xFFFF;
 /// How often an idle datagram relay checks whether its stream is gone.
-const RELAY_POLL: Duration = Duration::from_secs(1);
+const RELAY_POLL: Timespec = Timespec {
+   tv_sec:  1,
+   tv_nsec: 0,
+};
 
-/// Joins a UDP socket to a byte stream and returns the stream's other end.
+/// Joins a datagram socket to a byte stream and returns the stream's other
+/// end.
 ///
-/// Each datagram travels behind two bytes that hold its length. A socket
-/// that is not connected answers whoever sent to it last, which lets a new
-/// connection take the place of a dead one.
+/// `socket` is a connected UDP socket or one side of a socket pair that
+/// keeps message boundaries. Each datagram travels behind two bytes that
+/// hold its length.
 ///
 /// # Errors
 ///
 /// Fails when the process is out of file descriptors.
-pub fn datagrams(socket: UdpSocket) -> io::Result<OwnedFd> {
+pub fn datagrams(socket: OwnedFd) -> io::Result<OwnedFd> {
    let (mut near, far) = UnixStream::pair()?;
    let mut framed = near.try_clone()?;
    let inbound = socket.try_clone()?;
-   inbound.set_read_timeout(Some(RELAY_POLL))?;
 
    let closed = Arc::new(AtomicBool::new(false));
    let gone = Arc::clone(&closed);
-
-   let fixed = socket.peer_addr().is_ok();
-   let sender = Arc::new(Mutex::new(None));
-   let latest = Arc::clone(&sender);
 
    thread::spawn(move || {
       let mut buffer = vec![0; DATAGRAM_LIMIT + 2];
 
       while !gone.load(Ordering::Relaxed) {
-         let (count, from) = match inbound.recv_from(&mut buffer[2..]) {
-            Ok(received) => received,
-            // A timeout only gives the loop its look at `gone`, and a refused
-            // datagram says nothing about the next one.
-            Err(error)
-               if matches!(
-                  error.kind(),
-                  io::ErrorKind::WouldBlock
-                     | io::ErrorKind::TimedOut
-                     | io::ErrorKind::Interrupted
-                     | io::ErrorKind::ConnectionRefused
-               ) =>
-            {
-               continue;
-            },
+         // The wait ends once a second so that the loop sees `gone`.
+         let _ = poll(
+            &mut [PollFd::new(&inbound, PollFlags::IN)],
+            Some(&RELAY_POLL),
+         );
+
+         let count = match recv(&inbound, &mut buffer[2..], RecvFlags::DONTWAIT) {
+            Ok((0, _)) => break,
+            Ok((count, _)) => count,
+            // A refused datagram says nothing about the next one.
+            Err(Errno::WOULDBLOCK | Errno::INTR | Errno::CONNREFUSED) => continue,
             Err(_) => break,
          };
-
-         if let Ok(mut known) = latest.lock() {
-            *known = Some(from);
-         }
 
          let Ok(length) = u16::try_from(count) else {
             continue;
@@ -237,16 +240,9 @@ pub fn datagrams(socket: UdpSocket) -> io::Result<OwnedFd> {
             break;
          }
 
-         // A datagram that is too big for the path or has nowhere to go yet
-         // is lost alone, as it would be on any network.
-         let _ = if fixed {
-            socket.send(&buffer[..length])
-         } else {
-            match sender.lock().map(|known| *known) {
-               Ok(Some(peer)) => socket.send_to(&buffer[..length], peer),
-               Ok(None) | Err(_) => continue,
-            }
-         };
+         // A datagram that is too big for the path is lost alone, as it
+         // would be on any network.
+         let _ = send(&socket, &buffer[..length], SendFlags::NOSIGNAL);
       }
 
       closed.store(true, Ordering::Relaxed);
@@ -281,7 +277,7 @@ fn associate(host: String, port: u16, waker: &Arc<Waker>) -> Receiver<io::Result
             UdpSocketState::new((&socket).into())?;
             socket.set_nonblocking(false)?;
 
-            datagrams(socket)
+            datagrams(socket.into())
          });
 
       let _ = result.send(joined);

@@ -146,8 +146,8 @@ signatures, so this covers recorded traffic and not a forged login.
 A jump is a second `qsh` that logs in to the jump host and asks it to relay
 UDP to the next server. The real connection runs through that relay from end
 to end, so the jump host can drop your packets and can't read them. The two
-talk over a loopback UDP port, which another user on your machine could send
-junk to. That can stall the session and nothing more.
+`qsh` processes share a socket pair, which nothing else on your machine can
+reach.
 
 Each client gets its own UDP socket on the server. Without that, one client's
 bulk transfer sits in the same kernel queue as another client's keystrokes.
