@@ -1,5 +1,4 @@
 use std::{
-   fs::File,
    io::{
       self,
       Write,
@@ -11,6 +10,12 @@ use std::{
    },
    sync::{
       Arc,
+      Condvar,
+      Mutex,
+      atomic::{
+         AtomicBool,
+         Ordering,
+      },
       mpsc::{
          Receiver,
          TryRecvError,
@@ -19,13 +24,8 @@ use std::{
       },
    },
    thread,
-   time::{
-      Duration,
-      Instant,
-   },
 };
 
-use bytes::Bytes;
 use misstep::{
    OptionExt as _,
    Result,
@@ -38,7 +38,6 @@ use quicsh::{
    },
    pipe::{
       Waker,
-      reader,
       writer,
    },
    relay::Relay,
@@ -56,25 +55,21 @@ use rustix::{
    termios::Winsize,
 };
 
-use crate::{
-   hold::{
-      DATA_LIMIT,
-      PACKET_LIMIT,
-      Packet,
-   },
-   privsep::{
-      Helper,
-      Spawned,
-   },
+use crate::hold::{
+   DATA_LIMIT,
+   PACKET_LIMIT,
+   Packet,
 };
 
-/// How long output may keep flowing after the command exits. A background
-/// process that inherited the pipes would otherwise hold the session open.
-const EXIT_GRACE: Duration = Duration::from_millis(200);
 /// Exit status reported when none arrived.
 const NO_STATUS: u32 = 255;
-/// Chunks of terminal output queued for the stream before the holder waits.
+/// Chunks of session output queued for a stream before the holder waits.
 const QUEUE: usize = 16;
+/// How much input a holder may have beyond what its session accepted. More
+/// waits in the stream, which makes the client wait in turn.
+const INPUT_WINDOW: u64 = 1 << 20;
+/// How much more input the session accepts before the client hears of it.
+const REPORT_STEP: u64 = 256 << 10;
 
 /// The terminal size in the form the kernel takes.
 pub const fn winsize(size: Size) -> Winsize {
@@ -86,13 +81,65 @@ pub const fn winsize(size: Size) -> Winsize {
    }
 }
 
-/// Sends what a relay writes to a holder as terminal input.
-struct Input(OwnedFd);
+/// How many input bytes a holder's session accepted, as the holder last
+/// reported it.
+#[derive(Default)]
+struct Credit {
+   /// The count. `u64::MAX` once the holder is gone.
+   written: Mutex<u64>,
+   /// Signals a change of the count.
+   changed: Condvar,
+}
+
+impl Credit {
+   /// Records a report from the holder.
+   fn set(&self, written: u64) {
+      if let Ok(mut current) = self.written.lock() {
+         *current = written.max(*current);
+      }
+
+      self.changed.notify_all();
+   }
+
+   /// The last report.
+   fn get(&self) -> u64 {
+      self.written.lock().map_or(u64::MAX, |current| *current)
+   }
+
+   /// Waits until the holder has room for input after the first `sent`
+   /// bytes.
+   fn wait(&self, sent: u64) {
+      let Ok(current) = self.written.lock() else {
+         return;
+      };
+
+      let _room = self.changed.wait_while(current, |written| {
+         sent.saturating_sub(*written) >= INPUT_WINDOW
+      });
+   }
+}
+
+/// Sends what a relay writes to a holder as session input.
+struct Input {
+   /// The connection to the holder.
+   link:     OwnedFd,
+   /// How many input bytes the holder got, over every connection.
+   sent:     u64,
+   /// How far the session got with them.
+   credit:   Arc<Credit>,
+   /// Set once the session lets go of the holder. The writer then ends
+   /// without the client's input having ended.
+   released: Arc<AtomicBool>,
+}
 
 impl Write for Input {
    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+      self.credit.wait(self.sent);
+
       let count = bytes.len().min(DATA_LIMIT);
-      Packet::Data(bytes[..count].to_vec()).send(&self.0)?;
+      Packet::send_data(&self.link, &bytes[..count])?;
+      self.sent += count as u64;
+
       Ok(count)
    }
 
@@ -103,122 +150,113 @@ impl Write for Input {
 
 impl AsFd for Input {
    fn as_fd(&self) -> BorrowedFd<'_> {
-      self.0.as_fd()
+      self.link.as_fd()
    }
 }
 
-/// What a session runs on.
-enum Backing {
-   /// Pipes that the monitor made. The monitor hangs the session up.
-   Pipes {
-      /// The monitor's number for the session.
-      id:     u64,
-      /// Reaches the monitor.
-      helper: Helper,
-   },
-   /// A holder process with the terminal.
-   Holder {
-      /// The connection to the holder.
-      link: OwnedFd,
-      /// Whether the session goes on when this side lets go of it.
-      keep: bool,
-   },
+impl Drop for Input {
+   fn drop(&mut self) {
+      if !self.released.load(Ordering::Relaxed) {
+         let _ = Packet::End.send(&self.link);
+      }
+   }
 }
 
-/// The network process's side of a session.
+/// What a client that takes a session over says it has.
+#[derive(Clone, Copy)]
+pub struct Had {
+   /// Output bytes.
+   pub received: u64,
+   /// Standard error bytes.
+   pub errors:   u64,
+}
+
+/// The network process's side of a session, which runs in a holder.
 pub struct Session {
    /// Standard input and output.
-   relay:   Relay,
+   relay:    Relay,
    /// Standard error, for a session without a terminal.
-   errors:  Option<Relay>,
-   /// Where the session runs.
-   backing: Backing,
-   /// Yields programs that want the client's SSH agent, for a held session.
-   agents:  Option<Receiver<OwnedFd>>,
-   /// Yields the exit status once, as four bytes.
-   exit:    Receiver<Bytes>,
-   /// Exit status and when it arrived.
-   exited:  Option<(u32, Instant)>,
+   errors:   Option<Relay>,
+   /// The connection to the holder.
+   link:     OwnedFd,
+   /// Whether the session goes on when this side lets go of it.
+   keep:     bool,
+   /// Tells the input writer that its end is not the end of input.
+   released: Arc<AtomicBool>,
+   /// How far the session got with its input.
+   credit:   Arc<Credit>,
+   /// The count of accepted input the client last heard.
+   told:     u64,
+   /// Yields programs that want the client's SSH agent.
+   agents:   Receiver<OwnedFd>,
+   /// Yields the exit status once.
+   exit:     Receiver<u32>,
+   /// The exit status.
+   status:   Option<u32>,
+   /// Whether [`Session::pump`] returned the status.
+   reported: bool,
 }
 
 impl Session {
-   /// Joins `stream` to the pipes of a started session. `label` is the
-   /// client's number for the session, and `buffered` and `finished` describe
-   /// input already read from `stream`.
-   pub fn adopt(
-      label: u32,
-      spawned: Spawned,
-      helper: Helper,
-      stream: StreamId,
-      (buffered, finished): (Vec<u8>, bool),
-      connection: &mut Connection,
-      waker: &Arc<Waker>,
-   ) -> Result<Self> {
-      let Ok([input, output, stderr, status]) = <[OwnedFd; 4]>::try_from(spawned.descriptors)
-      else {
-         bail!("monitor sent an unexpected set of descriptors");
-      };
-
-      let side = connection
-         .streams()
-         .open(Dir::Uni)
-         .context("no stream credit for stderr")?;
-
-      let lines = reader(File::from(stderr), Arc::clone(waker));
-      let mut errors = Relay::new(side, Some(lines), None, Vec::new(), false);
-      errors.prefix(label.to_be_bytes().to_vec());
-
-      let outbound = reader(File::from(output), Arc::clone(waker));
-      let (inbound, _) = writer(File::from(input), Arc::clone(waker));
-
-      Ok(Self {
-         relay:   Relay::new(stream, Some(outbound), Some(inbound), buffered, finished),
-         errors:  Some(errors),
-         backing: Backing::Pipes {
-            id: spawned.session,
-            helper,
-         },
-         agents:  None,
-         exit:    reader(File::from(status), Arc::clone(waker)),
-         exited:  None,
-      })
-   }
-
-   /// Joins `stream` to a holder. `received` is how much output the client
-   /// already has, and a client that resumes is first told how much input
-   /// the holder has and how much output it missed for good.
+   /// Joins `stream` to a holder. `label` is the client's number for the
+   /// session. A client that takes the session over says in `had` what it
+   /// has, and is first told how much input the holder has and how much
+   /// output it missed for good. `buffered` and `finished` describe input
+   /// already read from `stream`.
    pub fn attach(
       link: OwnedFd,
-      (received, resumed): (u64, bool),
+      label: u32,
+      had: Option<Had>,
       stream: StreamId,
       (buffered, finished): (Vec<u8>, bool),
       connection: &mut Connection,
       waker: &Arc<Waker>,
    ) -> Result<Self> {
-      Packet::Attach { received }.send(&link)?;
+      let Had { received, errors } = had.unwrap_or(Had {
+         received: 0,
+         errors:   0,
+      });
+
+      Packet::Attach { received, errors }.send(&link)?;
 
       let mut buffer = vec![0; PACKET_LIMIT];
 
-      let Some((Packet::Attached { taken, skipped }, _)) = Packet::receive(&link, &mut buffer)?
+      let Some((
+         Packet::Attached {
+            taken,
+            skipped,
+            piped,
+         },
+         _,
+      )) = Packet::receive(&link, &mut buffer)?
       else {
          bail!("the session holder did not answer");
       };
 
       let (chunks, outbound) = sync_channel(QUEUE);
+      let (lines, stderr) = sync_channel(QUEUE);
       let (status, exit) = channel();
       let (wanted, agents) = channel();
       let source = link.try_clone()?;
       let signal = Arc::clone(waker);
+      let credit = Arc::new(Credit::default());
+      let report = Arc::clone(&credit);
 
+      // The thread stops at the exit status, which closes the channels and
+      // so tells the relays that no more output follows.
       thread::spawn(move || {
          while let Ok(Some((packet, descriptor))) = Packet::receive(&source, &mut buffer) {
             let delivered = match packet {
-               Packet::Data(bytes) => chunks.send(Bytes::from(bytes)).is_ok(),
+               Packet::Data(bytes) => chunks.send(bytes).is_ok(),
+               Packet::Errors(bytes) => lines.send(bytes).is_ok(),
+               Packet::Written(count) => {
+                  report.set(count);
+                  true
+               },
                Packet::Agent => descriptor.is_none_or(|socket| wanted.send(socket).is_ok()),
                Packet::Exit(code) => {
-                  status
-                     .send(Bytes::copy_from_slice(&code.to_be_bytes()))
-                     .is_ok()
+                  let _ = status.send(code);
+                  false
                },
                _ => true,
             };
@@ -230,16 +268,38 @@ impl Session {
             }
          }
 
+         report.set(u64::MAX);
          signal.wake();
       });
 
-      let (inbound, _) = writer(Input(link.try_clone()?), Arc::clone(waker));
+      let released = Arc::new(AtomicBool::new(false));
 
-      connection.send_stream(stream).set_priority(1)?;
+      let input = Input {
+         link:     link.try_clone()?,
+         sent:     taken,
+         credit:   Arc::clone(&credit),
+         released: Arc::clone(&released),
+      };
+
+      let (inbound, _) = writer(input, Arc::clone(waker));
+
+      let side = if piped {
+         let side = connection
+            .streams()
+            .open(Dir::Uni)
+            .context("no stream credit for stderr")?;
+
+         let mut relay = Relay::new(side, Some(stderr), None, Vec::new(), false);
+         relay.prefix(label.to_be_bytes().to_vec());
+         Some(relay)
+      } else {
+         connection.send_stream(stream).set_priority(1)?;
+         None
+      };
 
       let mut relay = Relay::new(stream, Some(outbound), Some(inbound), buffered, finished);
 
-      if resumed {
+      if had.is_some() {
          let answer = Message::Resumed {
             received: taken,
             skipped,
@@ -249,104 +309,93 @@ impl Session {
 
       Ok(Self {
          relay,
-         errors: None,
-         backing: Backing::Holder { link, keep: false },
-         agents: Some(agents),
+         errors: side,
+         link,
+         keep: false,
+         released,
+         credit,
+         told: 0,
+         agents,
          exit,
-         exited: None,
+         status: None,
+         reported: false,
       })
    }
 
    /// The next program that wants the client's SSH agent.
    pub fn agent(&self) -> Option<OwnedFd> {
-      self.agents.as_ref()?.try_recv().ok()
+      self.agents.try_recv().ok()
    }
 
    /// Sets the terminal's size.
    pub fn resize(&self, size: Size) -> Result<()> {
-      if let Backing::Holder { ref link, .. } = self.backing {
-         Packet::Resize(size).send(link)?;
-      }
-
+      Packet::Resize(size).send(&self.link)?;
       Ok(())
+   }
+
+   /// Lets the holder forget the output the client has.
+   pub fn release(&self, output: u64, errors: u64) -> Result<()> {
+      Packet::Received { output, errors }.send(&self.link)?;
+      Ok(())
+   }
+
+   /// How many input bytes the session accepted, when that is news the
+   /// client should hear so that it can forget them.
+   pub fn progress(&mut self) -> Option<u64> {
+      let written = self.credit.get();
+      let news = written != u64::MAX && written >= self.told + REPORT_STEP;
+
+      news.then(|| {
+         self.told = written;
+         written
+      })
    }
 
    /// Lets the session go on after this side is dropped, for a client that
    /// may come back for it.
    pub const fn keep(&mut self) {
-      if let Backing::Holder { ref mut keep, .. } = self.backing {
-         *keep = true;
-      }
+      self.keep = true;
    }
 
-   /// Moves data and returns the exit status once the session is over.
-   pub fn pump(&mut self, now: Instant, connection: &mut Connection) -> Result<Option<u32>> {
+   /// Moves data and returns the exit status once, when the session is over
+   /// and all of its output is on the streams.
+   pub fn pump(&mut self, connection: &mut Connection) -> Result<Option<u32>> {
       self.relay.pump(connection)?;
 
       if let Some(ref mut errors) = self.errors {
          errors.pump(connection)?;
       }
 
-      if self.exited.is_none() {
-         let status = match self.exit.try_recv() {
-            Ok(bytes) => {
-               Some(
-                  bytes
-                     .first_chunk()
-                     .map_or(NO_STATUS, |raw| u32::from_be_bytes(*raw)),
-               )
-            },
-            // A holder that another connection took over sends no status.
-            Err(TryRecvError::Disconnected) if self.relay.sent_all() => Some(NO_STATUS),
-            Err(TryRecvError::Disconnected | TryRecvError::Empty) => None,
-         };
-
-         self.exited = status.map(|code| (code, now));
-      }
-
-      let Some((status, at)) = self.exited else {
-         return Ok(None);
-      };
-
       let drained = self.relay.sent_all() && self.errors.as_ref().is_none_or(Relay::sent_all);
 
-      if !drained && now < at + EXIT_GRACE {
+      if self.status.is_none() {
+         self.status = match self.exit.try_recv() {
+            Ok(code) => Some(code),
+            // A holder that another connection took over sends no status.
+            Err(TryRecvError::Disconnected) if drained => Some(NO_STATUS),
+            Err(TryRecvError::Disconnected | TryRecvError::Empty) => None,
+         };
+      }
+
+      if self.reported || !drained {
          return Ok(None);
       }
 
-      for relay in [Some(&mut self.relay), self.errors.as_mut()]
-         .into_iter()
-         .flatten()
-      {
-         relay.finish(connection);
-      }
-
-      Ok(Some(status))
-   }
-
-   /// When [`Session::pump`] must run again even if nothing else happens.
-   pub fn deadline(&self) -> Option<Instant> {
-      self.exited.map(|(_, at)| at + EXIT_GRACE)
+      self.reported = self.status.is_some();
+      Ok(self.status)
    }
 }
 
 impl Drop for Session {
    fn drop(&mut self) {
-      match self.backing {
-         Backing::Pipes { id, ref helper } => {
-            if self.exited.is_none() {
-               helper.hangup(id);
-            }
-         },
-         Backing::Holder { ref link, keep } => {
-            if !keep && self.exited.is_none() {
-               let _ = Packet::Hangup.send(link);
-            }
+      self.released.store(true, Ordering::Relaxed);
 
-            // The thread that reads the link holds a copy of it, so closing
-            // this one would not end the connection.
-            let _ = shutdown(link, Shutdown::Both);
-         },
+      if !self.keep {
+         let _ = Packet::Hangup.send(&self.link);
       }
+
+      // The thread that reads the link holds a copy of it, so closing this
+      // one would not end the connection.
+      let _ = shutdown(&self.link, Shutdown::Both);
    }
 }

@@ -25,7 +25,6 @@ use std::{
             DirBuilderExt as _,
             FileTypeExt as _,
             OpenOptionsExt as _,
-            chown,
          },
          process::CommandExt as _,
       },
@@ -34,14 +33,8 @@ use std::{
       Path,
       PathBuf,
    },
-   process::{
-      Command,
-      Stdio,
-   },
-   sync::{
-      Arc,
-      Mutex,
-   },
+   process::Command,
+   sync::Arc,
    thread,
    time::{
       SystemTime,
@@ -49,10 +42,7 @@ use std::{
    },
 };
 
-use knell::{
-   signals::SignalPipe,
-   socket::bind_unix,
-};
+use knell::signals::SignalPipe;
 use misstep::{
    OptionExt as _,
    Result,
@@ -71,7 +61,6 @@ use quicsh::{
    control::{
       Open,
       Program,
-      Terminal,
       Token,
    },
    key::private_from_openssh,
@@ -101,23 +90,15 @@ use rustix::{
       socket_with,
       socketpair,
    },
-   process::{
-      Pid,
-      Signal,
-      geteuid,
-      kill_process_group,
-   },
+   process::geteuid,
 };
 use rustls::sign::SigningKey;
 
-use crate::{
-   child::exit_code,
-   privsep::{
-      Ended,
-      Reply,
-      Request,
-      serve,
-   },
+use crate::privsep::{
+   Ended,
+   Reply,
+   Request,
+   serve,
 };
 
 /// Where distributions install OpenSSH's `sftp-server`.
@@ -158,30 +139,12 @@ pub struct Settings {
    pub congestion:      Congestion,
 }
 
-/// The directory and socket that reach a client's SSH agent. Dropping it
-/// removes both.
-struct AgentDirectory {
-   /// The directory only the account can enter.
-   directory: PathBuf,
-   /// The socket inside it.
-   socket:    PathBuf,
-}
-
-impl Drop for AgentDirectory {
-   fn drop(&mut self) {
-      let _ = fs::remove_file(&self.socket);
-      let _ = fs::remove_dir(&self.directory);
-   }
-}
-
 /// One successful login.
 struct Grant {
    /// Who logged in.
    account: Account,
    /// What the key that logged in may do.
    permit:  Permit,
-   /// The agent socket, once a session asked for one.
-   agent:   Option<AgentDirectory>,
 }
 
 /// State of the privileged process.
@@ -198,8 +161,6 @@ struct Monitor {
    sftp_server:     Option<PathBuf>,
    /// Logins the network process may start sessions for.
    grants:          HashMap<u64, Grant>,
-   /// The process group of every session on pipes that has not exited.
-   sessions:        Arc<Mutex<HashMap<u64, Pid>>>,
    /// Directory of the sockets that reach session holders.
    holders:         PathBuf,
    /// The last grant or session number handed out.
@@ -275,51 +236,14 @@ impl Monitor {
       // The network process is the one that opens and accepts forwards.
       let reply = Reply::Granted {
          grant:      self.issue(),
-         agent:      permit.agent,
          forwarding: mem::take(&mut permit.forwarding),
       };
 
       if let Reply::Granted { grant, .. } = reply {
-         self.grants.insert(grant, Grant {
-            account,
-            permit,
-            agent: None,
-         });
+         self.grants.insert(grant, Grant { account, permit });
       }
 
       Ok(reply)
-   }
-
-   /// Makes the agent socket in a new directory that only the account can
-   /// enter.
-   fn agent(&mut self, id: u64) -> Result<(Reply, Vec<OwnedFd>)> {
-      let grant = self.grants.get_mut(&id).context("unknown grant")?;
-      ensure!(grant.permit.agent, "this key may not forward an agent");
-      ensure!(grant.agent.is_none(), "agent socket already exists");
-
-      let mut random = [0; 8];
-      SystemRandom::new()
-         .fill(&mut random)
-         .map_err(|_| report!("system random source failed"))?;
-
-      let directory = env::temp_dir().join(format!("quicsh-{:016x}", u64::from_be_bytes(random)));
-      let socket = directory.join("agent.sock");
-
-      DirBuilder::new()
-         .mode(0o700)
-         .create(&directory)
-         .with_context(|| format!("creating {}", directory.display()))?;
-
-      let created = grant.agent.insert(AgentDirectory { directory, socket });
-      let listener = bind_unix(&created.socket, 0o600)?;
-
-      if geteuid().is_root() {
-         for owned in [&created.directory, &created.socket] {
-            chown(owned, Some(grant.account.uid), Some(grant.account.gid))?;
-         }
-      }
-
-      Ok((Reply::Done, vec![listener.into()]))
    }
 
    /// Where the socket of the holder for `token` and `uid` lives. The uid in
@@ -393,12 +317,15 @@ impl Monitor {
       })
    }
 
-   /// Starts a holder process with a terminal session for the grant's
-   /// account. The holder listens on a socket made here, since it gives up
-   /// root and could not make one in a directory only root can enter.
-   fn hold(&self, id: u64, open: &Open, terminal: &Terminal) -> Result<(Reply, Vec<OwnedFd>)> {
+   /// Starts a holder process with a session for the grant's account. The
+   /// holder listens on a socket made here, since it gives up root and could
+   /// not make one in a directory only root can enter.
+   fn spawn(&self, id: u64, open: &Open) -> Result<(Reply, Vec<OwnedFd>)> {
       let grant = self.grants.get(&id).context("unknown grant")?;
-      ensure!(grant.permit.terminal, "this key may not open a terminal");
+      ensure!(
+         open.terminal.is_none() || grant.permit.terminal,
+         "this key may not open a terminal"
+      );
 
       sweep(&self.holders);
 
@@ -421,15 +348,17 @@ impl Monitor {
       listen(&listener, 4)?;
 
       let mut command = Command::new(env::current_exe()?);
-      command
-         .arg("hold")
-         .arg(&grant.account.name)
-         .arg("--term")
-         .arg(&terminal.name)
-         .arg("--columns")
-         .arg(terminal.size.columns.to_string())
-         .arg("--rows")
-         .arg(terminal.size.rows.to_string());
+      command.arg("hold").arg(&grant.account.name);
+
+      if let Some(ref terminal) = open.terminal {
+         command
+            .arg("--term")
+            .arg(&terminal.name)
+            .arg("--columns")
+            .arg(terminal.size.columns.to_string())
+            .arg("--rows")
+            .arg(terminal.size.rows.to_string());
+      }
 
       if open.agent && grant.permit.agent {
          command.arg("--agent");
@@ -496,73 +425,6 @@ impl Monitor {
       ))
    }
 
-   /// Starts a session on pipes for the grant's account.
-   fn spawn(&mut self, id: u64, open: &Open) -> Result<(Reply, Vec<OwnedFd>)> {
-      if let Some(ref terminal) = open.terminal {
-         return self.hold(id, open, terminal);
-      }
-
-      let grant = self.grants.get(&id).context("unknown grant")?;
-
-      let mut command = Command::new(env::current_exe()?);
-      command.arg("session").arg(&grant.account.name);
-
-      if let Some(agent) = grant.agent.as_ref().filter(|_| open.agent) {
-         command.arg("--agent-socket").arg(&agent.socket);
-      }
-
-      self.program(grant, open, &mut command)?;
-
-      command
-         .stdin(Stdio::piped())
-         .stdout(Stdio::piped())
-         .stderr(Stdio::piped());
-
-      let mut child = command.spawn().context("starting the session process")?;
-      let input = child.stdin.take().context("child has no stdin")?;
-      let output = child.stdout.take().context("child has no stdout")?;
-      let errors = child.stderr.take().context("child has no stderr")?;
-
-      let (exit, mut report) = io::pipe()?;
-
-      let session = self.issue();
-      let sessions = Arc::clone(&self.sessions);
-
-      sessions
-         .lock()
-         .map_err(|_| report!("a session thread died"))?
-         .insert(session, Pid::from_child(&child));
-
-      thread::spawn(move || {
-         let code = child.wait().map_or(255, exit_code);
-
-         if let Ok(mut running) = sessions.lock() {
-            running.remove(&session);
-         }
-
-         let _ = report.write_all(&code.to_be_bytes());
-      });
-
-      let descriptors = vec![input.into(), output.into(), errors.into(), exit.into()];
-      Ok((Reply::Spawned { session }, descriptors))
-   }
-
-   /// Hangs up one session, or every session for `None`.
-   fn hangup(&self, session: Option<u64>) {
-      let Ok(sessions) = self.sessions.lock() else {
-         return;
-      };
-
-      // Each session process leads its own process group, so this reaches
-      // the command and its foreground children.
-      for (_, &group) in sessions
-         .iter()
-         .filter(|&(&id, _)| session.is_none_or(|wanted| wanted == id))
-      {
-         let _ = kill_process_group(group, Signal::HUP);
-      }
-   }
-
    /// Answers one request from the network process.
    fn handle(&mut self, request: Request) -> Result<(Reply, Vec<OwnedFd>)> {
       let plain = |reply| Ok((reply, Vec::new()));
@@ -597,12 +459,7 @@ impl Monitor {
             exporter,
             remote,
          } => plain(self.login(&login, &exporter, remote.ip().to_canonical())?),
-         Request::Agent { grant } => self.agent(grant),
          Request::Spawn { grant, open } => self.spawn(grant, &open),
-         Request::Hangup { session } => {
-            self.hangup(Some(session));
-            plain(Reply::Done)
-         },
          Request::Logout { grant } => {
             self.grants.remove(&grant);
             plain(Reply::Done)
@@ -709,15 +566,12 @@ pub fn run(settings: Settings) -> Result<()> {
       authorized_keys: settings.authorized_keys,
       sftp_server:     settings.sftp_server,
       grants:          HashMap::new(),
-      sessions:        Arc::new(Mutex::new(HashMap::new())),
       holders:         holders()?,
       issued:          0,
    };
 
    println!("listening on udp {}", settings.listen);
    let ended = serve(&channel, &signal, |request| monitor.handle(request));
-
-   monitor.hangup(None);
 
    if matches!(ended, Ok(Ended::Signal)) {
       child.kill()?;

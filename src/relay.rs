@@ -23,6 +23,7 @@ use bytes::{
 };
 use quinn_proto::{
    Connection,
+   Dir,
    StreamId,
    VarInt,
    WriteError,
@@ -45,49 +46,90 @@ use crate::{
 
 /// Most stream bytes joined into one write to the sink.
 const MERGE_LIMIT: usize = 1 << 16;
-/// How much sent data a relay keeps for a peer that reconnects.
-const TAIL_LIMIT: usize = 256 << 10;
+/// How much sent data a relay keeps for a peer that reconnects, when it may
+/// forget the rest.
+const TAIL_LIMIT: u64 = 256 << 10;
 
-/// The newest bytes sent in one direction, kept so that a peer whose
-/// connection died can get the ones it never received.
-#[derive(Default)]
+/// The bytes sent in one direction that the peer may lack, kept so that a
+/// peer whose connection died can get them again.
 pub struct Tail {
-   /// The kept bytes, oldest first.
-   bytes: VecDeque<u8>,
+   /// The kept chunks, oldest first.
+   chunks: VecDeque<Bytes>,
+   /// How many bytes came before the first kept chunk.
+   start:  u64,
    /// How many bytes were ever recorded.
-   total: u64,
+   total:  u64,
+   /// How many bytes are kept before the oldest chunk is forgotten.
+   limit:  u64,
+}
+
+impl Default for Tail {
+   fn default() -> Self {
+      Self {
+         limit: TAIL_LIMIT,
+         ..Self::exact()
+      }
+   }
 }
 
 impl Tail {
-   /// Adds `chunk` and forgets the oldest bytes beyond the limit.
-   pub fn record(&mut self, chunk: &[u8]) {
-      self.total += chunk.len() as u64;
-      self.bytes.extend(chunk);
+   /// A tail that forgets only what [`Tail::release`] names, for a stream
+   /// that must continue without a gap.
+   #[must_use]
+   pub const fn exact() -> Self {
+      Self {
+         chunks: VecDeque::new(),
+         start:  0,
+         total:  0,
+         limit:  u64::MAX,
+      }
+   }
 
-      let excess = self.bytes.len().saturating_sub(TAIL_LIMIT);
-      self.bytes.drain(..excess);
+   /// Adds `chunk` and forgets the oldest chunks beyond the limit.
+   pub fn record(&mut self, chunk: Bytes) {
+      self.total += chunk.len() as u64;
+      self.chunks.push_back(chunk);
+
+      while let Some(oldest) = self.chunks.front()
+         && self.total - self.start - oldest.len() as u64 >= self.limit
+      {
+         self.start += oldest.len() as u64;
+         self.chunks.pop_front();
+      }
+   }
+
+   /// Forgets the chunks that lie within the first `received` bytes, which
+   /// the peer says it has.
+   pub fn release(&mut self, received: u64) {
+      while let Some(oldest) = self.chunks.front()
+         && self.start + oldest.len() as u64 <= received
+      {
+         self.start += oldest.len() as u64;
+         self.chunks.pop_front();
+      }
    }
 
    /// How many of the bytes after the first `received` are no longer kept.
    #[must_use]
-   #[expect(
-      clippy::missing_const_for_fn,
-      reason = "VecDeque::len is const from Rust 1.101, and stable 1.100 rejects it"
-   )]
-   pub fn dropped(&self, received: u64) -> u64 {
-      self
-         .total
-         .saturating_sub(received)
-         .saturating_sub(self.bytes.len() as u64)
+   pub const fn dropped(&self, received: u64) -> u64 {
+      self.start.saturating_sub(received)
    }
 
    /// The bytes after the first `received`, or as many of them as are kept.
    #[must_use]
-   pub fn since(&self, received: u64) -> Vec<u8> {
-      let missing = usize::try_from(self.total.saturating_sub(received)).unwrap_or(usize::MAX);
-      let start = self.bytes.len().saturating_sub(missing);
+   pub fn since(&self, received: u64) -> Vec<Bytes> {
+      let mut offset = self.start;
 
-      self.bytes.range(start..).copied().collect()
+      self
+         .chunks
+         .iter()
+         .filter_map(|chunk| {
+            let skip = usize::try_from(received.saturating_sub(offset)).unwrap_or(usize::MAX);
+            offset += chunk.len() as u64;
+
+            (skip < chunk.len()).then(|| chunk.slice(skip..))
+         })
+         .collect()
    }
 }
 
@@ -182,9 +224,25 @@ impl Relay {
       self.stream
    }
 
-   /// Starts keeping sent input so that the relay can [`Relay::resume`].
-   pub fn remember(&mut self) {
-      self.tail = Some(Tail::default());
+   /// Starts keeping sent input in `tail` so that the relay can
+   /// [`Relay::resume`].
+   pub fn remember(&mut self, tail: Tail) {
+      self.tail = Some(tail);
+   }
+
+   /// Forgets kept input within the first `received` bytes, which the peer
+   /// has.
+   pub fn release(&mut self, received: u64) {
+      if let Some(ref mut tail) = self.tail {
+         tail.release(received);
+      }
+   }
+
+   /// How many input bytes after the first `received` the relay could not
+   /// send again.
+   #[must_use]
+   pub fn lacks(&self, received: u64) -> u64 {
+      self.tail.as_ref().map_or(0, |tail| tail.dropped(received))
    }
 
    /// How many stream bytes the relay has taken, which the peer needs to know
@@ -214,7 +272,9 @@ impl Relay {
       let mut replay = frame;
 
       if let Some(ref tail) = self.tail {
-         replay.extend(tail.since(received));
+         for chunk in tail.since(received) {
+            replay.extend_from_slice(&chunk);
+         }
       }
 
       self.stream = stream;
@@ -226,9 +286,9 @@ impl Relay {
          self.unwritten.push_back(buffered.into());
       }
 
-      if self.outbound.is_none() {
+      // A relay that only receives may sit on a stream with no sending side.
+      if self.outbound.is_none() && self.unsent.is_none() && stream.dir() == Dir::Bi {
          let _ = connection.send_stream(stream).finish();
-         self.unsent = None;
       }
    }
 
@@ -275,14 +335,20 @@ impl Relay {
       self.receive(connection)
    }
 
-   /// Moves local input to the stream.
+   /// Moves local input to the stream. Input that ended may still have a
+   /// replay to send after [`Relay::resume`], and the stream finishes after
+   /// it.
    fn send(&mut self, connection: &mut Connection) -> Result<(), Error> {
-      while let Some(ref outbound) = self.outbound {
+      loop {
          if self.unsent.is_none() {
+            let Some(ref outbound) = self.outbound else {
+               return Ok(());
+            };
+
             match outbound.try_recv() {
                Ok(chunk) => {
                   if let Some(ref mut tail) = self.tail {
-                     tail.record(&chunk);
+                     tail.record(chunk.clone());
                   }
 
                   self.unsent = Some(chunk);
@@ -304,7 +370,13 @@ impl Relay {
             .send_stream(self.stream)
             .write_chunks(slice::from_mut(chunk))
          {
-            Ok(_) if chunk.is_empty() => self.unsent = None,
+            Ok(_) if chunk.is_empty() => {
+               self.unsent = None;
+
+               if self.outbound.is_none() {
+                  let _ = connection.send_stream(self.stream).finish();
+               }
+            },
             Ok(_) | Err(WriteError::Blocked) => return Ok(()),
             // The peer stopped reading, as when a remote command exits
             // without consuming its input.
@@ -315,8 +387,6 @@ impl Relay {
             Err(error @ WriteError::ClosedStream) => return Err(Error::Write(error)),
          }
       }
-
-      Ok(())
    }
 
    /// Moves stream data to the local sink.
@@ -378,28 +448,64 @@ impl Relay {
 
 #[cfg(test)]
 mod tests {
+   use bytes::Bytes;
+
    use crate::relay::{
       TAIL_LIMIT,
       Tail,
    };
+
+   /// The kept bytes after the first `received`, joined.
+   fn since(tail: &Tail, received: u64) -> Vec<u8> {
+      tail.since(received).concat()
+   }
 
    /// A peer gets the bytes after its count, all that are kept when its
    /// count is older than that, and none when it claims more than was sent.
    #[test]
    fn tail_replays_what_the_peer_lacks() {
       let mut tail = Tail::default();
-      tail.record(b"hello ");
-      tail.record(b"world");
+      tail.record(Bytes::from_static(b"hello "));
+      tail.record(Bytes::from_static(b"world"));
 
-      assert_eq!(tail.since(6), b"world", "second chunk only");
-      assert_eq!(tail.since(11), b"", "peer has everything");
-      assert_eq!(tail.since(99), b"", "peer claims too much");
+      assert_eq!(since(&tail, 6), b"world", "second chunk only");
+      assert_eq!(since(&tail, 8), b"rld", "part of a chunk");
+      assert_eq!(since(&tail, 11), b"", "peer has everything");
+      assert_eq!(since(&tail, 99), b"", "peer claims too much");
 
-      tail.record(&vec![b'x'; TAIL_LIMIT]);
+      let limit = usize::try_from(TAIL_LIMIT).unwrap();
+      tail.record(Bytes::from(vec![b'x'; limit]));
 
-      assert_eq!(tail.since(0).len(), TAIL_LIMIT, "older bytes are gone");
+      assert_eq!(since(&tail, 0).len(), limit, "older chunks are gone");
       assert_eq!(tail.dropped(0), 11, "the first two chunks");
       assert_eq!(tail.dropped(11), 0, "nothing the peer lacks");
-      assert_eq!(tail.since(tail.total - 3), b"xxx", "count still lines up");
+      assert_eq!(since(&tail, tail.total - 3), b"xxx", "count still lines up");
+   }
+
+   /// An exact tail keeps everything until the peer confirms it.
+   #[test]
+   fn exact_tail_forgets_only_what_was_released() {
+      let mut tail = Tail::exact();
+      let limit = usize::try_from(TAIL_LIMIT).unwrap();
+
+      tail.record(Bytes::from(vec![b'a'; limit]));
+      tail.record(Bytes::from(vec![b'b'; limit]));
+      tail.record(Bytes::from_static(b"end"));
+
+      assert_eq!(tail.dropped(0), 0, "nothing is forgotten unasked");
+
+      tail.release(TAIL_LIMIT + 5);
+
+      assert_eq!(tail.dropped(0), TAIL_LIMIT, "the confirmed first chunk");
+      assert_eq!(
+         tail.dropped(TAIL_LIMIT + 5),
+         0,
+         "the peer lacks nothing kept"
+      );
+      assert_eq!(
+         since(&tail, TAIL_LIMIT * 2),
+         b"end",
+         "a partly confirmed chunk stays"
+      );
    }
 }

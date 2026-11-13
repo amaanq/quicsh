@@ -83,12 +83,8 @@ const SIGN: u8 = 2;
 const SOCKET: u8 = 3;
 /// Tag of [`Request::Login`].
 const LOGIN: u8 = 4;
-/// Tag of [`Request::Agent`].
-const AGENT: u8 = 5;
 /// Tag of [`Request::Spawn`].
 const SPAWN: u8 = 6;
-/// Tag of [`Request::Hangup`].
-const HANGUP: u8 = 7;
 /// Tag of [`Request::Logout`].
 const LOGOUT: u8 = 8;
 /// Tag of [`Request::Attach`].
@@ -100,8 +96,6 @@ const SIGNATURE: u8 = 2;
 const GRANTED: u8 = 4;
 /// Tag of [`Reply::Denied`].
 const DENIED: u8 = 5;
-/// Tag of [`Reply::Spawned`].
-const SPAWNED: u8 = 6;
 /// Tag of [`Reply::Done`].
 const DONE: u8 = 7;
 /// Tag of [`Reply::Failed`].
@@ -131,11 +125,6 @@ pub enum Request {
       /// Where the client is.
       remote:   SocketAddr,
    },
-   /// Asks for a listening agent socket that the grant's sessions can reach.
-   Agent {
-      /// The login the socket is for.
-      grant: u64,
-   },
    /// Asks for a new session.
    Spawn {
       /// The login the session runs as.
@@ -143,12 +132,7 @@ pub enum Request {
       /// What the client asked to run.
       open:  Open,
    },
-   /// Asks to hang up a session.
-   Hangup {
-      /// The session to hang up.
-      session: u64,
-   },
-   /// Ends a login and removes its agent socket.
+   /// Ends a login.
    Logout {
       /// The login to end.
       grant: u64,
@@ -179,19 +163,12 @@ pub enum Reply {
    Granted {
       /// The number that names this login.
       grant:      u64,
-      /// Whether the key may forward its agent.
-      agent:      bool,
       /// Which ports the key may forward.
       forwarding: Forwarding,
    },
    /// The login was refused.
    Denied,
-   /// Comes with standard input, output and error and a status pipe.
-   Spawned {
-      /// The number that names this session.
-      session: u64,
-   },
-   /// Comes with a connection to the holder of a terminal session.
+   /// Comes with a connection to the holder of a session.
    Held {
       /// What a client shows to get the session back.
       token: Token,
@@ -274,18 +251,10 @@ impl Request {
             put_address(&mut out, remote);
             out.extend_from_slice(&Message::Request(login).encode());
          },
-         Self::Agent { grant } => {
-            out.push(AGENT);
-            put_u64(&mut out, grant);
-         },
          Self::Spawn { grant, open } => {
             out.push(SPAWN);
             put_u64(&mut out, grant);
             out.extend_from_slice(&Message::Open(open).encode());
-         },
-         Self::Hangup { session } => {
-            out.push(HANGUP);
-            put_u64(&mut out, session);
          },
          Self::Logout { grant } => {
             out.push(LOGOUT);
@@ -328,11 +297,6 @@ impl Request {
                remote,
             }
          },
-         AGENT => {
-            Self::Agent {
-               grant: u64_from(&mut reader)?,
-            }
-         },
          SPAWN => {
             let grant = u64_from(&mut reader)?;
 
@@ -341,11 +305,6 @@ impl Request {
             };
 
             Self::Spawn { grant, open }
-         },
-         HANGUP => {
-            Self::Hangup {
-               session: u64_from(&mut reader)?,
-            }
          },
          LOGOUT => {
             Self::Logout {
@@ -391,20 +350,15 @@ impl Reply {
          },
          Self::Granted {
             grant,
-            agent,
             ref forwarding,
          } => {
             out.push(GRANTED);
             put_u64(&mut out, grant);
-            out.extend_from_slice(&[u8::from(agent), u8::from(forwarding.allowed)]);
+            out.push(u8::from(forwarding.allowed));
             put_list(&mut out, &forwarding.targets);
             put_list(&mut out, &forwarding.ports);
          },
          Self::Denied => out.push(DENIED),
-         Self::Spawned { session } => {
-            out.push(SPAWNED);
-            put_u64(&mut out, session);
-         },
          Self::Held { ref token } => {
             out.push(HELD);
             put_string(&mut out, token);
@@ -435,7 +389,6 @@ impl Reply {
          GRANTED => {
             Self::Granted {
                grant:      u64_from(&mut reader)?,
-               agent:      reader.byte()? != 0,
                forwarding: Forwarding {
                   allowed: reader.byte()? != 0,
                   targets: list(&mut reader)?,
@@ -444,11 +397,6 @@ impl Reply {
             }
          },
          DENIED => Self::Denied,
-         SPAWNED => {
-            Self::Spawned {
-               session: u64_from(&mut reader)?,
-            }
-         },
          HELD => {
             Self::Held {
                token: reader.array()?,
@@ -563,27 +511,6 @@ where
    }
 }
 
-/// What the monitor returns for a session on pipes.
-pub struct Spawned {
-   /// The number that names the session.
-   pub session:     u64,
-   /// Standard input, output and error, followed by the status pipe.
-   pub descriptors: Vec<OwnedFd>,
-}
-
-/// What the monitor returns for a started session.
-pub enum Started {
-   /// A session on pipes, which ends with its connection.
-   Pipes(Spawned),
-   /// A terminal session in a holder process.
-   Held {
-      /// What a client shows to get the session back.
-      token: Token,
-      /// The connection to the holder.
-      link:  OwnedFd,
-   },
-}
-
 /// The network process's end of the channel.
 #[derive(Clone, Debug)]
 pub struct Helper(Arc<Mutex<OwnedFd>>);
@@ -671,27 +598,17 @@ impl Helper {
       }
    }
 
-   /// Asks for a listening socket that reaches the client's SSH agent.
-   pub fn agent(&self, grant: u64) -> Result<OwnedFd> {
-      self.descriptor(Request::Agent { grant })
-   }
-
-   /// Asks the monitor to start a session.
-   pub fn spawn(&self, grant: u64, open: Open) -> Result<Started> {
+   /// Asks the monitor to start a session. Returns what a client shows to
+   /// get the session back, and a connection to its holder.
+   pub fn spawn(&self, grant: u64, open: Open) -> Result<(Token, OwnedFd)> {
       match self.call(Request::Spawn { grant, open })? {
-         (Reply::Spawned { session }, descriptors) => {
-            Ok(Started::Pipes(Spawned {
-               session,
-               descriptors,
-            }))
-         },
          (Reply::Held { token }, descriptors) => {
             let link = descriptors
                .into_iter()
                .next()
                .context("monitor sent no holder connection")?;
 
-            Ok(Started::Held { token, link })
+            Ok((token, link))
          },
          _ => bail!("unexpected reply from the monitor"),
       }
@@ -705,11 +622,6 @@ impl Helper {
          (Reply::Denied, _) => Ok(None),
          _ => bail!("unexpected reply from the monitor"),
       }
-   }
-
-   /// Asks the monitor to hang up a session.
-   pub fn hangup(&self, session: u64) {
-      let _ = self.call(Request::Hangup { session });
    }
 
    /// Ends a login.

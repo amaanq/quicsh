@@ -1,5 +1,5 @@
 mod child;
-/// The process that owns one terminal session.
+/// The process that owns one session.
 mod hold;
 mod monitor;
 mod network;
@@ -15,7 +15,10 @@ use misstep::Result;
 use pound::Parse as _;
 use quicsh::{
    DEFAULT_PORT,
-   control::Size,
+   control::{
+      Size,
+      Terminal,
+   },
 };
 
 use crate::{
@@ -56,11 +59,15 @@ fn main() -> Result<()> {
       }) => {
          let hold = Hold {
             user,
-            terminal: term,
+            terminal: term.map(|name| {
+               Terminal {
+                  name,
+                  size: Size { columns, rows },
+               }
+            }),
             command,
             original: original_command,
             agent,
-            size: Size { columns, rows },
          };
 
          hold.run()

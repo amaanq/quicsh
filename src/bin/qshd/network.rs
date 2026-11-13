@@ -11,10 +11,7 @@ use std::{
       Ipv4Addr,
       SocketAddr,
    },
-   os::{
-      fd::AsFd as _,
-      unix::net::UnixListener,
-   },
+   os::fd::AsFd as _,
    sync::Arc,
    time::{
       Duration,
@@ -85,9 +82,11 @@ use crate::{
    privsep::{
       Helper,
       Reply,
-      Started,
    },
-   session::Session,
+   session::{
+      Had,
+      Session,
+   },
 };
 
 /// How long a client may take to log in.
@@ -170,12 +169,10 @@ impl Signer for RemoteSigner {
 }
 
 /// A login the monitor accepted. Dropping it ends the monitor's record of
-/// the login and removes the agent socket.
+/// the login.
 struct Grant {
    /// The number the monitor gave this login.
    id:         u64,
-   /// Whether the key may forward its agent.
-   agent:      bool,
    /// Which ports the key may forward.
    forwarding: Forwarding,
    /// Reaches the monitor.
@@ -210,8 +207,6 @@ struct Peer {
    forwards:  Forwards,
    /// Remote listeners by the client's number for them.
    listeners: BTreeMap<u32, Acceptor>,
-   /// Accepts programs that want the client's SSH agent.
-   agent:     Option<Acceptor>,
 }
 
 /// State of the network process.
@@ -267,7 +262,6 @@ impl Server {
 
                let Some(Reply::Granted {
                   grant: id,
-                  agent,
                   forwarding,
                }) = granted
                else {
@@ -280,7 +274,6 @@ impl Server {
 
                peer.grant = Some(Grant {
                   id,
-                  agent,
                   forwarding,
                   helper: self.helper.clone(),
                });
@@ -288,6 +281,15 @@ impl Server {
             Message::Resize { session, size } => {
                if let Some(resized) = peer.sessions.get(&session) {
                   resized.resize(size)?;
+               }
+            },
+            Message::Taken {
+               session,
+               taken,
+               errors,
+            } => {
+               if let Some(confirmed) = peer.sessions.get(&session) {
+                  confirmed.release(taken, errors)?;
                }
             },
             Message::Listen { listener, port } => {
@@ -335,21 +337,15 @@ impl Server {
       (stream, pending): (StreamId, (Vec<u8>, bool)),
       open: Open,
    ) -> Result<()> {
-      let granted = peer.grant.as_ref().context("stream before login")?;
-      let grant = granted.id;
+      let grant = peer.grant.as_ref().context("stream before login")?.id;
 
       if peer.sessions.contains_key(&open.session) || peer.sessions.len() >= MAX_SESSIONS {
          bail!("session id reused or too many sessions");
       }
 
-      if open.agent && granted.agent && open.terminal.is_none() && peer.agent.is_none() {
-         let listener = UnixListener::from(helper.agent(grant)?);
-         peer.agent = Some(Acceptor::unix(listener, waker)?);
-      }
-
       let label = open.session;
 
-      let started = match helper.spawn(grant, open) {
+      let (token, link) = match helper.spawn(grant, open) {
          Ok(started) => started,
          Err(error) => {
             let reason = format!("{error}");
@@ -362,28 +358,12 @@ impl Server {
          },
       };
 
-      let session = match started {
-         Started::Pipes(spawned) => {
-            Session::adopt(
-               label,
-               spawned,
-               helper.clone(),
-               stream,
-               pending,
-               connection,
-               waker,
-            )?
-         },
-         Started::Held { token, link } => {
-            peer.outbox.push(&Message::Resumable {
-               session: label,
-               token,
-            });
+      peer.outbox.push(&Message::Resumable {
+         session: label,
+         token,
+      });
 
-            Session::attach(link, (0, false), stream, pending, connection, waker)?
-         },
-      };
-
+      let session = Session::attach(link, label, None, stream, pending, connection, waker)?;
       peer.sessions.insert(label, session);
 
       Ok(())
@@ -408,9 +388,9 @@ impl Server {
          return Ok(());
       };
 
-      let (received, finished) = drain(connection, stream)?;
+      let (chunks, finished) = drain(connection, stream)?;
 
-      for bytes in received {
+      for bytes in chunks {
          deframer.push(&bytes);
       }
 
@@ -438,7 +418,8 @@ impl Server {
          Message::Resume {
             token,
             session: label,
-            received: had,
+            received,
+            errors,
          } => {
             let link = self
                .helper
@@ -449,7 +430,8 @@ impl Server {
                let pending = (buffered, finished);
                let session = Session::attach(
                   holder,
-                  (had, true),
+                  label,
+                  Some(Had { received, errors }),
                   stream,
                   pending,
                   connection,
@@ -521,7 +503,6 @@ impl Server {
                sessions:  BTreeMap::new(),
                forwards:  Forwards::default(),
                listeners: BTreeMap::new(),
-               agent:     None,
             });
          },
          Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
@@ -579,7 +560,6 @@ impl Server {
    /// the next instant this connection needs attention.
    fn pump(
       &mut self,
-      now: Instant,
       handle: ConnectionHandle,
       connection: &mut Connection,
    ) -> Result<Option<Instant>> {
@@ -587,17 +567,20 @@ impl Server {
          return Ok(None);
       };
 
-      let mut finished = Vec::new();
-
-      for (&id, session) in &mut peer.sessions {
-         if let Some(status) = session.pump(now, connection)? {
-            finished.push((id, status));
+      // A session that ended stays until the connection does, because its
+      // holder goes on only for a client that may still lack the last output.
+      for (&session, running) in &mut peer.sessions {
+         if let Some(status) = running.pump(connection)? {
+            peer.outbox.push(&Message::Exit { session, status });
          }
-      }
 
-      for (session, status) in finished {
-         peer.sessions.remove(&session);
-         peer.outbox.push(&Message::Exit { session, status });
+         if let Some(taken) = running.progress() {
+            peer.outbox.push(&Message::Taken {
+               session,
+               taken,
+               errors: 0,
+            });
+         }
       }
 
       if let Some(control) = peer.control {
@@ -610,10 +593,6 @@ impl Server {
          while let Some(socket) = acceptor.poll() {
             accepted.push((Message::Forwarded { listener }, socket));
          }
-      }
-
-      while let Some(socket) = peer.agent.as_ref().and_then(Acceptor::poll) {
-         accepted.push((Message::Agent, socket));
       }
 
       for session in peer.sessions.values() {
@@ -636,13 +615,7 @@ impl Server {
 
       peer.forwards.pump(connection, &self.waker)?;
 
-      let login = peer.grant.is_none().then_some(peer.deadline);
-      Ok(peer
-         .sessions
-         .values()
-         .filter_map(Session::deadline)
-         .chain(login)
-         .min())
+      Ok(peer.grant.is_none().then_some(peer.deadline))
    }
 
    /// Closes a connection and forgets its state.
@@ -678,7 +651,7 @@ impl App for Server {
       handle: ConnectionHandle,
       connection: &mut Connection,
    ) -> Result<Option<Instant>> {
-      let deadline = match self.pump(now, handle, connection) {
+      let deadline = match self.pump(handle, connection) {
          Ok(deadline) => deadline,
          Err(error) => {
             eprintln!("closing {}: {error}", origin(connection));

@@ -144,7 +144,7 @@ in
           ]
         );
         Restart = "on-failure";
-        # Terminal sessions live in holder processes that a restarted server
+        # Sessions live in holder processes that a restarted server
         # picks up again, so only the server itself gets the signal.
         KillMode = "process";
       };

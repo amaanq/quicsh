@@ -27,11 +27,13 @@ afford to lose :)
   runs `qshd` and only ever sees encrypted packets
 - IPv4 and IPv6 on one socket
 - Roaming. A session carries on when the client changes networks
-- Reattaching. A terminal session survives up to an hour without a
-  connection, and `qsh` picks it up again. The server keeps the last 256 KiB
-  of output for that, and `qsh` says so when more was produced
-- Restarting `qshd` under a terminal session. The session lives in a process
-  of its own, and `qsh` reattaches with the next packet it sends, a keystroke
+- Reattaching. A session survives up to an hour without a connection, and
+  `qsh` picks it up again. For a terminal the server keeps the last 256 KiB
+  of output, and `qsh` says so when more was produced. A command on pipes
+  waits instead and continues without a missing or repeated byte, so an
+  `rsync` or `scp` carries on where it was
+- Restarting `qshd` under a session. The session lives in a process of its
+  own, and `qsh` reattaches with the next packet it sends, a keystroke, data
   or the keep-alive that goes out every 15 seconds
 - `ed25519`, ECDSA (P-256, P-384 and P-521) and RSA keys, signed through
   `ssh-agent` or `ssh-keygen`
@@ -127,10 +129,12 @@ and `no-port-forwarding`, `permitopen=` and `permitlisten=` are enforced where
 forwarded connections are opened. Someone who took over the network process
 could get around those, though they'd still need the private key to log in.
 
-Each terminal session gets a third process that runs as the account, owns the
-terminal and keeps recent output. The server talks to it over a socket in a
-directory only root can enter, which is how a session outlives both a lost
-connection and a restarted server.
+Each session gets a third process that runs as the account, owns the terminal
+or the pipes and keeps the output the client may not have yet. The server
+talks to it over a socket in a directory only root can enter, which is how a
+session outlives both a lost connection and a restarted server. That process
+waits an hour for a client that vanished without closing the connection, so
+a command whose client was killed stays around that long.
 
 Login doesn't use TLS client certificates. The client signs a value derived
 from the TLS handshake with its SSH key and sends that on the first stream. A
@@ -196,8 +200,8 @@ batch into real packets there, and I haven't measured it between two machines.
   skipped instead of being honored without its restriction. `from=` matches
   addresses and networks and never host names. An `expiry-time=` without a
   `Z` ends up to a day early, since `qshd` doesn't know your time zone.
-- Restarts for anything but terminal sessions. Remote commands on pipes and
-  open forwarded connections end with the server.
+- Forwarded connections across a restart. They end with the server, and so
+  does a `qsh -N`.
 - Anything but Linux.
 
 ## Building

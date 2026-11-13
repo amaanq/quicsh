@@ -116,7 +116,10 @@ use quicsh::{
       reopen,
       writer,
    },
-   relay::Relay,
+   relay::{
+      Relay,
+      Tail,
+   },
    tls,
    transport::{
       App,
@@ -187,6 +190,8 @@ const ATTEMPT: Duration = Duration::from_secs(5);
 const REDIAL: Duration = Duration::from_secs(1);
 /// TLS server name, unused because the host key is checked instead.
 const SERVER_NAME: &str = "quicsh";
+/// How much more session output arrives before the server hears of it.
+const CONFIRM_STEP: u64 = 256 << 10;
 /// The number this client gives its one session.
 const SESSION: u32 = 1;
 
@@ -253,9 +258,8 @@ fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
       },
       Strict::Ask => {
          eprint!(
-            "The authenticity of host '[{named}]:{}' can't be established.\nHost key \
-             fingerprint is {fingerprint}.\nAre you sure you want to continue connecting \
-             (yes/no)? ",
+            "The authenticity of host '[{named}]:{}' can't be established.\nHost key fingerprint \
+             is {fingerprint}.\nAre you sure you want to continue connecting (yes/no)? ",
             login.port
          );
 
@@ -526,6 +530,11 @@ struct Client {
    heading:  Option<(StreamId, Vec<u8>)>,
    /// The session's standard error.
    errors:   Option<Relay>,
+   /// Standard error whose stream died with its connection, until the
+   /// server opens a new one for it.
+   orphan:   Option<Relay>,
+   /// How much session output the server last heard that this side has.
+   told:     u64,
    /// Threads still writing to standard output and error.
    writers:  Vec<JoinHandle<()>>,
    /// Restores the terminal when dropped.
@@ -584,24 +593,26 @@ impl Client {
       let mut session = Relay::new(stream, Some(input), Some(output), Vec::new(), false);
       session.prefix(Message::Open(open).encode());
 
-      if interactive {
-         session.remember();
-      }
+      // A terminal may lose input typed during an outage. Anything else
+      // must continue without a gap, so its input stays until the server
+      // confirms it.
+      session.remember(if interactive {
+         Tail::default()
+      } else {
+         Tail::exact()
+      });
 
       self.writers.push(handle);
       self.session = Some(session);
       Ok(())
    }
 
-   /// Whether a new connection could take over. A terminal session can,
-   /// since the server keeps it, and so can a UDP relay, which has no state
-   /// on the server worth keeping.
+   /// Whether a new connection could take over. A session can, since the
+   /// server keeps it, and so can a UDP relay, which has no state on the
+   /// server worth keeping.
    const fn resumable(&self) -> bool {
       self.relay.is_some()
-         || self.token.is_some()
-            && self.size.is_some()
-            && self.session.is_some()
-            && self.status.is_none()
+         || self.token.is_some() && self.session.is_some() && self.status.is_none()
    }
 
    /// Gives up the dead connection. The terminal leaves raw mode so that
@@ -633,7 +644,7 @@ impl Client {
       self.opening.clear();
       self.forwards = Forwards::default();
       self.heading = None;
-      self.errors = None;
+      self.orphan = self.errors.take().or_else(|| self.orphan.take());
    }
 
    /// Asks the server for the session on a new stream.
@@ -652,6 +663,7 @@ impl Client {
          token,
          session: SESSION,
          received: session.taken(),
+         errors: self.orphan.as_ref().map_or(0, Relay::taken),
       });
 
       self.resuming = Some((stream, Deframer::default(), outbox));
@@ -685,11 +697,20 @@ impl Client {
          .map_or_else(Vec::new, |(_, answer, _)| answer.into_rest());
 
       let session = self.session.as_mut().context("no session to resume")?;
+      let lost = skipped + session.lacks(received);
+
+      if self.size.is_none() && lost > 0 {
+         bail!("the session cannot continue, {lost} bytes of it are gone");
+      }
+
       session.skip(skipped);
       session.resume(connection, stream, Vec::new(), received, (rest, finished));
 
       self.lost = None;
-      self.raw = Some(RawMode::enable()?);
+
+      if self.size.is_some() {
+         self.raw = Some(RawMode::enable()?);
+      }
 
       if skipped == 0 {
          eprint!("qsh: reconnected\r\n");
@@ -698,6 +719,30 @@ impl Client {
       }
 
       Ok(())
+   }
+
+   /// Tells the server how much session output arrived, once enough is new,
+   /// so that the server can forget it.
+   fn confirm(&mut self) {
+      let Some(ref session) = self.session else {
+         return;
+      };
+
+      let taken = session.taken();
+      let errors = self
+         .errors
+         .as_ref()
+         .or(self.orphan.as_ref())
+         .map_or(0, Relay::taken);
+
+      if taken + errors >= self.told + CONFIRM_STEP {
+         self.told = taken + errors;
+         self.outbox.push(&Message::Taken {
+            session: SESSION,
+            taken,
+            errors,
+         });
+      }
    }
 
    /// Reads the stderr stream's header, then relays the rest to stderr.
@@ -715,6 +760,19 @@ impl Client {
       let Some((_session, rest)) = header.split_first_chunk::<4>() else {
          return Ok(());
       };
+
+      if let Some(mut errors) = self.orphan.take() {
+         errors.resume(
+            connection,
+            *stream,
+            Vec::new(),
+            0,
+            (rest.to_vec(), finished),
+         );
+         self.errors = Some(errors);
+         self.heading = None;
+         return Ok(());
+      }
 
       let (output, handle) = writer(standard(io::stderr())?, Arc::clone(&self.waker));
 
@@ -890,6 +948,11 @@ impl Client {
                }
             },
             Message::Exit { status, .. } => self.status = Some(status),
+            Message::Taken { taken, .. } => {
+               if let Some(ref mut session) = self.session {
+                  session.release(taken);
+               }
+            },
             Message::Failed { reason, .. } => {
                eprintln!("qsh: the server did not start the session: {reason}\r");
                self.status = Some(255);
@@ -1063,6 +1126,8 @@ impl App for Client {
          for relay in self.session.iter_mut().chain(&mut self.errors) {
             relay.pump(connection)?;
          }
+
+         self.confirm();
       }
 
       if let Some(last) = self.size {
@@ -1084,6 +1149,7 @@ impl App for Client {
 
       let flushed = self.session.as_ref().is_some_and(Relay::received_all)
          && self.heading.is_none()
+         && self.orphan.is_none()
          && self.errors.as_ref().is_none_or(Relay::received_all);
 
       if (shutdown_requested() || self.status.is_some() && flushed) && !self.done {
@@ -1337,6 +1403,8 @@ fn main() -> Result<()> {
       session: None,
       heading: None,
       errors: None,
+      orphan: None,
+      told: 0,
       writers: Vec::new(),
       raw: None,
       size: None,

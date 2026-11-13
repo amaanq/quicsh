@@ -1,12 +1,14 @@
-//! The process that owns one terminal session, so that the session outlives
-//! the server.
+//! The process that owns one session, so that the session outlives the
+//! server.
 //!
-//! - The monitor starts a holder for each terminal session and hands it a
-//!   listening socket in a directory only the monitor can enter.
-//! - The holder opens the terminal, starts the session and then becomes the
-//!   session's account. It keeps the newest output and counts the input, which
-//!   is what a client needs to continue after its connection or the server went
-//!   away.
+//! - The monitor starts a holder for each session and hands it a listening
+//!   socket in a directory only the monitor can enter.
+//! - The holder opens the terminal or the pipes, starts the session and then
+//!   becomes the session's account. It keeps the output the client may lack and
+//!   counts the input, which is what a client needs to continue after its
+//!   connection or the server went away. A terminal's output is kept up to a
+//!   limit, and a pipe's until the client confirms it, so a pipe continues
+//!   without a gap.
 //! - The network process reaches a holder through a connection the monitor
 //!   makes for it, and speaks [`Packet`]s over it. A new connection replaces
 //!   the old one.
@@ -44,7 +46,10 @@ use std::{
       },
    },
    path::PathBuf,
-   process::Command,
+   process::{
+      Command,
+      Stdio,
+   },
    thread,
    time::{
       Duration,
@@ -52,10 +57,15 @@ use std::{
    },
 };
 
+use bytes::{
+   Buf as _,
+   Bytes,
+};
 use misstep::{
    OptionExt as _,
    Result,
    ResultExt as _,
+   bail,
    report,
 };
 use quicsh::{
@@ -63,6 +73,7 @@ use quicsh::{
    control::{
       DETACH_LIMIT,
       Size,
+      Terminal,
    },
    error::Error,
    relay::Tail,
@@ -128,9 +139,11 @@ use crate::{
 pub const DATA_LIMIT: usize = 32 << 10;
 /// Room for the largest packet.
 pub const PACKET_LIMIT: usize = DATA_LIMIT + 32;
-/// How long output may keep flowing after the command exits. A background
-/// process that inherited the terminal would otherwise hold the session open.
+/// How long output may stay open after the command exits. A background
+/// process that inherited it would otherwise hold the session open.
 const EXIT_GRACE: Duration = Duration::from_millis(200);
+/// How much more input the session accepts before the link hears of it.
+const REPORT_STEP: u64 = 64 << 10;
 
 /// Tag of [`Packet::Attach`].
 const ATTACH: u8 = 1;
@@ -146,14 +159,23 @@ const EXIT: u8 = 5;
 const HANGUP: u8 = 6;
 /// Tag of [`Packet::Agent`].
 const AGENT: u8 = 7;
+/// Tag of [`Packet::Errors`].
+const ERRORS: u8 = 8;
+/// Tag of [`Packet::End`].
+const END: u8 = 9;
+/// Tag of [`Packet::Written`].
+const WRITTEN: u8 = 10;
+/// Tag of [`Packet::Received`].
+const RECEIVED: u8 = 11;
 
 /// One message between the network process and a holder.
 pub enum Packet {
-   /// Starts the flow of output. `received` is how much output the client
-   /// already has.
+   /// Starts the flow of output after what the client already has.
    Attach {
       /// Output bytes the client has.
       received: u64,
+      /// Standard error bytes the client has.
+      errors:   u64,
    },
    /// The holder's answer to [`Packet::Attach`].
    Attached {
@@ -161,9 +183,24 @@ pub enum Packet {
       taken:   u64,
       /// Output bytes the client lacks and the holder no longer keeps.
       skipped: u64,
+      /// Whether the session runs on pipes and has a standard error.
+      piped:   bool,
    },
-   /// Terminal input or output.
-   Data(Vec<u8>),
+   /// Session input, or output from the terminal or standard output.
+   Data(Bytes),
+   /// Standard error of a session on pipes.
+   Errors(Bytes),
+   /// The client's input ended.
+   End,
+   /// How many input bytes the session accepted so far.
+   Written(u64),
+   /// How much the client has, which the holder may forget.
+   Received {
+      /// Output bytes the client has.
+      output: u64,
+      /// Standard error bytes the client has.
+      errors: u64,
+   },
    /// The client's terminal changed size.
    Resize(Size),
    /// The session ended with this status. Nothing follows.
@@ -179,16 +216,39 @@ impl Packet {
    /// The bytes of one packet.
    pub fn encode(&self) -> Vec<u8> {
       match *self {
-         Self::Attach { received } => [&[ATTACH][..], &received.to_be_bytes()].concat(),
-         Self::Attached { taken, skipped } => {
+         Self::Attach { received, errors } => {
+            [
+               &[ATTACH][..],
+               &received.to_be_bytes(),
+               &errors.to_be_bytes(),
+            ]
+            .concat()
+         },
+         Self::Attached {
+            taken,
+            skipped,
+            piped,
+         } => {
             [
                &[ATTACHED][..],
                &taken.to_be_bytes(),
                &skipped.to_be_bytes(),
+               &[u8::from(piped)],
             ]
             .concat()
          },
          Self::Data(ref bytes) => [&[DATA][..], bytes].concat(),
+         Self::Errors(ref bytes) => [&[ERRORS][..], bytes].concat(),
+         Self::End => vec![END],
+         Self::Written(count) => [&[WRITTEN][..], &count.to_be_bytes()].concat(),
+         Self::Received { output, errors } => {
+            [
+               &[RECEIVED][..],
+               &output.to_be_bytes(),
+               &errors.to_be_bytes(),
+            ]
+            .concat()
+         },
          Self::Resize(size) => {
             [
                &[RESIZE][..],
@@ -214,15 +274,26 @@ impl Packet {
          ATTACH => {
             Self::Attach {
                received: number()?,
+               errors:   number()?,
             }
          },
          ATTACHED => {
             Self::Attached {
                taken:   number()?,
                skipped: number()?,
+               piped:   reader.byte()? != 0,
             }
          },
-         DATA => Self::Data(rest.to_vec()),
+         DATA => Self::Data(Bytes::copy_from_slice(rest)),
+         ERRORS => Self::Errors(Bytes::copy_from_slice(rest)),
+         END => Self::End,
+         WRITTEN => Self::Written(number()?),
+         RECEIVED => {
+            Self::Received {
+               output: number()?,
+               errors: number()?,
+            }
+         },
          RESIZE => {
             let both = reader.u32()?;
 
@@ -241,6 +312,18 @@ impl Packet {
    /// Sends the packet, waiting for room unless the socket is non-blocking.
    pub fn send(&self, link: &OwnedFd) -> io::Result<()> {
       send(link, &self.encode(), SendFlags::NOSIGNAL)?;
+      Ok(())
+   }
+
+   /// Sends `bytes` as a [`Packet::Data`] without copying them first.
+   pub fn send_data(link: &OwnedFd, bytes: &[u8]) -> io::Result<()> {
+      sendmsg(
+         link,
+         &[IoSlice::new(&[DATA]), IoSlice::new(bytes)],
+         &mut SendAncillaryBuffer::default(),
+         SendFlags::NOSIGNAL,
+      )?;
+
       Ok(())
    }
 
@@ -286,16 +369,14 @@ impl Packet {
 pub struct Hold {
    /// Account the session runs as.
    pub user:     String,
-   /// The client's `TERM`.
-   pub terminal: String,
+   /// The terminal to run on, or `None` for pipes.
+   pub terminal: Option<Terminal>,
    /// The command, or `None` for a login shell.
    pub command:  Option<String>,
    /// What the client asked for when the key forces another command.
    pub original: Option<String>,
    /// Whether the session gets a socket to the client's SSH agent.
    pub agent:    bool,
-   /// The terminal's first size.
-   pub size:     Size,
 }
 
 /// The socket programs in the session open to reach the client's SSH agent.
@@ -350,10 +431,51 @@ impl Drop for AgentSocket {
    }
 }
 
+/// One stream of session output.
+struct Flow {
+   /// Where the output comes from.
+   source: OwnedFd,
+   /// The output the client may lack.
+   tail:   Tail,
+   /// Whether the source has no more output.
+   ended:  bool,
+}
+
+/// Names one of a session's output streams.
+#[derive(Clone, Copy)]
+enum Stream {
+   /// The terminal, or standard output.
+   Output,
+   /// Standard error.
+   Errors,
+}
+
+/// What each descriptor is ready for.
+struct Ready {
+   /// Accepts the network process.
+   listener: PollFlags,
+   /// The exit status pipe.
+   status:   PollFlags,
+   /// The session's input.
+   input:    PollFlags,
+   /// The terminal, or standard output.
+   output:   PollFlags,
+   /// Standard error.
+   errors:   PollFlags,
+   /// The network process.
+   link:     PollFlags,
+   /// Accepts programs that want the SSH agent.
+   agent:    PollFlags,
+}
+
 /// A running session and its link to the network process.
 struct Holder {
-   /// The terminal.
-   master:   OwnedFd,
+   /// Takes the session's input, until it is closed.
+   input:    Option<OwnedFd>,
+   /// The terminal, or standard output.
+   output:   Flow,
+   /// Standard error, for a session on pipes.
+   errors:   Option<Flow>,
    /// Accepts the network process.
    listener: OwnedFd,
    /// Accepts programs that want the client's SSH agent.
@@ -362,24 +484,26 @@ struct Holder {
    status:   File,
    /// The session's process group.
    group:    Pid,
-   /// The newest output.
-   tail:     Tail,
    /// How many input bytes arrived.
    taken:    u64,
-   /// Input the terminal has not accepted yet.
-   input:    Vec<u8>,
+   /// How many input bytes the session accepted.
+   written:  u64,
+   /// The count of accepted bytes the link last heard.
+   told:     u64,
+   /// Input the session has not accepted yet.
+   queue:    VecDeque<Bytes>,
+   /// Whether the client's input ended.
+   closing:  bool,
    /// The network process, while one is connected.
    link:     Option<OwnedFd>,
    /// Whether the link asked for output.
    attached: bool,
    /// Packets the link has not accepted yet.
-   outbox:   VecDeque<Vec<u8>>,
+   outbox:   VecDeque<Bytes>,
    /// When the last link went away.
    detached: Instant,
    /// Exit status and when it arrived.
    exited:   Option<(u32, Instant)>,
-   /// Whether the terminal has no more output.
-   ended:    bool,
    /// Whether the link was told the exit status.
    reported: bool,
 }
@@ -409,7 +533,7 @@ impl Holder {
 
    /// Queues a packet for the link.
    fn push(&mut self, now: Instant, packet: &Packet) {
-      self.outbox.push_back(packet.encode());
+      self.outbox.push_back(packet.encode().into());
       self.flush(now);
    }
 
@@ -442,6 +566,34 @@ impl Holder {
       );
    }
 
+   /// Answers a link that asked for output with the counts it needs and the
+   /// output its client lacks.
+   fn attach(&mut self, now: Instant, received: u64, errors: u64) {
+      self.attached = true;
+      self.told = self.written;
+
+      let answer = Packet::Attached {
+         taken:   self.taken,
+         skipped: self.output.tail.dropped(received),
+         piped:   self.errors.is_some(),
+      };
+
+      let mut packets = vec![answer.encode(), Packet::Written(self.written).encode()];
+
+      for chunk in self.output.tail.since(received) {
+         packets.push([&[DATA][..], &chunk].concat());
+      }
+
+      if let Some(ref flow) = self.errors {
+         for chunk in flow.tail.since(errors) {
+            packets.push([&[ERRORS][..], &chunk].concat());
+         }
+      }
+
+      self.outbox.extend(packets.into_iter().map(Bytes::from));
+      self.flush(now);
+   }
+
    /// Handles everything the link sent. Breaks when the client hung up.
    fn receive(&mut self, now: Instant, buffer: &mut [u8]) -> ControlFlow<()> {
       while let Some(ref link) = self.link {
@@ -452,62 +604,129 @@ impl Holder {
          };
 
          match packet {
-            Some(Packet::Attach { received }) => {
-               self.attached = true;
-
-               let answer = Packet::Attached {
-                  taken:   self.taken,
-                  skipped: self.tail.dropped(received),
-               };
-               self.push(now, &answer);
-
-               for chunk in self.tail.since(received).chunks(DATA_LIMIT) {
-                  self.push(now, &Packet::Data(chunk.to_vec()));
-               }
-            },
+            Some(Packet::Attach { received, errors }) => self.attach(now, received, errors),
             Some(Packet::Data(bytes)) => {
                self.taken += bytes.len() as u64;
-               self.input.extend_from_slice(&bytes);
+               self.queue.push_back(bytes);
+            },
+            // A terminal has no end of input to pass on.
+            Some(Packet::End) => self.closing = self.errors.is_some(),
+            Some(Packet::Received { output, errors }) => {
+               self.output.tail.release(output);
+
+               if let Some(ref mut flow) = self.errors {
+                  flow.tail.release(errors);
+               }
             },
             Some(Packet::Resize(size)) => {
-               let _ = tcsetwinsize(&self.master, winsize(size));
+               if self.errors.is_none() {
+                  let _ = tcsetwinsize(&self.output.source, winsize(size));
+               }
             },
             Some(Packet::Hangup) => return ControlFlow::Break(()),
-            Some(Packet::Attached { .. } | Packet::Exit(_) | Packet::Agent) | None => {
-               self.detach(now);
-            },
+            Some(
+               Packet::Attached { .. }
+               | Packet::Errors(_)
+               | Packet::Written(_)
+               | Packet::Exit(_)
+               | Packet::Agent,
+            )
+            | None => self.detach(now),
          }
       }
 
       ControlFlow::Continue(())
    }
 
-   /// Whether output is read now. It is read only when it has somewhere to
-   /// go, which is the link when one is attached and the tail when none is
-   /// connected. A full link therefore makes the program wait, as a slow
-   /// terminal would.
+   /// Gives queued input to the session and tells the link how far it got.
+   /// Input for a session that closed its end counts as accepted, so that
+   /// the sender never waits for it.
+   fn feed(&mut self, now: Instant) {
+      while let (Some(input), Some(chunk)) = (self.input.as_ref(), self.queue.front_mut()) {
+         match write(input, chunk) {
+            Ok(count) => {
+               self.written += count as u64;
+               chunk.advance(count);
+
+               if chunk.is_empty() {
+                  self.queue.pop_front();
+               }
+            },
+            Err(Errno::WOULDBLOCK) => break,
+            Err(_) => self.input = None,
+         }
+      }
+
+      if self.input.is_none() {
+         self.queue.clear();
+         self.written = self.taken;
+      } else if self.closing && self.queue.is_empty() {
+         self.input = None;
+      }
+
+      let due = self.queue.is_empty() || self.written - self.told >= REPORT_STEP;
+
+      if self.attached && self.written != self.told && due {
+         self.told = self.written;
+         self.push(now, &Packet::Written(self.written));
+      }
+   }
+
+   /// Reads one chunk of `stream`, keeps it and passes it to the link. An
+   /// `overdue` stream with nothing to read has ended.
+   fn collect(&mut self, now: Instant, stream: Stream, overdue: bool, buffer: &mut [u8]) {
+      let (tag, chosen) = match stream {
+         Stream::Output => (DATA, Some(&mut self.output)),
+         Stream::Errors => (ERRORS, self.errors.as_mut()),
+      };
+
+      let Some(flow) = chosen.filter(|open| !open.ended) else {
+         return;
+      };
+
+      buffer[0] = tag;
+
+      match read(&flow.source, &mut buffer[1..=DATA_LIMIT]) {
+         Ok(0) => flow.ended = true,
+         Ok(count) => {
+            let packet = Bytes::copy_from_slice(&buffer[..=count]);
+            flow.tail.record(packet.slice(1..));
+
+            if self.attached {
+               self.outbox.push_back(packet);
+               self.flush(now);
+            }
+         },
+         Err(Errno::WOULDBLOCK) => flow.ended = overdue,
+         // A terminal whose other side closed fails with EIO, which is its
+         // end of output.
+         Err(_) => flow.ended = true,
+      }
+   }
+
+   /// Whether every output stream has ended.
+   fn ended(&self) -> bool {
+      self.output.ended && self.errors.as_ref().is_none_or(|flow| flow.ended)
+   }
+
+   /// Whether output is read now. With a link, it is read only when the
+   /// link takes it, so a full link makes the program wait. Without one, a
+   /// terminal's output goes on into what is kept, and a pipe's waits,
+   /// because none of it may be dropped.
    #[expect(
       clippy::missing_const_for_fn,
       reason = "VecDeque::is_empty is const from Rust 1.101, and stable 1.100 rejects it"
    )]
    fn reading(&self) -> bool {
-      !self.ended
-         && if self.link.is_some() {
-            self.attached && self.outbox.is_empty()
-         } else {
-            true
-         }
+      if self.link.is_some() {
+         self.attached && self.outbox.is_empty()
+      } else {
+         self.errors.is_none()
+      }
    }
 
-   /// Sleeps until something needs handling. Returns what the listener, the
-   /// status pipe, the terminal, the link and the agent socket are ready for.
-   fn wait(&self, now: Instant) -> Result<[PollFlags; 5]> {
-      let reading = self.reading();
-
-      let mut terminal = PollFlags::empty();
-      terminal.set(PollFlags::IN, reading);
-      terminal.set(PollFlags::OUT, !self.input.is_empty());
-
+   /// Sleeps until something needs handling.
+   fn wait(&self, now: Instant, reading: bool) -> Result<Ready> {
       let mut sending = PollFlags::IN;
       sending.set(PollFlags::OUT, !self.outbox.is_empty());
 
@@ -515,8 +734,8 @@ impl Holder {
          self.link.is_none().then(|| self.detached + DETACH_LIMIT),
          self
             .exited
-            .filter(|_| !self.ended)
-            .map(|(_, at)| at + EXIT_GRACE),
+            .map(|(_, at)| at + EXIT_GRACE)
+            .filter(|&at| now < at && !self.ended()),
       ]
       .into_iter()
       .flatten()
@@ -539,7 +758,17 @@ impl Holder {
             .exited
             .is_none()
             .then(|| PollFd::new(&self.status, PollFlags::IN)),
-         (!terminal.is_empty()).then(|| PollFd::new(&self.master, terminal)),
+         self
+            .input
+            .as_ref()
+            .filter(|_| !self.queue.is_empty())
+            .map(|input| PollFd::new(input, PollFlags::OUT)),
+         (reading && !self.output.ended).then(|| PollFd::new(&self.output.source, PollFlags::IN)),
+         self
+            .errors
+            .as_ref()
+            .filter(|flow| reading && !flow.ended)
+            .map(|flow| PollFd::new(&flow.source, PollFlags::IN)),
          self.link.as_ref().map(|link| PollFd::new(link, sending)),
          self
             .agent
@@ -562,28 +791,34 @@ impl Holder {
       let ready = fds.iter().map(PollFd::revents).collect::<Vec<PollFlags>>();
       drop(fds);
 
-      let [status, master, link, agent] =
+      let [status, input, output, errors, link, agent] =
          watched.map(|index| index.map_or(PollFlags::empty(), |at| ready[at]));
 
-      Ok([ready[0], status, master, link, agent])
+      Ok(Ready {
+         listener: ready[0],
+         status,
+         input,
+         output,
+         errors,
+         link,
+         agent,
+      })
    }
 
    /// Waits for one thing to happen and handles it. Breaks when the session
-   /// is over for good.
+   /// is over for good, which is when the client hung up or stayed away too
+   /// long. A session that ended stays until then, because only the client
+   /// knows whether it got the last output.
    fn turn(&mut self, buffer: &mut [u8]) -> Result<ControlFlow<()>> {
       let mut now = Instant::now();
 
-      if let Some((status, at)) = self.exited {
-         self.ended |= now >= at + EXIT_GRACE;
-
-         if self.ended && self.attached && !self.reported {
-            self.reported = true;
-            self.push(now, &Packet::Exit(status));
-         }
-
-         if self.reported && self.outbox.is_empty() {
-            return Ok(ControlFlow::Break(()));
-         }
+      if let Some((status, _)) = self.exited
+         && self.ended()
+         && self.attached
+         && !self.reported
+      {
+         self.reported = true;
+         self.push(now, &Packet::Exit(status));
       }
 
       if self.link.is_none() && now >= self.detached + DETACH_LIMIT {
@@ -591,59 +826,49 @@ impl Holder {
       }
 
       let reading = self.reading();
-      let [listener, status, master, link, agent] = self.wait(now)?;
+      let ready = self.wait(now, reading)?;
       now = Instant::now();
 
-      if !agent.is_empty() {
+      if !ready.agent.is_empty() {
          self.offer();
       }
 
-      if !listener.is_empty() {
+      if !ready.listener.is_empty() {
          let accepted = accept_with(&self.listener, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK)
             .context("accepting the network process")?;
 
          self.detach(now);
          self.link = Some(accepted);
-      } else if !link.is_empty() {
+      } else if !ready.link.is_empty() {
          if self.receive(now, buffer).is_break() {
             return Ok(ControlFlow::Break(()));
          }
 
          self.flush(now);
+         self.feed(now);
       }
 
-      if !status.is_empty() {
+      if !ready.status.is_empty() {
          let mut code = [0; 4];
          let known = self.status.read_exact(&mut code).is_ok();
 
          self.exited = Some((if known { u32::from_be_bytes(code) } else { 255 }, now));
       }
 
-      if master.intersects(PollFlags::OUT) {
-         match write(&self.master, &self.input) {
-            Ok(written) => {
-               self.input.drain(..written);
-            },
-            Err(Errno::WOULDBLOCK) => {},
-            Err(_) => self.input.clear(),
-         }
+      if !ready.input.is_empty() {
+         self.feed(now);
       }
 
-      if reading && !master.difference(PollFlags::OUT).is_empty() {
-         match read(&self.master, &mut buffer[..DATA_LIMIT]) {
-            Ok(0) => self.ended = true,
-            Ok(count) => {
-               let bytes = &buffer[..count];
-               self.tail.record(bytes);
+      // A background process that inherited the output may hold it open
+      // after the command exits, so it then ends once nothing is left in it.
+      let overdue = self.exited.is_some_and(|(_, at)| now >= at + EXIT_GRACE);
 
-               if self.attached {
-                  self.push(now, &Packet::Data(bytes.to_vec()));
-               }
-            },
-            Err(Errno::WOULDBLOCK) => {},
-            // A terminal whose other side closed fails with EIO, which is its
-            // end of output.
-            Err(_) => self.ended = true,
+      for (stream, flags) in [
+         (Stream::Output, ready.output),
+         (Stream::Errors, ready.errors),
+      ] {
+         if reading && (overdue || !flags.is_empty()) {
+            self.collect(now, stream, overdue, buffer);
          }
       }
 
@@ -651,33 +876,34 @@ impl Holder {
    }
 }
 
+/// Opens a terminal of `size` and returns its two sides, the session's last.
+fn open_terminal(size: Size, account: &Account) -> Result<(OwnedFd, OwnedFd)> {
+   let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
+   let master = openpt(flags).context("opening a terminal")?;
+   grantpt(&master)?;
+   unlockpt(&master)?;
+   tcsetwinsize(&master, winsize(size))?;
+
+   let slave = ioctl_tiocgptpeer(&master, flags)?;
+
+   // The account owns the terminal device, because programs such as tmux
+   // open it by path.
+   if geteuid().is_root() {
+      fchown(&slave, Some(account.uid), None)?;
+   }
+
+   Ok((master, slave))
+}
+
 impl Hold {
-   /// Starts the session on a new terminal and serves it until it is over.
-   /// Standard input is the listening socket.
+   /// Starts the session on a new terminal or on pipes and serves it until
+   /// it is over. Standard input is the listening socket.
    pub fn run(&self) -> Result<()> {
       let listener = io::stdin().as_fd().try_clone_to_owned()?;
       let account = Account::lookup(&self.user)?.context("account vanished after login")?;
 
-      let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
-      let master = openpt(flags).context("opening a terminal")?;
-      grantpt(&master)?;
-      unlockpt(&master)?;
-      tcsetwinsize(&master, winsize(self.size))?;
-
-      let slave = ioctl_tiocgptpeer(&master, flags)?;
-
-      // The account owns the terminal device, because programs such as tmux
-      // open it by path.
-      if geteuid().is_root() {
-         fchown(&slave, Some(account.uid), None)?;
-      }
-
       let mut command = Command::new(env::current_exe()?);
-      command
-         .arg("session")
-         .arg(&self.user)
-         .arg("--term")
-         .arg(&self.terminal);
+      command.arg("session").arg(&self.user);
 
       let mut agent = self.agent.then(AgentSocket::new).transpose()?;
 
@@ -693,13 +919,40 @@ impl Hold {
          command.arg("--original-command").arg(text);
       }
 
-      command
-         .stdin(slave.try_clone()?)
-         .stdout(slave.try_clone()?)
-         .stderr(slave);
+      let master = if let Some(ref terminal) = self.terminal {
+         let (master, slave) = open_terminal(terminal.size, &account)?;
+
+         command
+            .arg("--term")
+            .arg(&terminal.name)
+            .stdin(slave.try_clone()?)
+            .stdout(slave.try_clone()?)
+            .stderr(slave);
+
+         Some(master)
+      } else {
+         command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+         None
+      };
 
       let mut child = command.spawn().context("starting the session process")?;
       let group = Pid::from_child(&child);
+
+      let (input, output, errors) = if let Some(terminal) = master {
+         (terminal.try_clone()?, terminal, None)
+      } else {
+         let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+
+         let (Some(input), Some(output), Some(errors)) = pipes else {
+            bail!("the session process has no pipes");
+         };
+
+         (input.into(), output.into(), Some(OwnedFd::from(errors)))
+      };
 
       // The copies of the terminal's child side live in `command`, and the
       // terminal reports end of output only once they are closed.
@@ -720,23 +973,45 @@ impl Hold {
          let _ = report.write_all(&code.to_be_bytes());
       });
 
-      ioctl_fionbio(&master, true)?;
+      for descriptor in [Some(&input), Some(&output), errors.as_ref()]
+         .into_iter()
+         .flatten()
+      {
+         ioctl_fionbio(descriptor, true)?;
+      }
+
+      let flow = |source, piped: bool| {
+         Flow {
+            source,
+            tail: if piped {
+               Tail::exact()
+            } else {
+               Tail::default()
+            },
+            ended: false,
+         }
+      };
+
+      let piped = errors.is_some();
 
       let mut holder = Holder {
-         master,
+         input: Some(input),
+         output: flow(output, piped),
+         errors: errors.map(|source| flow(source, piped)),
          listener,
          agent,
          status: File::from(OwnedFd::from(status)),
          group,
-         tail: Tail::default(),
          taken: 0,
-         input: Vec::new(),
+         written: 0,
+         told: 0,
+         queue: VecDeque::new(),
+         closing: false,
          link: None,
          attached: false,
          outbox: VecDeque::new(),
          detached: Instant::now(),
          exited: None,
-         ended: false,
          reported: false,
       };
 

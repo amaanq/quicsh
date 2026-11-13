@@ -5,7 +5,9 @@
 //!   input follows it, and raw standard output comes back.
 //! - A client whose connection died starts the session stream of its next
 //!   connection with [`Message::Resume`], and the server answers on that stream
-//!   with [`Message::Resumed`] or [`Message::Gone`].
+//!   with [`Message::Resumed`] or [`Message::Gone`]. Both sides say with
+//!   [`Message::Taken`] how much of a session's data they have, so that the
+//!   other may forget it.
 
 use std::time::Duration;
 
@@ -65,11 +67,13 @@ const RESUMABLE: u8 = 16;
 const FAILED: u8 = 17;
 /// Tag of [`Message::Associate`].
 const ASSOCIATE: u8 = 18;
+/// Tag of [`Message::Taken`].
+const TAKEN: u8 = 19;
 
-/// How long a terminal session waits for a client whose connection died.
+/// How long a session waits for a client whose connection died.
 pub const DETACH_LIMIT: Duration = Duration::from_hours(1);
 
-/// A secret that names one terminal session, which a client shows to get the
+/// A secret that names one session, which a client shows to get the
 /// session back on a new connection.
 pub type Token = [u8; 16];
 
@@ -153,6 +157,8 @@ pub enum Message {
       session:  u32,
       /// How many bytes of the session's output the client has.
       received: u64,
+      /// How many bytes of the session's standard error the client has.
+      errors:   u64,
    },
    /// The server's answer to [`Message::Resume`], followed by the output the
    /// client is missing.
@@ -175,6 +181,14 @@ pub enum Message {
       session: u32,
       reason:  String,
    },
+   /// Says how much of a session's data the sender has, so that the other
+   /// side may forget it. The client counts output and standard error, and
+   /// the server counts input and leaves `errors` at zero.
+   Taken {
+      session: u32,
+      taken:   u64,
+      errors:  u64,
+   },
 }
 
 /// Appends the tag and the fields of a message that names a host and a port.
@@ -182,6 +196,17 @@ fn put_target(out: &mut Vec<u8>, tag: u8, host: &str, port: u16) {
    out.push(tag);
    put_string(out, host.as_bytes());
    put_u32(out, port.into());
+}
+
+/// Appends the tag and the fields of a message that carries a session and
+/// two counts of its data.
+fn put_counts(out: &mut Vec<u8>, tag: u8, session: u32, counts: [u64; 2]) {
+   out.push(tag);
+   put_u32(out, session);
+
+   for count in counts {
+      put_string(out, &count.to_be_bytes());
+   }
 }
 
 /// Appends a 32-bit number.
@@ -317,12 +342,16 @@ impl Message {
             ref token,
             session,
             received,
+            errors,
          } => {
-            payload.push(RESUME);
+            put_counts(&mut payload, RESUME, session, [received, errors]);
             put_string(&mut payload, token);
-            put_u32(&mut payload, session);
-            put_string(&mut payload, &received.to_be_bytes());
          },
+         Self::Taken {
+            session,
+            taken,
+            errors,
+         } => put_counts(&mut payload, TAKEN, session, [taken, errors]),
          Self::Resumed { received, skipped } => {
             payload.push(RESUMED);
             put_string(&mut payload, &received.to_be_bytes());
@@ -347,6 +376,28 @@ impl Message {
       let mut frame = Vec::with_capacity(payload.len() + 4);
       put_string(&mut frame, &payload);
       frame
+   }
+
+   /// Reads the rest of a message that [`put_counts`] started.
+   fn counted(tag: u8, reader: &mut Reader<'_>) -> Result<Self, Error> {
+      let session = reader.u32()?;
+      let first = u64::from_be_bytes(reader.array()?);
+      let errors = u64::from_be_bytes(reader.array()?);
+
+      Ok(if tag == RESUME {
+         Self::Resume {
+            token: reader.array()?,
+            session,
+            received: first,
+            errors,
+         }
+      } else {
+         Self::Taken {
+            session,
+            taken: first,
+            errors,
+         }
+      })
    }
 
    /// Reads the payload of one frame, which is the frame without its length.
@@ -421,13 +472,7 @@ impl Message {
             }
          },
          AGENT => Self::Agent,
-         RESUME => {
-            Self::Resume {
-               token:    reader.array()?,
-               session:  reader.u32()?,
-               received: u64::from_be_bytes(reader.array()?),
-            }
-         },
+         tag @ (RESUME | TAKEN) => Self::counted(tag, &mut reader)?,
          RESUMED => {
             Self::Resumed {
                received: u64::from_be_bytes(reader.array()?),

@@ -48,19 +48,19 @@ pub enum Stage {
    /// The unprivileged network process.
    #[pound(hidden)]
    Network,
-   /// The process that owns one terminal session.
+   /// The process that owns one session.
    #[pound(hidden)]
    Hold {
       /// Account the session runs as.
       user:             String,
-      /// The client's `TERM`.
+      /// The client's `TERM`, absent for a session on pipes.
       #[pound(long)]
-      term:             String,
+      term:             Option<String>,
       /// Width of the terminal.
-      #[pound(long)]
+      #[pound(long, default = "80")]
       columns:          u16,
       /// Height of the terminal.
-      #[pound(long)]
+      #[pound(long, default = "24")]
       rows:             u16,
       /// The command, absent for a login shell.
       #[pound(long, allow_hyphen_values)]
