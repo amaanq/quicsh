@@ -85,9 +85,10 @@ private key file either way, so encrypted keys and FIDO keys work the same way
 plain ones do. `-i` also picks which agent key to offer, which is worth doing
 with security keys since every wrong one costs you a touch.
 
-`qsh` reads `~/.ssh/config` and `/etc/ssh/ssh_config` for `HostName`, `User`,
-`IdentityFile` and `ProxyJump`, so the names you already use with `ssh` work.
-`Port` is ignored, because that's sshd's TCP port and `qshd` may sit on
+`qsh` reads `~/.ssh/config` and `/etc/ssh/ssh_config`, so the names you
+already use with `ssh` work, along with their keys, jump hosts, forwards and
+agent settings. `-o` takes a line of that file and wins over both. `Port` is
+ignored in the files, because that's sshd's TCP port and `qshd` may sit on
 another one. `QshPort` sets the UDP port, and `IgnoreUnknown` makes `ssh` skip
 it.
 
@@ -179,7 +180,11 @@ batch into real packets there, and I haven't measured it between two machines.
 - Passwords and PAM. Keys only.
 - X11 forwarding.
 - Most of `ssh_config`. Only `Host`, `Match all`, `Include`, `HostName`,
-  `User`, `IdentityFile`, `ProxyJump` and `QshPort` are read.
+  `User`, `IdentityFile`, `IdentityAgent`, `ProxyJump`, `ForwardAgent`,
+  `LocalForward`, `RemoteForward`, `DynamicForward`, `ClearAllForwardings`,
+  `RequestTTY`, `RemoteCommand`, `StrictHostKeyChecking`, `HostKeyAlias` and
+  `QshPort` are read. `StrictHostKeyChecking no` behaves like `accept-new`,
+  so a changed host key is always refused.
 - P-521 keys, RSA keys under 2048 bits and RSA signatures over SHA-1.
   `ecdsa-sk` keys are accepted but nobody has tried one.
 - Host keys other than `ed25519`.

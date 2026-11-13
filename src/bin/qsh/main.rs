@@ -173,6 +173,7 @@ use crate::{
    options::{
       Login,
       Options,
+      Strict,
    },
 };
 
@@ -220,8 +221,9 @@ fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
    }
 
    let fingerprint = key.fingerprint();
+   let named = login.alias.as_deref().unwrap_or(&login.host);
 
-   match check(&known, &login.host, login.port, key) {
+   match check(&known, named, login.port, key) {
       Trust::Known => return Ok(()),
       Trust::Changed => {
          bail!(
@@ -236,17 +238,34 @@ fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
       Trust::Unknown => {},
    }
 
-   eprint!(
-      "The authenticity of host '[{}]:{}' can't be established.\nED25519 key fingerprint is \
-       {fingerprint}.\nAre you sure you want to continue connecting (yes/no)? ",
-      login.host, login.port
-   );
+   match login.strict {
+      Strict::Refuse => {
+         bail!(
+            "no known hosts file lists [{named}]:{}, and StrictHostKeyChecking forbids asking",
+            login.port
+         )
+      },
+      Strict::AcceptNew => {
+         eprintln!(
+            "Warning: Permanently added '[{named}]:{}' ({fingerprint}) to the list of known hosts.",
+            login.port
+         );
+      },
+      Strict::Ask => {
+         eprint!(
+            "The authenticity of host '[{named}]:{}' can't be established.\nED25519 key \
+             fingerprint is {fingerprint}.\nAre you sure you want to continue connecting \
+             (yes/no)? ",
+            login.port
+         );
 
-   let mut answer = String::new();
-   io::stdin().read_line(&mut answer)?;
+         let mut answer = String::new();
+         io::stdin().read_line(&mut answer)?;
 
-   if answer.trim() != "yes" {
-      bail!("host key not accepted");
+         if answer.trim() != "yes" {
+            bail!("host key not accepted");
+         }
+      },
    }
 
    DirBuilder::new()
@@ -262,7 +281,7 @@ fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
       .open(&own)
       .with_context(|| format!("opening {}", own.display()))?;
 
-   file.write_all(entry(&login.host, login.port, key).as_bytes())?;
+   file.write_all(entry(named, login.port, key).as_bytes())?;
    Ok(())
 }
 
@@ -285,8 +304,8 @@ fn authenticate(
    let offer = |request| attempts.send(Ok(Some(request))).is_ok() && next.recv().is_ok();
    let mut tried = Vec::new();
 
-   if env::var_os("SSH_AUTH_SOCK").is_some() {
-      let mut agent = Agent::connect()?;
+   if let Some(ref socket) = login.agent {
+      let mut agent = Agent::connect(socket)?;
       let data = challenge(secret, &login.user);
 
       for identity in agent.identities()? {
@@ -784,7 +803,7 @@ impl Client {
          .map_or_else(Vec::new, Deframer::into_rest);
 
       let agent = || {
-         let path = env::var_os("SSH_AUTH_SOCK")?;
+         let path = self.login.agent.as_ref()?;
          Some(OwnedFd::from(UnixStream::connect(path).ok()?))
       };
 
@@ -1225,7 +1244,7 @@ fn jump(hops: &str, login: &Login) -> Result<(Child, OwnedFd)> {
 }
 
 fn main() -> Result<()> {
-   let options = Options::parse();
+   let mut options = Options::parse();
    let login = options.login()?;
 
    let relay = match options.relay.as_deref().map(endpoint) {

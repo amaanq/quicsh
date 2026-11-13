@@ -48,8 +48,6 @@ pub enum Error {
    PrivateKey,
    #[error("signature does not verify")]
    Signature,
-   #[error("SSH_AUTH_SOCK is not set")]
-   AgentUnavailable,
    #[error("talking to the SSH agent failed")]
    Agent(#[source] io::Error),
    #[error("the SSH agent refused the request")]

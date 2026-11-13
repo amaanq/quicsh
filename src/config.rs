@@ -3,8 +3,11 @@
 //! - `Host` blocks with `*`, `?` and `!` patterns, `Match all`, and `Include`.
 //!   Any other `Match` block is skipped, since its conditions are not
 //!   evaluated.
-//! - `HostName`, `User` and `IdentityFile`. `Port` is ignored, because it names
-//!   sshd's TCP port and says nothing about the UDP port.
+//! - `HostName`, `User`, `IdentityFile`, `IdentityAgent`, `ProxyJump`,
+//!   `ForwardAgent`, the three forward keywords, `ClearAllForwardings`,
+//!   `RequestTTY`, `RemoteCommand`, `StrictHostKeyChecking` and `HostKeyAlias`.
+//!   `Port` is ignored, because it names sshd's TCP port and says nothing about
+//!   the UDP port.
 //! - `QshPort` for the UDP port, which OpenSSH skips once the file says
 //!   `IgnoreUnknown QshPort`.
 //! - As in OpenSSH, the first value found for a keyword wins and identity files
@@ -37,10 +40,31 @@ pub struct Host {
    pub identity_files: Vec<PathBuf>,
    /// The hosts to connect through, as written.
    pub jump:           Option<String>,
+   /// `IdentityAgent`, as written.
+   pub agent:          Option<String>,
+   /// `ForwardAgent`, as written.
+   pub forward_agent:  Option<String>,
+   /// Every `LocalForward`, as written.
+   pub locals:         Vec<String>,
+   /// Every `RemoteForward`, as written.
+   pub remotes:        Vec<String>,
+   /// Every `DynamicForward`, as written.
+   pub dynamics:       Vec<String>,
+   /// `ClearAllForwardings`, as written.
+   pub clear:          Option<String>,
+   /// `RequestTTY`, as written.
+   pub terminal:       Option<String>,
+   /// `RemoteCommand`, as written.
+   pub command:        Option<String>,
+   /// `StrictHostKeyChecking`, as written.
+   pub strict:         Option<String>,
+   /// The name to look the host key up under.
+   pub alias:          Option<String>,
 }
 
 /// Replaces a leading `~/` with the home directory.
-fn expand(path: &str) -> PathBuf {
+#[must_use]
+pub fn expand(path: &str) -> PathBuf {
    match (path.strip_prefix("~/"), env::var_os("HOME")) {
       (Some(rest), Some(home)) => Path::new(&home).join(rest),
       _ => PathBuf::from(path),
@@ -69,6 +93,12 @@ impl Host {
       self.include(path, name, true, 0);
    }
 
+   /// Adds what command line options say, each in the form of one line of
+   /// the file. They cannot include other files.
+   pub fn options(&mut self, lines: &[String], name: &str) {
+      self.apply(&lines.join("\n"), Path::new(""), name, true, MAX_DEPTH);
+   }
+
    /// Reads one file, which applies from its first line when `active`.
    fn include(&mut self, path: &Path, name: &str, active: bool, depth: usize) {
       if let Ok(text) = fs::read_to_string(path) {
@@ -91,17 +121,41 @@ impl Host {
             .trim_start_matches(|symbol: char| symbol.is_whitespace() || symbol == '=')
             .trim_matches('"');
 
-         match keyword.to_ascii_lowercase().as_str() {
+         let lowered = keyword.to_ascii_lowercase();
+
+         let single = match lowered.as_str() {
+            "user" => Some(&mut self.user),
+            "qshport" => Some(&mut self.port),
+            "proxyjump" => Some(&mut self.jump),
+            "identityagent" => Some(&mut self.agent),
+            "forwardagent" => Some(&mut self.forward_agent),
+            "clearallforwardings" => Some(&mut self.clear),
+            "requesttty" => Some(&mut self.terminal),
+            "remotecommand" => Some(&mut self.command),
+            "stricthostkeychecking" => Some(&mut self.strict),
+            "hostkeyalias" => Some(&mut self.alias),
+            _ => None,
+         };
+
+         if let Some(slot) = single {
+            if active && !value.is_empty() && slot.is_none() {
+               *slot = Some(value.to_owned());
+            }
+
+            continue;
+         }
+
+         match lowered.as_str() {
             "host" => active = covers(value.split_whitespace(), name),
             "match" => active = value.eq_ignore_ascii_case("all"),
             _ if !active || value.is_empty() => {},
             "hostname" if self.hostname.is_none() => {
                self.hostname = Some(value.replace("%h", name));
             },
-            "user" if self.user.is_none() => self.user = Some(value.to_owned()),
-            "qshport" if self.port.is_none() => self.port = Some(value.to_owned()),
-            "proxyjump" if self.jump.is_none() => self.jump = Some(value.to_owned()),
             "identityfile" => self.identity_files.push(expand(value)),
+            "localforward" => self.locals.push(value.to_owned()),
+            "remoteforward" => self.remotes.push(value.to_owned()),
+            "dynamicforward" => self.dynamics.push(value.to_owned()),
             "include" if depth < MAX_DEPTH => {
                for pattern in value.split_whitespace() {
                   for path in matching(&base.join(expand(pattern))) {

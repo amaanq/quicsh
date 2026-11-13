@@ -19,7 +19,10 @@ use misstep::{
 };
 use quicsh::{
    DEFAULT_PORT,
-   config::Host,
+   config::{
+      Host,
+      expand,
+   },
    key::PublicKey,
    transport::Congestion,
 };
@@ -34,15 +37,32 @@ use crate::forward::{
 #[derive(Clone)]
 pub struct Login {
    /// Account name on the server.
-   pub user: String,
+   pub user:   String,
    /// Host name or address of the server.
-   pub host: String,
+   pub host:   String,
    /// The server's UDP port.
-   pub port: u16,
+   pub port:   u16,
    /// The only keys to offer, when any were named.
-   pub keys: Vec<Identity>,
+   pub keys:   Vec<Identity>,
    /// The hosts to connect through, the nearest first.
-   pub jump: Option<String>,
+   pub jump:   Option<String>,
+   /// Socket of the SSH agent, when there is one to use.
+   pub agent:  Option<PathBuf>,
+   /// What to do about a host key nobody vouched for yet.
+   pub strict: Strict,
+   /// The name to look the host key up under, in place of the host's.
+   pub alias:  Option<String>,
+}
+
+/// What to do about a host key that no known hosts file lists.
+#[derive(Clone, Copy)]
+pub enum Strict {
+   /// Ask the user.
+   Ask,
+   /// Trust it and remember it.
+   AcceptNew,
+   /// Refuse it.
+   Refuse,
 }
 
 /// A key to log in with.
@@ -108,8 +128,8 @@ pub struct Options {
    /// Accepted for scp and sftp and ignored, since nothing compresses.
    #[pound(short = 'C')]
    pub compress:   bool,
-   /// An OpenSSH option, as sftp and scp pass them. Port sets the UDP port
-   /// and the rest are ignored.
+   /// A line of the OpenSSH client configuration, which wins over the files.
+   /// Port sets the UDP port here, as sftp and scp expect.
    #[pound(short = 'o', value_name = "OPTION")]
    pub option:     Vec<String>,
    /// The server's UDP port. Without it, the OpenSSH client configuration
@@ -157,15 +177,80 @@ pub struct Options {
    pub command: Vec<String>,
 }
 
+/// The agent socket that `IdentityAgent` names, which is the one in
+/// `SSH_AUTH_SOCK` when the keyword is absent.
+fn socket(named: Option<&str>) -> Option<PathBuf> {
+   match named {
+      Some(text) if text.eq_ignore_ascii_case("none") => None,
+      Some("SSH_AUTH_SOCK") | None => env::var_os("SSH_AUTH_SOCK").map(PathBuf::from),
+      Some(text) => {
+         text.strip_prefix('$').map_or_else(
+            || Some(expand(text)),
+            |variable| env::var_os(variable).map(PathBuf::from),
+         )
+      },
+   }
+}
+
 impl Options {
-   /// Resolves the account, host, port and identity the options name.
-   pub fn login(&self) -> Result<Login> {
+   /// Takes the forwards, the command, the terminal and the agent switch from
+   /// the OpenSSH client configuration where the command line left them open.
+   fn adopt(&mut self, host: &Host) -> Result<()> {
+      let yes = |value: &Option<String>| {
+         value.as_deref().is_some_and(|text| {
+            text.eq_ignore_ascii_case("yes") || text.eq_ignore_ascii_case("true")
+         })
+      };
+
+      self.agent |= yes(&host.forward_agent);
+      self.terminal |= host.terminal.as_deref().is_some_and(|text| {
+         text.eq_ignore_ascii_case("yes") || text.eq_ignore_ascii_case("force")
+      });
+
+      // A relay for another qsh must not claim the ports a host's forwards
+      // name, and neither must scp or sftp, which say so with this option.
+      if self.relay.is_none() && !yes(&host.clear) {
+         let joined = |spec: &String| spec.split_whitespace().collect::<Vec<&str>>().join(":");
+
+         for spec in &host.locals {
+            self.local.push(joined(spec).parse()?);
+         }
+
+         for spec in &host.remotes {
+            self.remote.push(joined(spec).parse()?);
+         }
+
+         for spec in &host.dynamics {
+            self.dynamic.push(spec.parse()?);
+         }
+      }
+
+      let command = host
+         .command
+         .as_deref()
+         .filter(|text| !text.eq_ignore_ascii_case("none"));
+
+      if let Some(text) = command
+         && self.command.is_empty()
+         && !self.forward
+         && self.relay.is_none()
+      {
+         self.command.push(text.to_owned());
+      }
+
+      Ok(())
+   }
+
+   /// Resolves the account, host, port and identity the options name, and
+   /// fills the open options from the OpenSSH client configuration.
+   pub fn login(&mut self) -> Result<Login> {
       let (named, alias) = match self.target.split_once('@') {
          Some((named, alias)) => (Some(named), alias),
          None => (None, self.target.as_str()),
       };
 
       let mut host = Host::default();
+      host.options(&self.option, alias);
 
       if let Some(home) = env::var_os("HOME") {
          host.read(&Path::new(&home).join(".ssh/config"), alias);
@@ -204,16 +289,32 @@ impl Options {
       let user = match named.or(self.login.as_deref()) {
          Some(user) => user.to_owned(),
          None => {
-            match host.user {
+            match host.user.take() {
                Some(user) => user,
                None => env::var("USER").context("USER is not set, pass USER@HOST")?,
             }
          },
       };
 
+      let name = host.hostname.take().unwrap_or_else(|| alias.to_owned());
+      self.adopt(&host)?;
+
+      // OpenSSH's `no` also accepts a key that changed, which is not on
+      // offer here.
+      let strict = match host
+         .strict
+         .as_deref()
+         .map(str::to_ascii_lowercase)
+         .as_deref()
+      {
+         Some("yes") => Strict::Refuse,
+         Some("accept-new" | "no" | "off") => Strict::AcceptNew,
+         Some(_) | None => Strict::Ask,
+      };
+
       Ok(Login {
          user,
-         host: host.hostname.unwrap_or_else(|| alias.to_owned()),
+         host: name,
          port,
          keys,
          jump: self
@@ -221,6 +322,9 @@ impl Options {
             .clone()
             .or(host.jump)
             .filter(|jump| !jump.eq_ignore_ascii_case("none")),
+         agent: socket(host.agent.as_deref()),
+         strict,
+         alias: host.alias,
       })
    }
 }

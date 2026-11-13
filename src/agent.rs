@@ -2,12 +2,12 @@
 //! the user's keys and signs with them.
 
 use std::{
-   env,
    io::{
       Read as _,
       Write as _,
    },
    os::unix::net::UnixStream,
+   path::Path,
 };
 
 use crate::{
@@ -42,13 +42,12 @@ pub struct Identity {
 pub struct Agent(UnixStream);
 
 impl Agent {
-   /// Connects to the agent named by `SSH_AUTH_SOCK`.
+   /// Connects to the agent that listens at `path`.
    ///
    /// # Errors
    ///
-   /// Fails when the variable is unset or the socket refuses the connection.
-   pub fn connect() -> Result<Self, Error> {
-      let path = env::var_os("SSH_AUTH_SOCK").ok_or(Error::AgentUnavailable)?;
+   /// Fails when the socket refuses the connection.
+   pub fn connect(path: &Path) -> Result<Self, Error> {
       Ok(Self(UnixStream::connect(path).map_err(Error::Agent)?))
    }
 
