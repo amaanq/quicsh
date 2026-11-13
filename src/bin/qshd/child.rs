@@ -67,7 +67,11 @@ impl Launch {
       }
 
       if geteuid().is_root() {
-         let groups: Vec<Gid> = account.groups()?.into_iter().map(Gid::from_raw).collect();
+         let groups = account
+            .groups()?
+            .into_iter()
+            .map(Gid::from_raw)
+            .collect::<Vec<Gid>>();
 
          // Groups and gid go first, because dropping the uid removes the
          // right to change them.

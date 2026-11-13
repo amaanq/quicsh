@@ -102,7 +102,7 @@ impl Account {
       let passwd = fs::read_to_string("/etc/passwd").map_err(Error::Passwd)?;
 
       Ok(passwd.lines().find_map(|line| {
-         let fields: Vec<&str> = line.split(':').collect();
+         let fields = line.split(':').collect::<Vec<&str>>();
          let [user, _password, uid, gid, _gecos, home, shell] = *fields.as_slice() else {
             return None;
          };
@@ -129,7 +129,7 @@ impl Account {
       let group = fs::read_to_string("/etc/group").map_err(Error::Passwd)?;
 
       let supplementary = group.lines().filter_map(|line| {
-         let fields: Vec<&str> = line.split(':').collect();
+         let fields = line.split(':').collect::<Vec<&str>>();
          let [_name, _password, gid, members] = *fields.as_slice() else {
             return None;
          };

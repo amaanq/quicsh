@@ -105,7 +105,7 @@ impl FromStr for Fixed {
    type Err = Report;
 
    fn from_str(spec: &str) -> Result<Self> {
-      let fields: Vec<&str> = spec.split(':').collect();
+      let fields = spec.split(':').collect::<Vec<&str>>();
 
       let (bind, host, port) = match *fields.as_slice() {
          [port, host, target] => (bind(None, port)?, host, target),
@@ -198,7 +198,7 @@ impl FromStr for Remote {
 
    /// Parses `-R port:host:hostport`.
    fn from_str(spec: &str) -> Result<Self> {
-      let fields: Vec<&str> = spec.split(':').collect();
+      let fields = spec.split(':').collect::<Vec<&str>>();
 
       let [port, host, target] = *fields.as_slice() else {
          bail!("expected port:host:hostport, got {spec}");

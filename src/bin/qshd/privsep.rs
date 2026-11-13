@@ -457,7 +457,10 @@ where
          .and_then(&mut handle)
          .unwrap_or_else(|error| (Reply::Failed(format!("{error}")), Vec::new()));
 
-      let borrowed: Vec<_> = descriptors.iter().map(OwnedFd::as_fd).collect();
+      let borrowed = descriptors
+         .iter()
+         .map(OwnedFd::as_fd)
+         .collect::<Vec<BorrowedFd>>();
       send(channel, &reply.encode(), &borrowed)?;
    }
 }
