@@ -64,6 +64,15 @@ in
       '';
     };
 
+    sftpServer = lib.mkOption {
+      type = lib.types.path;
+      default = "${pkgs.openssh}/libexec/sftp-server";
+      defaultText = lib.literalExpression ''"''${pkgs.openssh}/libexec/sftp-server"'';
+      description = ''
+        The program behind the `sftp` subsystem, which `scp` and `sftp` use.
+      '';
+    };
+
     congestion = lib.mkOption {
       type = lib.types.enum [
         "bbr"
@@ -125,6 +134,8 @@ in
             cfg.user
             "--congestion"
             cfg.congestion
+            "--sftp-server"
+            cfg.sftpServer
           ]
           ++ lib.optionals (cfg.authorizedKeysFile != null) [
             "--authorized-keys"

@@ -81,13 +81,22 @@ pub struct Terminal {
    pub size: Size,
 }
 
+/// What a session runs.
+pub enum Program {
+   /// The account's login shell.
+   Shell,
+   /// A command line for the login shell.
+   Command(String),
+   /// A service the server knows by name, such as `sftp`.
+   Subsystem(String),
+}
+
 pub struct Open {
    /// Chosen by the client and echoed in resize and exit messages.
    pub session:  u32,
    /// `None` runs the command on pipes with a separate standard error.
    pub terminal: Option<Terminal>,
-   /// `None` starts the account's login shell.
-   pub command:  Option<String>,
+   pub program:  Program,
    /// Offer the client's SSH agent to the session.
    pub agent:    bool,
 }
@@ -197,15 +206,17 @@ fn open(reader: &mut Reader<'_>) -> Result<Open, Error> {
       },
    };
 
-   let command = match reader.byte()? {
-      0 => None,
-      _ => Some(text(reader)?),
+   let program = match reader.byte()? {
+      0 => Program::Shell,
+      1 => Program::Command(text(reader)?),
+      2 => Program::Subsystem(text(reader)?),
+      _ => return Err(Error::Frame),
    };
 
    Ok(Open {
       session,
       terminal,
-      command,
+      program,
       agent: reader.byte()? != 0,
    })
 }
@@ -235,9 +246,16 @@ impl Message {
                put_size(&mut payload, terminal.size);
             }
 
-            payload.push(u8::from(open.command.is_some()));
-            if let Some(ref command) = open.command {
-               put_string(&mut payload, command.as_bytes());
+            match open.program {
+               Program::Shell => payload.push(0),
+               Program::Command(ref line) => {
+                  payload.push(1);
+                  put_string(&mut payload, line.as_bytes());
+               },
+               Program::Subsystem(ref name) => {
+                  payload.push(2);
+                  put_string(&mut payload, name.as_bytes());
+               },
             }
 
             payload.push(u8::from(open.agent));
@@ -481,6 +499,7 @@ mod tests {
          Message,
          Open,
          Outbox,
+         Program,
          Size,
          Terminal,
       },
@@ -551,7 +570,7 @@ mod tests {
                rows:    40,
             },
          }),
-         command:  Some("uname -a".to_owned()),
+         program:  Program::Command("uname -a".to_owned()),
          agent:    true,
       }));
 
@@ -574,7 +593,10 @@ mod tests {
          Some((120, 40)),
          "size"
       );
-      assert_eq!(open.command.as_deref(), Some("uname -a"), "command");
+      assert!(
+         matches!(open.program, Program::Command(ref line) if line == "uname -a"),
+         "command"
+      );
       assert!(open.agent, "agent");
    }
 }

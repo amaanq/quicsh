@@ -60,6 +60,7 @@ use quicsh::{
    },
    control::{
       Open,
+      Program,
       Terminal,
       Token,
    },
@@ -109,6 +110,14 @@ use crate::{
    },
 };
 
+/// Where distributions install OpenSSH's `sftp-server`.
+const SFTP_SERVERS: [&str; 4] = [
+   "/usr/lib/openssh/sftp-server",
+   "/usr/libexec/openssh/sftp-server",
+   "/usr/lib/ssh/sftp-server",
+   "/usr/libexec/sftp-server",
+];
+
 /// File in the holders directory with the keys a restarted server shares
 /// with the old one. It sits on a runtime directory, so a reboot replaces it.
 const RESTART_SECRET: &str = "restart-secret";
@@ -131,6 +140,8 @@ pub struct Settings {
    pub host_key:        PathBuf,
    /// File that replaces every account's own `authorized_keys`.
    pub authorized_keys: Option<PathBuf>,
+   /// Program behind the `sftp` subsystem.
+   pub sftp_server:     Option<PathBuf>,
    /// The account the network process runs as when the monitor is root.
    pub user:            String,
    /// Congestion controller the network process uses.
@@ -171,6 +182,8 @@ struct Monitor {
    listener:        Option<OwnedFd>,
    /// File that replaces every account's own `authorized_keys`.
    authorized_keys: Option<PathBuf>,
+   /// Program behind the `sftp` subsystem.
+   sftp_server:     Option<PathBuf>,
    /// Logins the network process may start sessions for.
    grants:          HashMap<u64, Grant>,
    /// The process group of every session on pipes that has not exited.
@@ -294,6 +307,35 @@ impl Monitor {
       Ok(link)
    }
 
+   /// The command line the login shell gets, or `None` for the shell alone.
+   fn command(&self, program: &Program) -> Result<Option<String>> {
+      Ok(match *program {
+         Program::Shell => None,
+         Program::Command(ref line) => Some(line.clone()),
+         Program::Subsystem(ref name) => {
+            ensure!(name == "sftp", "no subsystem named {name}");
+
+            let server = self
+               .sftp_server
+               .as_deref()
+               .or_else(|| {
+                  SFTP_SERVERS
+                     .iter()
+                     .map(Path::new)
+                     .find(|path| path.exists())
+               })
+               .context("no sftp-server found, name one with --sftp-server")?;
+
+            Some(
+               server
+                  .to_str()
+                  .context("sftp-server path is not UTF-8")?
+                  .to_owned(),
+            )
+         },
+      })
+   }
+
    /// Starts a holder process with a terminal session for the grant's
    /// account. The holder listens on a socket made here, since it gives up
    /// root and could not make one in a directory only root can enter.
@@ -333,7 +375,7 @@ impl Monitor {
          command.arg("--agent");
       }
 
-      if let Some(ref text) = open.command {
+      if let Some(text) = self.command(&open.program)? {
          command.arg("--command").arg(text);
       }
 
@@ -411,7 +453,7 @@ impl Monitor {
          command.arg("--agent-socket").arg(&agent.socket);
       }
 
-      if let Some(ref text) = open.command {
+      if let Some(text) = self.command(&open.program)? {
          command.arg("--command").arg(text);
       }
 
@@ -586,6 +628,7 @@ pub fn run(settings: Settings) -> Result<()> {
       listen:          settings.listen,
       listener:        Some(listener),
       authorized_keys: settings.authorized_keys,
+      sftp_server:     settings.sftp_server,
       grants:          HashMap::new(),
       sessions:        Arc::new(Mutex::new(HashMap::new())),
       holders:         holders()?,

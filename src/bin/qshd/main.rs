@@ -39,6 +39,7 @@ fn main() -> Result<()> {
                .unwrap_or_else(|| (Ipv6Addr::UNSPECIFIED, DEFAULT_PORT).into()),
             host_key:        options.host_key,
             authorized_keys: options.authorized_keys,
+            sftp_server:     options.sftp_server,
             user:            options.user,
             congestion:      options.congestion,
          })

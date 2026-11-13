@@ -77,6 +77,10 @@ impl Identity {
 /// SSH over QUIC client.
 #[derive(pound::Parse)]
 #[pound(name = "qsh", version = env!("CARGO_PKG_VERSION"))]
+#[expect(
+   clippy::struct_excessive_bools,
+   reason = "each flag is an independent switch on the command line"
+)]
 pub struct Options {
    /// Forward the local SSH agent to the session.
    #[pound(short = 'A')]
@@ -87,6 +91,25 @@ pub struct Options {
    /// Run COMMAND on a terminal.
    #[pound(short = 't')]
    pub terminal:   bool,
+   /// Ask for the subsystem COMMAND names, as sftp and scp do.
+   #[pound(short = 's')]
+   pub subsystem:  bool,
+   /// Accepted for scp and ignored, since nothing forwards X11.
+   #[pound(short = 'x')]
+   pub no_x11:     bool,
+   /// Accepted for scp and sftp and ignored.
+   #[pound(short = 'q')]
+   pub quiet:      bool,
+   /// Accepted for scp and sftp and ignored.
+   #[pound(short = 'v')]
+   pub verbose:    bool,
+   /// Accepted for scp and sftp and ignored, since nothing compresses.
+   #[pound(short = 'C')]
+   pub compress:   bool,
+   /// An OpenSSH option, as sftp and scp pass them. Port sets the UDP port
+   /// and the rest are ignored.
+   #[pound(short = 'o', value_name = "OPTION")]
+   pub option:     Vec<String>,
    /// The server's UDP port. Without it, the OpenSSH client configuration
    /// may name one, and 22 is the default.
    #[pound(short = 'p', value_name = "PORT")]
@@ -140,12 +163,17 @@ impl Options {
 
       host.read(Path::new("/etc/ssh/ssh_config"), alias);
 
-      let port = match (self.port, host.port) {
+      let chosen = self.option.iter().find_map(|option| {
+         let (name, value) = option.split_once(['=', ' '])?;
+         name.eq_ignore_ascii_case("port").then_some(value.trim())
+      });
+
+      let port = match (self.port, chosen.or(host.port.as_deref())) {
          (Some(port), _) => port,
          (None, Some(text)) => {
             text
                .parse::<u16>()
-               .with_context(|| format!("bad QshPort {text} for {alias}"))?
+               .with_context(|| format!("bad port {text} for {alias}"))?
          },
          (None, None) => DEFAULT_PORT,
       };

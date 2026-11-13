@@ -22,7 +22,7 @@ afford to lose :)
 - Login shells and remote commands, with a terminal or with pipes
 - `-L`, `-R` and `-D` (SOCKS5) forwarding
 - Agent forwarding with `-A`, which keeps working after a reattach
-- `rsync -e qsh`
+- `rsync -e qsh`, and `scp` and `sftp` with `-S qsh`
 - IPv4 and IPv6 on one socket
 - Roaming. A session carries on when the client changes networks
 - Reattaching. A terminal session survives up to an hour without a
@@ -62,6 +62,16 @@ qsh user@host uname -a
 qsh -t host htop
 qsh -A host
 qsh -N -L 8080:localhost:80 -D 1080 host
+```
+
+`scp` and `sftp` take `qsh` as their transport. The server runs OpenSSH's
+`sftp-server` for them, and `--sftp-server` names it when it lives somewhere
+unusual.
+
+```sh
+scp -S qsh notes.txt host:
+sftp -S qsh host
+rsync -a -e qsh src/ host:dst/
 ```
 
 Keys come from `ssh-agent` when one is running. Without one, `ssh-keygen`
@@ -145,7 +155,7 @@ switch. I'd like to close that gap, but it isn't closed.
 ## What's missing
 
 - Passwords and PAM. Keys only.
-- X11 forwarding and the `sftp` subsystem.
+- X11 forwarding.
 - Most of `ssh_config`. Only `Host`, `Match all`, `Include`, `HostName`,
   `User`, `IdentityFile` and `QshPort` are read.
 - Key types other than `ed25519` and `ed25519-sk`.

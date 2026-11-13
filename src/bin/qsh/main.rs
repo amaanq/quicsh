@@ -92,6 +92,7 @@ use quicsh::{
       Message,
       Open,
       Outbox,
+      Program,
       Size,
       Terminal,
       Token,
@@ -405,8 +406,8 @@ fn window() -> Result<Size> {
 
 /// What the session runs.
 struct Shell {
-   /// The remote command, or `None` for a login shell.
-   command:  Option<String>,
+   /// The shell, a command or a subsystem.
+   program:  Program,
    /// Run the command on a terminal, as `ssh -t` does.
    terminal: bool,
 }
@@ -481,7 +482,8 @@ fn standard(descriptor: impl AsFd) -> Result<File> {
 impl Client {
    /// Opens the session stream once the server accepted the login.
    fn start(&mut self, shell: Shell, connection: &mut Connection) -> Result<()> {
-      let interactive = (shell.command.is_none() || shell.terminal) && isatty(io::stdin());
+      let interactive =
+         (matches!(shell.program, Program::Shell) || shell.terminal) && isatty(io::stdin());
 
       let terminal = if interactive {
          let size = window()?;
@@ -498,7 +500,7 @@ impl Client {
       let open = Open {
          session: SESSION,
          terminal,
-         command: shell.command,
+         program: shell.program,
          agent: self.agent,
       };
 
@@ -1106,7 +1108,11 @@ fn main() -> Result<()> {
       spares: 0,
       resuming: None,
       shell: (!options.forward).then_some(Shell {
-         command:  (!options.command.is_empty()).then(|| options.command.join(" ")),
+         program:  match (options.command.is_empty(), options.subsystem) {
+            (true, _) => Program::Shell,
+            (false, false) => Program::Command(options.command.join(" ")),
+            (false, true) => Program::Subsystem(options.command.join(" ")),
+         },
          terminal: options.terminal,
       }),
       agent: options.agent,

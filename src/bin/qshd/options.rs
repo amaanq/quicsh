@@ -25,6 +25,10 @@ pub struct Options {
    /// Check every login against FILE instead of each account's own key file.
    #[pound(long, value_name = "FILE")]
    pub authorized_keys: Option<PathBuf>,
+   /// The program behind the sftp subsystem, which scp and sftp ask for.
+   /// Without it, the usual places for OpenSSH's sftp-server are tried.
+   #[pound(long, value_name = "FILE")]
+   pub sftp_server:     Option<PathBuf>,
    /// The account the network process runs as when the server is root.
    #[pound(long, value_name = "NAME", default = "sshd")]
    pub user:            String,
