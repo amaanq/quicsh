@@ -6,23 +6,26 @@ edition = "2024"
 [dependencies]
 bytes       = "1.12.1"
 knell       = "1.0.1"
-misstep     = { features = [ "pretty" ], version = "0.4.1" }
+misstep     = { version = "0.4.1", features = [ "pretty" ] }
 pound       = "0.6.1"
-quinn-proto = { default-features = false, features = [ "rustls-ring" ], version = "0.11.19" }
-quinn-udp   = { default-features = false, version = "0.6.3" }
+quinn-proto = { version = "0.11.19", default-features = false, features = [ "rustls-ring" ] }
+quinn-udp   = { version = "0.6.3", default-features = false }
 ring        = "0.17.14"
-rustix      = { features = [ "event", "net", "process", "pty", "termios", "thread", "time" ], version = "1.1.6" }
-rustls      = { default-features = false, features = [ "ring", "std" ], version = "0.23.46" }
+rustix      = {
+  version  = "1.1.6",
+  features = [ "event", "net", "process", "pty", "termios", "thread", "time" ]
+}
+rustls      = { version = "0.23.46", default-features = false, features = [ "ring", "std" ] }
 thiserror   = "2.0.21"
 zeroize     = "1.9.1"
-
-[profile.release]
-lto   = "thin"
-strip = true
-
-[lints.rust]
-unsafe_code = "forbid"
 
 [lints.clippy]
 nursery  = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[profile.release]
+strip = true
+lto   = "thin"
