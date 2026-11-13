@@ -73,6 +73,9 @@ pub struct Login {
    /// How long the first connection may take per address, from
    /// `ConnectTimeout`.
    pub timeout:      Option<Duration>,
+   /// The known hosts files to read, from `UserKnownHostsFile` and
+   /// `GlobalKnownHostsFile` or the places OpenSSH looks without them.
+   pub known:        Vec<PathBuf>,
    /// Certificates for the keys to log in with, from `CertificateFile` and
    /// from beside the named key files.
    pub certificates: Vec<Certificate>,
@@ -248,6 +251,26 @@ fn socket(named: Option<&str>) -> Option<PathBuf> {
          )
       },
    }
+}
+
+/// The known hosts files that `UserKnownHostsFile` and
+/// `GlobalKnownHostsFile` name, or the ones OpenSSH reads without them.
+fn known(host: &Host) -> Vec<PathBuf> {
+   [
+      host
+         .known_user
+         .as_deref()
+         .unwrap_or("~/.ssh/known_hosts ~/.ssh/known_hosts2"),
+      host
+         .known_global
+         .as_deref()
+         .unwrap_or("/etc/ssh/ssh_known_hosts /etc/ssh/ssh_known_hosts2"),
+   ]
+   .into_iter()
+   .flat_map(str::split_whitespace)
+   .filter(|file| !file.eq_ignore_ascii_case("none"))
+   .map(expand)
+   .collect()
 }
 
 /// The escape character that `EscapeChar` or `-e` names, which is `~` when
@@ -535,6 +558,7 @@ impl Options {
 
       Ok(Login {
          control,
+         known: known(&host),
          certificates,
          environment: environment(&host)?,
          escape: escape(self.escape.as_deref().or(host.escape.as_deref()))?,

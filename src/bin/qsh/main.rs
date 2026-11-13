@@ -217,14 +217,12 @@ fn home() -> Result<PathBuf> {
 
 /// The known hosts files in one text, and the path of the one this program
 /// writes.
-fn known_hosts() -> Result<(String, PathBuf)> {
-   let ssh = home()?.join(".ssh");
-   let own = ssh.join("known_hosts_quicsh");
-
+fn known_hosts(login: &Login) -> Result<(String, PathBuf)> {
+   let own = home()?.join(".ssh/known_hosts_quicsh");
    let mut known = String::new();
 
-   for path in [ssh.join("known_hosts"), own.clone()] {
-      match fs::read_to_string(&path) {
+   for path in login.known.iter().chain([&own]) {
+      match fs::read_to_string(path) {
          Ok(text) => {
             known.push_str(&text);
             known.push('\n');
@@ -244,7 +242,7 @@ fn known_hosts() -> Result<(String, PathBuf)> {
 /// Stops unless the user's known hosts vouch for `key`, asking on first
 /// contact.
 fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
-   let (known, own) = known_hosts()?;
+   let (known, own) = known_hosts(login)?;
    let fingerprint = key.fingerprint();
    let named = login.alias.as_deref().unwrap_or(&login.host);
 
@@ -1010,7 +1008,7 @@ impl Client {
    fn connected(&mut self, connection: &mut Connection) -> Result<()> {
       let host_key = tls::peer_key(connection)?;
       let named = self.login.alias.as_deref().unwrap_or(&self.login.host);
-      let (known, _) = known_hosts()?;
+      let (known, _) = known_hosts(&self.login)?;
 
       let listed = matches!(
          check(&known, named, self.login.port, &host_key),

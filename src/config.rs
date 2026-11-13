@@ -7,10 +7,11 @@
 //! - `HostName`, `User`, `IdentityFile`, `CertificateFile`, `IdentityAgent`,
 //!   `ProxyJump`, `ForwardAgent`, the three forward keywords,
 //!   `ClearAllForwardings`, `RequestTTY`, `RemoteCommand`,
-//!   `StrictHostKeyChecking`, `HostKeyAlias`, `ControlMaster`, `ControlPath`,
-//!   `ControlPersist`, `ConnectTimeout`, `EscapeChar`, `SendEnv` and `SetEnv`.
-//!   As in OpenSSH, only the first `SetEnv` line counts. `Port` is ignored,
-//!   because it names sshd's TCP port and says nothing about the UDP port.
+//!   `StrictHostKeyChecking`, `HostKeyAlias`, `UserKnownHostsFile`,
+//!   `GlobalKnownHostsFile`, `ControlMaster`, `ControlPath`, `ControlPersist`,
+//!   `ConnectTimeout`, `EscapeChar`, `SendEnv` and `SetEnv`. As in OpenSSH,
+//!   only the first `SetEnv` line counts. `Port` is ignored, because it names
+//!   sshd's TCP port and says nothing about the UDP port.
 //! - `QshPort` for the UDP port, which OpenSSH skips once the file says
 //!   `IgnoreUnknown QshPort`.
 //! - As in OpenSSH, the first value found for a keyword wins and identity files
@@ -74,6 +75,10 @@ pub struct Host {
    pub certificates:    Vec<PathBuf>,
    /// `ConnectTimeout`, as written.
    pub connect_timeout: Option<String>,
+   /// `UserKnownHostsFile`, as written.
+   pub known_user:      Option<String>,
+   /// `GlobalKnownHostsFile`, as written.
+   pub known_global:    Option<String>,
    /// `EscapeChar`, as written.
    pub escape:          Option<String>,
    /// The `SendEnv` patterns that name local variables to pass on.
@@ -247,6 +252,8 @@ impl Host {
             "controlpersist" => Some(&mut self.control_persist),
             "connecttimeout" => Some(&mut self.connect_timeout),
             "escapechar" => Some(&mut self.escape),
+            "userknownhostsfile" => Some(&mut self.known_user),
+            "globalknownhostsfile" => Some(&mut self.known_global),
             _ => None,
          };
 
