@@ -4,6 +4,12 @@
 //! - Each session stream starts with one [`Message::Open`] frame. Raw standard
 //!   input follows it, and raw standard output comes back.
 
+use quinn_proto::{
+   Connection,
+   StreamId,
+   WriteError,
+};
+
 use crate::{
    auth::Request,
    error::Error,
@@ -22,6 +28,12 @@ const REJECTED: u8 = 3;
 const OPEN: u8 = 4;
 const RESIZE: u8 = 5;
 const EXIT: u8 = 6;
+const CONNECT: u8 = 7;
+const LISTEN: u8 = 8;
+const LISTENING: u8 = 9;
+const REFUSED: u8 = 10;
+const FORWARDED: u8 = 11;
+const AGENT: u8 = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Size {
@@ -42,6 +54,8 @@ pub struct Open {
    pub terminal: Option<Terminal>,
    /// `None` starts the account's login shell.
    pub command:  Option<String>,
+   /// Offer the client's SSH agent to the session.
+   pub agent:    bool,
 }
 
 pub enum Message {
@@ -49,8 +63,37 @@ pub enum Message {
    Accepted,
    Rejected,
    Open(Open),
-   Resize { session: u32, size: Size },
-   Exit { session: u32, status: u32 },
+   Resize {
+      session: u32,
+      size:    Size,
+   },
+   Exit {
+      session: u32,
+      status:  u32,
+   },
+   /// Opens a client stream that the server joins to a TCP connection.
+   Connect {
+      host: String,
+      port: u16,
+   },
+   /// Asks the server to listen on a loopback port. Port 0 lets it choose.
+   Listen {
+      listener: u32,
+      port:     u16,
+   },
+   Listening {
+      listener: u32,
+      port:     u16,
+   },
+   Refused {
+      listener: u32,
+   },
+   /// Opens a server stream for a connection that `listener` accepted.
+   Forwarded {
+      listener: u32,
+   },
+   /// Opens a server stream for a program that wants the client's SSH agent.
+   Agent,
 }
 
 fn put_u32(out: &mut Vec<u8>, value: u32) {
@@ -67,6 +110,10 @@ fn size(reader: &mut Reader<'_>) -> Result<Size, Error> {
       columns: reader.u32()?.try_into().map_err(|_| Error::Frame)?,
       rows:    reader.u32()?.try_into().map_err(|_| Error::Frame)?,
    })
+}
+
+fn port(reader: &mut Reader<'_>) -> Result<u16, Error> {
+   reader.u32()?.try_into().map_err(|_| Error::Frame)
 }
 
 fn text(reader: &mut Reader<'_>) -> Result<String, Error> {
@@ -103,6 +150,8 @@ impl Message {
             if let Some(command) = &open.command {
                put_string(&mut payload, command.as_bytes());
             }
+
+            payload.push(u8::from(open.agent));
          },
          Self::Resize { session, size } => {
             payload.push(RESIZE);
@@ -114,6 +163,30 @@ impl Message {
             put_u32(&mut payload, *session);
             put_u32(&mut payload, *status);
          },
+         Self::Connect { host, port } => {
+            payload.push(CONNECT);
+            put_string(&mut payload, host.as_bytes());
+            put_u32(&mut payload, (*port).into());
+         },
+         Self::Listen { listener, port } => {
+            payload.push(LISTEN);
+            put_u32(&mut payload, *listener);
+            put_u32(&mut payload, (*port).into());
+         },
+         Self::Listening { listener, port } => {
+            payload.push(LISTENING);
+            put_u32(&mut payload, *listener);
+            put_u32(&mut payload, (*port).into());
+         },
+         Self::Refused { listener } => {
+            payload.push(REFUSED);
+            put_u32(&mut payload, *listener);
+         },
+         Self::Forwarded { listener } => {
+            payload.push(FORWARDED);
+            put_u32(&mut payload, *listener);
+         },
+         Self::Agent => payload.push(AGENT),
       }
 
       let mut frame = Vec::with_capacity(payload.len() + 4);
@@ -162,6 +235,7 @@ impl Message {
                session,
                terminal,
                command,
+               agent: reader.byte()? != 0,
             })
          },
          RESIZE => {
@@ -176,6 +250,35 @@ impl Message {
                status:  reader.u32()?,
             }
          },
+         CONNECT => {
+            Self::Connect {
+               host: text(&mut reader)?,
+               port: port(&mut reader)?,
+            }
+         },
+         LISTEN => {
+            Self::Listen {
+               listener: reader.u32()?,
+               port:     port(&mut reader)?,
+            }
+         },
+         LISTENING => {
+            Self::Listening {
+               listener: reader.u32()?,
+               port:     port(&mut reader)?,
+            }
+         },
+         REFUSED => {
+            Self::Refused {
+               listener: reader.u32()?,
+            }
+         },
+         FORWARDED => {
+            Self::Forwarded {
+               listener: reader.u32()?,
+            }
+         },
+         AGENT => Self::Agent,
          _ => return Err(Error::Frame),
       };
 
@@ -183,6 +286,37 @@ impl Message {
          Ok(message)
       } else {
          Err(Error::Frame)
+      }
+   }
+}
+
+/// Control messages waiting for the connection's send window, which bulk
+/// data on other streams can use up.
+#[derive(Default)]
+pub struct Outbox(Vec<u8>);
+
+impl Outbox {
+   pub fn push(&mut self, message: &Message) {
+      self.0.extend_from_slice(&message.encode());
+   }
+
+   /// Writes as much as `stream` accepts now.
+   ///
+   /// # Errors
+   ///
+   /// Fails when the peer stopped reading the stream.
+   pub fn flush(&mut self, connection: &mut Connection, stream: StreamId) -> Result<(), Error> {
+      if self.0.is_empty() {
+         return Ok(());
+      }
+
+      match connection.send_stream(stream).write(&self.0) {
+         Ok(written) => {
+            self.0.drain(..written);
+            Ok(())
+         },
+         Err(WriteError::Blocked) => Ok(()),
+         Err(error) => Err(Error::Write(error)),
       }
    }
 }

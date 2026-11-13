@@ -1,4 +1,7 @@
+mod forward;
+
 use std::{
+   collections::HashMap,
    env,
    fs::{
       self,
@@ -11,8 +14,14 @@ use std::{
    },
    net::ToSocketAddrs as _,
    os::{
-      fd::AsFd,
-      unix::fs::OpenOptionsExt as _,
+      fd::{
+         AsFd,
+         OwnedFd,
+      },
+      unix::{
+         fs::OpenOptionsExt as _,
+         net::UnixStream,
+      },
    },
    path::PathBuf,
    process,
@@ -76,9 +85,11 @@ use ssh_quic::{
       Deframer,
       Message,
       Open,
+      Outbox,
       Size,
       Terminal,
    },
+   forward::Forwards,
    key::PublicKey,
    known_hosts::{
       Trust,
@@ -101,12 +112,19 @@ use ssh_quic::{
    },
 };
 
+use crate::forward::{
+   Inbound,
+   Local,
+   Remote,
+};
+
 const WORKER_POLL: Duration = Duration::from_millis(20);
 const RESIZE_POLL: Duration = Duration::from_millis(250);
 const SERVER_NAME: &str = "ssh-quic";
 const SESSION: u32 = 1;
-const USAGE: &str =
-   "usage: ssh-quic [-t] [-p PORT] [-l USER] [-i PUBLIC_KEY_FILE] [USER@]HOST [COMMAND...]";
+const USAGE: &str = "usage: ssh-quic [-AtN] [-p PORT] [-l USER] [-i PUBLIC_KEY_FILE] [-L \
+                     [BIND:]PORT:HOST:HOSTPORT] [-R PORT:HOST:HOSTPORT] [-D [BIND:]PORT] \
+                     [USER@]HOST [COMMAND...]";
 
 struct Login {
    user:     String,
@@ -120,6 +138,12 @@ struct Options {
    command:  Option<String>,
    /// Run the command on a terminal, as `ssh -t` does.
    terminal: bool,
+   /// Forward the local SSH agent, as `ssh -A` does.
+   agent:    bool,
+   /// Start no session and only forward, as `ssh -N` does.
+   forward:  bool,
+   locals:   Vec<Local>,
+   remotes:  Vec<Remote>,
 }
 
 impl Options {
@@ -130,12 +154,21 @@ impl Options {
       let mut command = None;
       let mut terminal = false;
       let mut login_name = None;
+      let mut agent = false;
+      let mut forward = false;
+      let mut locals = Vec::new();
+      let mut remotes = Vec::new();
       let mut parser = Parser::from_env();
 
       while let Some(argument) = parser.next()? {
          match argument {
             Arg::Short('p') => port = parser.value()?.parse()?,
             Arg::Short('t') => terminal = true,
+            Arg::Short('A') => agent = true,
+            Arg::Short('N') => forward = true,
+            Arg::Short('L') => locals.push(Local::fixed(&parser.value()?.string()?)?),
+            Arg::Short('D') => locals.push(Local::socks(&parser.value()?.string()?)?),
+            Arg::Short('R') => remotes.push(parser.value()?.string()?.parse()?),
             Arg::Short('l') => login_name = Some(parser.value()?.string()?),
             Arg::Short('i') => {
                let path: PathBuf = parser.value()?.into();
@@ -183,6 +216,10 @@ impl Options {
          },
          command,
          terminal,
+         agent,
+         forward,
+         locals,
+         remotes,
       })
    }
 }
@@ -253,8 +290,8 @@ fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
    Ok(())
 }
 
-/// A signed login frame, or `None` once every agent key has been tried.
-type Attempt = Result<Option<Vec<u8>>>;
+/// A signed login, or `None` once every agent key has been tried.
+type Attempt = Result<Option<Request>>;
 
 /// Checks the host, then yields one signed login per usable agent key, each
 /// time the main loop asks for the next.
@@ -287,9 +324,7 @@ fn authenticate(
          key:       identity.key,
       };
 
-      let frame = Message::Request(request).encode();
-
-      if attempts.send(Ok(Some(frame))).is_err() || next.recv().is_err() {
+      if attempts.send(Ok(Some(request))).is_err() || next.recv().is_err() {
          return Ok(());
       }
    }
@@ -328,13 +363,27 @@ fn window() -> Result<Size> {
    })
 }
 
+struct Shell {
+   command:  Option<String>,
+   /// Run the command on a terminal, as `ssh -t` does.
+   terminal: bool,
+}
+
 struct Client {
    login:    Option<Login>,
-   command:  Option<String>,
-   terminal: bool,
+   /// The session to start after login.
+   shell:    Option<Shell>,
+   agent:    bool,
+   remotes:  Vec<Remote>,
+   inbound:  Receiver<Inbound>,
+   /// Streams the server opened, until their first frame arrived.
+   opening:  HashMap<StreamId, Deframer>,
+   forwards: Forwards,
+   accepted: bool,
    waker:    Arc<Waker>,
    control:  Option<StreamId>,
    deframer: Deframer,
+   outbox:   Outbox,
    attempts: Option<Receiver<Attempt>>,
    next:     Option<Sender<()>>,
    session:  Option<Relay>,
@@ -355,8 +404,8 @@ fn standard(descriptor: impl AsFd) -> Result<File> {
 
 impl Client {
    /// Opens the session stream once the server accepted the login.
-   fn start(&mut self, connection: &mut Connection) -> Result<()> {
-      let interactive = (self.command.is_none() || self.terminal) && isatty(io::stdin());
+   fn start(&mut self, shell: Shell, connection: &mut Connection) -> Result<()> {
+      let interactive = (shell.command.is_none() || shell.terminal) && isatty(io::stdin());
 
       let terminal = if interactive {
          let size = window()?;
@@ -373,16 +422,14 @@ impl Client {
       let open = Open {
          session: SESSION,
          terminal,
-         command: self.command.take(),
+         command: shell.command,
+         agent: self.agent,
       };
 
       let stream = connection
          .streams()
          .open(Dir::Bi)
          .ok_or_eyre("no stream credit")?;
-      connection
-         .send_stream(stream)
-         .write(&Message::Open(open).encode())?;
 
       if interactive {
          connection.send_stream(stream).set_priority(1)?;
@@ -392,14 +439,11 @@ impl Client {
       let input = reader(standard(io::stdin())?, Arc::clone(&self.waker));
       let (output, handle) = writer(standard(io::stdout())?, Arc::clone(&self.waker));
 
+      let mut session = Relay::new(stream, Some(input), Some(output), Vec::new(), false);
+      session.prefix(Message::Open(open).encode());
+
       self.writers.push(handle);
-      self.session = Some(Relay::new(
-         stream,
-         Some(input),
-         Some(output),
-         Vec::new(),
-         false,
-      ));
+      self.session = Some(session);
       Ok(())
    }
 
@@ -433,25 +477,124 @@ impl Client {
       Ok(())
    }
 
+   /// Asks the server for the `-R` listeners.
+   fn listen(&mut self) {
+      for (listener, remote) in (0..).zip(&self.remotes) {
+         self.outbox.push(&Message::Listen {
+            listener,
+            port: remote.port,
+         });
+      }
+   }
+
+   /// Reads the first frame of a stream the server opened and joins the
+   /// stream to what the frame asks for. A bad stream is dropped alone.
+   fn opened(&mut self, connection: &mut Connection, stream: StreamId) -> Result<()> {
+      let Some(deframer) = self.opening.get_mut(&stream) else {
+         return Ok(());
+      };
+
+      let (message, finished) = match drain(connection, stream) {
+         Ok((chunks, finished)) => {
+            for bytes in chunks {
+               deframer.push(&bytes);
+            }
+
+            (deframer.pop(), finished)
+         },
+         Err(error) => (Err(error), true),
+      };
+
+      let message = match message {
+         Ok(Some(message)) => message,
+         Ok(None) if !finished => return Ok(()),
+         Ok(None) | Err(_) => {
+            self.opening.remove(&stream);
+            Relay::abort(connection, stream);
+            return Ok(());
+         },
+      };
+
+      let rest = self
+         .opening
+         .remove(&stream)
+         .map_or_else(Vec::new, Deframer::into_rest);
+
+      let agent = || {
+         let path = env::var_os("SSH_AUTH_SOCK")?;
+         Some(OwnedFd::from(UnixStream::connect(path).ok()?))
+      };
+
+      match message {
+         Message::Forwarded { listener } => {
+            let remote = usize::try_from(listener)
+               .ok()
+               .and_then(|index| self.remotes.get(index));
+
+            if let Some(remote) = remote {
+               self.forwards.dial(
+                  stream,
+                  (remote.host.clone(), remote.target),
+                  (rest, finished),
+                  &self.waker,
+               );
+               return Ok(());
+            }
+         },
+         Message::Agent if self.agent => {
+            if let Some(socket) = agent() {
+               self
+                  .forwards
+                  .attach(stream, socket, (rest, finished), &self.waker)?;
+               return Ok(());
+            }
+         },
+         _ => {},
+      }
+
+      Relay::abort(connection, stream);
+      Ok(())
+   }
+
+   /// Opens a stream for each connection the local listeners accepted.
+   fn connect(&mut self, connection: &mut Connection) -> Result<()> {
+      while self.accepted
+         && let Ok(inbound) = self.inbound.try_recv()
+      {
+         // Without stream credit the local connection is closed.
+         let Some(stream) = connection.streams().open(Dir::Bi) else {
+            continue;
+         };
+
+         let connect = Message::Connect {
+            host: inbound.host,
+            port: inbound.port,
+         };
+
+         self
+            .forwards
+            .open(stream, &connect, inbound.socket, &self.waker)?;
+      }
+
+      Ok(())
+   }
+
    fn login(&mut self, connection: &mut Connection) -> Result<()> {
       let Some(attempts) = &self.attempts else {
          return Ok(());
       };
 
       match attempts.try_recv() {
-         Ok(Ok(Some(frame))) => {
-            let control = if let Some(control) = self.control {
-               control
-            } else {
-               let id = connection
+         Ok(Ok(Some(request))) => {
+            if self.control.is_none() {
+               let control = connection
                   .streams()
                   .open(Dir::Bi)
                   .ok_or_eyre("no stream credit")?;
-               self.control = Some(id);
-               id
-            };
+               self.control = Some(control);
+            }
 
-            connection.send_stream(control).write(&frame)?;
+            self.outbox.push(&Message::Request(request));
             Ok(())
          },
          Ok(Ok(None)) => bail!("permission denied, the server accepted none of the agent's keys"),
@@ -501,7 +644,12 @@ impl App for Client {
                   Message::Accepted => {
                      self.attempts = None;
                      self.next = None;
-                     self.start(connection)?;
+                     self.accepted = true;
+                     self.listen();
+
+                     if let Some(shell) = self.shell.take() {
+                        self.start(shell, connection)?;
+                     }
                   },
                   Message::Rejected => {
                      if let Some(next) = &self.next {
@@ -509,6 +657,23 @@ impl App for Client {
                      }
                   },
                   Message::Exit { status, .. } => self.status = Some(status),
+                  Message::Listening { listener, port } => {
+                     let chosen = usize::try_from(listener)
+                        .ok()
+                        .and_then(|index| self.remotes.get(index))
+                        .is_some_and(|remote| remote.port == 0);
+
+                     if chosen {
+                        eprintln!("Allocated port {port} for remote forward\r");
+                     }
+                  },
+                  Message::Refused { listener } => {
+                     let port = usize::try_from(listener)
+                        .ok()
+                        .and_then(|index| self.remotes.get(index))
+                        .map_or(0, |remote| remote.port);
+                     eprintln!("Warning: remote port forwarding failed for listen port {port}\r");
+                  },
                   _ => bail!("unexpected control message from the server"),
                }
             }
@@ -522,6 +687,15 @@ impl App for Client {
                self.heading = Some((stream, Vec::new()));
                self.heading(connection)?;
             }
+         },
+         Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
+            while let Some(stream) = connection.streams().accept(Dir::Bi) {
+               self.opening.insert(stream, Deframer::default());
+               self.opened(connection, stream)?;
+            }
+         },
+         Event::Stream(StreamEvent::Readable { id }) if self.opening.contains_key(&id) => {
+            self.opened(connection, id)?;
          },
          Event::Stream(StreamEvent::Readable { .. }) => self.heading(connection)?,
          Event::ConnectionLost { reason } => bail!("connection lost: {reason}"),
@@ -539,12 +713,14 @@ impl App for Client {
    ) -> Result<Option<Instant>> {
       self.waker.clear();
       self.login(connection)?;
+      self.connect(connection)?;
+      self.forwards.pump(connection, &self.waker)?;
 
       for relay in self.session.iter_mut().chain(&mut self.errors) {
          relay.pump(connection)?;
       }
 
-      if let (Some(control), Some(last)) = (self.control, self.size) {
+      if let Some(last) = self.size {
          let size = window()?;
 
          if size != last {
@@ -552,9 +728,13 @@ impl App for Client {
                session: SESSION,
                size,
             };
-            connection.send_stream(control).write(&resize.encode())?;
+            self.outbox.push(&resize);
             self.size = Some(size);
          }
+      }
+
+      if let Some(control) = self.control {
+         self.outbox.flush(connection, control)?;
       }
 
       let flushed = self.session.as_ref().is_some_and(Relay::received_all)
@@ -604,23 +784,39 @@ fn main() -> Result<()> {
       INTERACTIVE_WINDOW,
    )?;
 
+   let waker = Arc::new(Waker::new()?);
+   let (accepted, inbound) = channel();
+
+   for local in options.locals {
+      local.listen(&accepted, &waker)?;
+   }
+
    let mut client = Client {
-      login:    Some(options.login),
-      command:  options.command,
-      terminal: options.terminal,
-      waker:    Arc::new(Waker::new()?),
-      control:  None,
+      login: Some(options.login),
+      shell: (!options.forward).then_some(Shell {
+         command:  options.command,
+         terminal: options.terminal,
+      }),
+      agent: options.agent,
+      remotes: options.remotes,
+      inbound,
+      opening: HashMap::new(),
+      forwards: Forwards::default(),
+      accepted: false,
+      waker,
+      control: None,
       deframer: Deframer::default(),
+      outbox: Outbox::default(),
       attempts: None,
-      next:     None,
-      session:  None,
-      heading:  None,
-      errors:   None,
-      writers:  Vec::new(),
-      raw:      None,
-      size:     None,
-      status:   None,
-      done:     false,
+      next: None,
+      session: None,
+      heading: None,
+      errors: None,
+      writers: Vec::new(),
+      raw: None,
+      size: None,
+      status: None,
+      done: false,
    };
 
    transport.run(&mut client)?;

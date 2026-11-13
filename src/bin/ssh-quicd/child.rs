@@ -9,7 +9,10 @@ use std::{
    env,
    io,
    os::unix::process::CommandExt as _,
-   path::Path,
+   path::{
+      Path,
+      PathBuf,
+   },
    process::Command,
 };
 
@@ -42,6 +45,8 @@ pub struct Launch {
    /// The client's `TERM`, present when standard input is a terminal to adopt.
    pub terminal: Option<String>,
    pub command:  Option<String>,
+   /// Where the session finds the client's forwarded SSH agent.
+   pub agent:    Option<PathBuf>,
 }
 
 impl Launch {
@@ -89,6 +94,10 @@ impl Launch {
 
       if let Some(terminal) = &self.terminal {
          shell.env("TERM", terminal);
+      }
+
+      if let Some(agent) = &self.agent {
+         shell.env("SSH_AUTH_SOCK", agent);
       }
 
       if let Some(command) = &self.command {

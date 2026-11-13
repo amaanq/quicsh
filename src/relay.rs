@@ -2,12 +2,17 @@
 
 use std::{
    collections::VecDeque,
+   fs::File,
+   os::fd::OwnedFd,
    slice,
-   sync::mpsc::{
-      Receiver,
-      SyncSender,
-      TryRecvError,
-      TrySendError,
+   sync::{
+      Arc,
+      mpsc::{
+         Receiver,
+         SyncSender,
+         TryRecvError,
+         TrySendError,
+      },
    },
 };
 
@@ -18,9 +23,19 @@ use quinn_proto::{
    VarInt,
    WriteError,
 };
+use rustix::net::{
+   Shutdown,
+   shutdown,
+};
 
 use crate::{
    error::Error,
+   pipe::{
+      SendHalf,
+      Waker,
+      reader,
+      writer,
+   },
    transport::drain,
 };
 
@@ -33,6 +48,16 @@ pub struct Relay {
    inbound:   Option<SyncSender<Bytes>>,
    unwritten: VecDeque<Bytes>,
    finished:  bool,
+   /// Kept so that dropping the relay unblocks the thread reading the socket.
+   socket:    Option<OwnedFd>,
+}
+
+impl Drop for Relay {
+   fn drop(&mut self) {
+      if let Some(socket) = &self.socket {
+         let _ = shutdown(socket, Shutdown::Both);
+      }
+   }
 }
 
 impl Relay {
@@ -57,7 +82,54 @@ impl Relay {
             .into_iter()
             .collect(),
          finished,
+         socket: None,
       }
+   }
+
+   /// Relays between `stream` and a connected TCP or Unix socket.
+   ///
+   /// # Errors
+   ///
+   /// Fails when the process is out of file descriptors.
+   pub fn socket(
+      stream: StreamId,
+      socket: OwnedFd,
+      waker: &Arc<Waker>,
+      buffered: Vec<u8>,
+      finished: bool,
+   ) -> Result<Self, Error> {
+      let source = File::from(socket.try_clone().map_err(Error::Forward)?);
+      let sink = SendHalf(socket.try_clone().map_err(Error::Forward)?);
+
+      let outbound = reader(source, Arc::clone(waker));
+      let (inbound, _) = writer(sink, Arc::clone(waker));
+
+      let mut relay = Self::new(stream, Some(outbound), Some(inbound), buffered, finished);
+      relay.socket = Some(socket);
+      Ok(relay)
+   }
+
+   /// Queues `frame` to go out before any local input. Call it once, before
+   /// the first [`Relay::pump`].
+   pub fn prefix(&mut self, frame: Vec<u8>) {
+      self.unsent = Some(frame.into());
+   }
+
+   #[must_use]
+   pub const fn stream(&self) -> StreamId {
+      self.stream
+   }
+
+   /// Whether both directions have ended.
+   #[must_use]
+   pub const fn is_done(&self) -> bool {
+      self.outbound.is_none() && self.inbound.is_none()
+   }
+
+   /// Abandons the stream in both directions.
+   pub fn abort(connection: &mut Connection, stream: StreamId) {
+      let _ = connection.send_stream(stream).reset(VarInt::from_u32(1));
+      let _ = connection.recv_stream(stream).stop(VarInt::from_u32(1));
    }
 
    /// Whether local input ended and the stream was finished.

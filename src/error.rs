@@ -38,6 +38,8 @@ pub enum Error {
    Read(#[source] ReadError),
    #[error("writing a stream failed")]
    Write(#[source] WriteError),
+   #[error("forwarding socket setup failed")]
+   Forward(#[source] io::Error),
    #[error("data ended early or has the wrong shape")]
    Truncated,
    #[error("invalid base64")]

@@ -5,6 +5,7 @@ use std::{
       fd::OwnedFd,
       unix::process::ExitStatusExt as _,
    },
+   path::Path,
    process::{
       Command,
       Stdio,
@@ -92,6 +93,7 @@ impl Session {
    pub fn spawn(
       open: &Open,
       user: &str,
+      agent: Option<&Path>,
       stream: StreamId,
       (buffered, finished): (Vec<u8>, bool),
       connection: &mut Connection,
@@ -99,6 +101,10 @@ impl Session {
    ) -> Result<Self> {
       let mut command = Command::new(env::current_exe()?);
       command.arg("--session").arg(user);
+
+      if let Some(socket) = agent {
+         command.arg("--agent-socket").arg(socket);
+      }
 
       if let Some(text) = &open.command {
          command.arg("--command").arg(text);
@@ -141,12 +147,10 @@ impl Session {
             .streams()
             .open(Dir::Uni)
             .ok_or_eyre("no stream credit for stderr")?;
-         connection
-            .send_stream(side)
-            .write(&open.session.to_be_bytes())?;
 
          let errors = reader(File::from(OwnedFd::from(errors)), Arc::clone(waker));
-         let errors = Relay::new(side, Some(errors), None, Vec::new(), false);
+         let mut errors = Relay::new(side, Some(errors), None, Vec::new(), false);
+         errors.prefix(open.session.to_be_bytes().to_vec());
 
          (
             child,

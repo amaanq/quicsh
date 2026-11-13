@@ -8,8 +8,9 @@
 use std::{
    fs::File,
    io::{
+      self,
       Read as _,
-      Write as _,
+      Write,
    },
    os::fd::{
       AsFd,
@@ -39,6 +40,10 @@ use rustix::{
    io::{
       read,
       write,
+   },
+   net::{
+      Shutdown,
+      shutdown,
    },
 };
 
@@ -78,6 +83,26 @@ impl AsFd for Waker {
    }
 }
 
+/// The sending side of a socket. Dropping it tells the peer that no more data
+/// follows, while the receiving side stays open.
+pub struct SendHalf(pub OwnedFd);
+
+impl Write for SendHalf {
+   fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+      Ok(write(&self.0, bytes)?)
+   }
+
+   fn flush(&mut self) -> io::Result<()> {
+      Ok(())
+   }
+}
+
+impl Drop for SendHalf {
+   fn drop(&mut self) {
+      let _ = shutdown(&self.0, Shutdown::Write);
+   }
+}
+
 /// Reads `source` until it ends. The channel closes at end of input, and a
 /// full channel pauses reading.
 #[must_use]
@@ -110,7 +135,10 @@ pub fn reader(mut source: File, waker: Arc<Waker>) -> Receiver<Bytes> {
 /// Writes every chunk sent to it and closes `sink` once the sender is dropped.
 /// The handle finishes after the last write.
 #[must_use]
-pub fn writer(mut sink: File, waker: Arc<Waker>) -> (SyncSender<Bytes>, JoinHandle<()>) {
+pub fn writer<Sink: Write + Send + 'static>(
+   mut sink: Sink,
+   waker: Arc<Waker>,
+) -> (SyncSender<Bytes>, JoinHandle<()>) {
    let (sender, chunks) = sync_channel::<Bytes>(QUEUE);
 
    let handle = thread::spawn(move || {
