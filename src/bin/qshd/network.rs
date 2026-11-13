@@ -33,6 +33,7 @@ use quicsh::{
    control::{
       Deframer,
       Message,
+      Open,
       Outbox,
    },
    forward::{
@@ -154,9 +155,13 @@ impl Signer for RemoteSigner {
 /// the login and removes the agent socket.
 struct Grant {
    /// The number the monitor gave this login.
-   id:     u64,
+   id:         u64,
+   /// Whether the key may forward its agent.
+   agent:      bool,
+   /// Whether the key may forward ports.
+   forwarding: bool,
    /// Reaches the monitor.
-   helper: Helper,
+   helper:     Helper,
 }
 
 impl Drop for Grant {
@@ -237,7 +242,17 @@ impl Server {
 
                let label = format!("{} for {}", request.key.fingerprint(), request.user);
 
-               let Some(id) = self.helper.login(request, exporter(connection)?)? else {
+               let granted =
+                  self
+                     .helper
+                     .login(request, exporter(connection)?, origin(connection))?;
+
+               let Some(Reply::Granted {
+                  grant: id,
+                  agent,
+                  forwarding,
+               }) = granted
+               else {
                   peer.outbox.push(&Message::Rejected);
                   continue;
                };
@@ -247,6 +262,8 @@ impl Server {
 
                peer.grant = Some(Grant {
                   id,
+                  agent,
+                  forwarding,
                   helper: self.helper.clone(),
                });
             },
@@ -256,12 +273,13 @@ impl Server {
                }
             },
             Message::Listen { listener, port } => {
-               if peer.grant.is_none() {
+               let Some(ref grant) = peer.grant else {
                   bail!("forward before login");
-               }
+               };
 
                // The listener is reachable from this host only.
-               let allowed = (port == 0 || port >= FIRST_UNPRIVILEGED_PORT)
+               let allowed = grant.forwarding
+                  && (port == 0 || port >= FIRST_UNPRIVILEGED_PORT)
                   && peer.listeners.len() < MAX_LISTENERS
                   && !peer.listeners.contains_key(&listener);
 
@@ -289,6 +307,70 @@ impl Server {
       Ok(())
    }
 
+   /// Starts the session a client opened `stream` for, or tells the client
+   /// why it did not start.
+   fn start(
+      helper: &Helper,
+      waker: &Arc<Waker>,
+      peer: &mut Peer,
+      connection: &mut Connection,
+      (stream, pending): (StreamId, (Vec<u8>, bool)),
+      open: Open,
+   ) -> Result<()> {
+      let granted = peer.grant.as_ref().context("stream before login")?;
+      let grant = granted.id;
+
+      if peer.sessions.contains_key(&open.session) || peer.sessions.len() >= MAX_SESSIONS {
+         bail!("session id reused or too many sessions");
+      }
+
+      if open.agent && granted.agent && open.terminal.is_none() && peer.agent.is_none() {
+         let listener = UnixListener::from(helper.agent(grant)?);
+         peer.agent = Some(Acceptor::unix(listener, waker)?);
+      }
+
+      let label = open.session;
+
+      let started = match helper.spawn(grant, open) {
+         Ok(started) => started,
+         Err(error) => {
+            let reason = format!("{error}");
+            peer.outbox.push(&Message::Failed {
+               session: label,
+               reason,
+            });
+            let _ = connection.send_stream(stream).finish();
+            return Ok(());
+         },
+      };
+
+      let session = match started {
+         Started::Pipes(spawned) => {
+            Session::adopt(
+               label,
+               spawned,
+               helper.clone(),
+               stream,
+               pending,
+               connection,
+               waker,
+            )?
+         },
+         Started::Held { token, link } => {
+            peer.outbox.push(&Message::Resumable {
+               session: label,
+               token,
+            });
+
+            Session::attach(link, (0, false), stream, pending, connection, waker)?
+         },
+      };
+
+      peer.sessions.insert(label, session);
+
+      Ok(())
+   }
+
    /// Reads a new client stream until its opening frame is complete, then
    /// starts what the frame asks for.
    fn opening(
@@ -301,7 +383,8 @@ impl Server {
          .peers
          .get_mut(&handle)
          .context("stream on an unknown connection")?;
-      let grant = peer.grant.as_ref().context("stream before login")?.id;
+      let granted = peer.grant.as_ref().context("stream before login")?;
+      let (grant, forwarding) = (granted.id, granted.forwarding);
 
       let Some(deframer) = peer.opening.get_mut(&stream) else {
          return Ok(());
@@ -324,41 +407,15 @@ impl Server {
 
       match message {
          Message::Open(open) => {
-            if peer.sessions.contains_key(&open.session) || peer.sessions.len() >= MAX_SESSIONS {
-               bail!("session id reused or too many sessions");
-            }
-
-            if open.agent && open.terminal.is_none() && peer.agent.is_none() {
-               let listener = UnixListener::from(self.helper.agent(grant)?);
-               peer.agent = Some(Acceptor::unix(listener, &self.waker)?);
-            }
-
-            let label = open.session;
             let pending = (buffered, finished);
-
-            let session = match self.helper.spawn(grant, open)? {
-               Started::Pipes(spawned) => {
-                  Session::adopt(
-                     label,
-                     spawned,
-                     self.helper.clone(),
-                     stream,
-                     pending,
-                     connection,
-                     &self.waker,
-                  )?
-               },
-               Started::Held { token, link } => {
-                  peer.outbox.push(&Message::Resumable {
-                     session: label,
-                     token,
-                  });
-
-                  Session::attach(link, (0, false), stream, pending, connection, &self.waker)?
-               },
-            };
-
-            peer.sessions.insert(label, session);
+            Self::start(
+               &self.helper,
+               &self.waker,
+               peer,
+               connection,
+               (stream, pending),
+               open,
+            )?;
          },
          Message::Resume {
             token,
@@ -390,7 +447,7 @@ impl Server {
             }
          },
          Message::Connect { host, port } => {
-            if peer.forwards.len() >= MAX_FORWARDS {
+            if !forwarding || peer.forwards.len() >= MAX_FORWARDS {
                Relay::abort(connection, stream);
                return Ok(());
             }

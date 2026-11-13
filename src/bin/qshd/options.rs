@@ -52,36 +52,42 @@ pub enum Stage {
    #[pound(hidden)]
    Hold {
       /// Account the session runs as.
-      user:    String,
+      user:             String,
       /// The client's `TERM`.
       #[pound(long)]
-      term:    String,
+      term:             String,
       /// Width of the terminal.
       #[pound(long)]
-      columns: u16,
+      columns:          u16,
       /// Height of the terminal.
       #[pound(long)]
-      rows:    u16,
+      rows:             u16,
       /// The command, absent for a login shell.
       #[pound(long, allow_hyphen_values)]
-      command: Option<String>,
+      command:          Option<String>,
       /// Give the session a socket that reaches the client's SSH agent.
       #[pound(long)]
-      agent:   bool,
+      agent:            bool,
+      /// What the client asked for when the key forces another command.
+      #[pound(long, allow_hyphen_values)]
+      original_command: Option<String>,
    },
    /// One session, run as its account.
    #[pound(hidden)]
    Session {
       /// Account the session runs as.
-      user:         String,
+      user:             String,
       /// The client's `TERM`.
       #[pound(long)]
-      term:         Option<String>,
+      term:             Option<String>,
       /// The command, absent for a login shell.
       #[pound(long, allow_hyphen_values)]
-      command:      Option<String>,
+      command:          Option<String>,
       /// Socket that reaches the client's SSH agent.
       #[pound(long)]
-      agent_socket: Option<PathBuf>,
+      agent_socket:     Option<PathBuf>,
+      /// What the client asked for when the key forces another command.
+      #[pound(long, allow_hyphen_values)]
+      original_command: Option<String>,
    },
 }

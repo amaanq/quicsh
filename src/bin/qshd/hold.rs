@@ -290,6 +290,8 @@ pub struct Hold {
    pub terminal: String,
    /// The command, or `None` for a login shell.
    pub command:  Option<String>,
+   /// What the client asked for when the key forces another command.
+   pub original: Option<String>,
    /// Whether the session gets a socket to the client's SSH agent.
    pub agent:    bool,
    /// The terminal's first size.
@@ -685,6 +687,10 @@ impl Hold {
 
       if let Some(ref text) = self.command {
          command.arg("--command").arg(text);
+      }
+
+      if let Some(ref text) = self.original {
+         command.arg("--original-command").arg(text);
       }
 
       command

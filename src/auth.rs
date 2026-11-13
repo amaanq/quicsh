@@ -12,6 +12,7 @@ use std::{
    fs,
    io,
    iter,
+   net::IpAddr,
    os::unix::fs::MetadataExt as _,
    path::{
       Path,
@@ -194,34 +195,41 @@ impl Account {
    /// only the account or root can write it and its parent directories.
    /// `keys_file` names a file the server operator vouches for instead.
    ///
-   /// Lines with options such as `command=` or `from=` are skipped, because
-   /// honoring the key without the restriction would grant more than the line
-   /// allows.
+   /// The answer is what the first line that lists `key` and applies to a
+   /// client at `remote` permits. A line with an option this server cannot
+   /// enforce is skipped, because honoring the key without the restriction
+   /// would grant more than the line allows.
    ///
    /// # Errors
    ///
    /// Fails when the file exists but cannot be read.
-   pub fn authorizes(&self, key: &PublicKey, keys_file: Option<&Path>) -> Result<bool, Error> {
+   pub fn authorizes(
+      &self,
+      key: &PublicKey,
+      keys_file: Option<&Path>,
+      remote: IpAddr,
+   ) -> Result<Option<Permit>, Error> {
       let default = self.home.join(".ssh/authorized_keys");
 
       let guarded = [self.home.as_path(), &self.home.join(".ssh"), &default];
 
       if keys_file.is_none() && !guarded.iter().all(|path| self.controls(path)) {
-         return Ok(false);
+         return Ok(None);
       }
 
       let path = keys_file.unwrap_or(&default);
 
       let text = match fs::read_to_string(path) {
          Ok(text) => text,
-         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
          Err(error) => return Err(Error::AuthorizedKeys(error)),
       };
 
       Ok(text
          .lines()
-         .filter_map(|line| line.parse::<PublicKey>().ok())
-         .any(|listed| listed == *key))
+         .filter_map(entry)
+         .filter(|found| found.1 == *key)
+         .find_map(|(options, _)| Permit::parse(options, remote)))
    }
 
    /// Whether only the account or root can write `path`.
@@ -232,11 +240,173 @@ impl Account {
    }
 }
 
+/// What a key may do, from the options on its `authorized_keys` line.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Permit {
+   /// Runs in place of whatever the client asks for.
+   pub command:    Option<String>,
+   /// Whether a session may have a terminal.
+   pub terminal:   bool,
+   /// Whether a session may reach the client's SSH agent.
+   pub agent:      bool,
+   /// Whether the client may forward ports.
+   pub forwarding: bool,
+}
+
+impl Permit {
+   /// Reads the options of one line for a client at `remote`. `None` means
+   /// the line does not apply, which covers an option this server cannot
+   /// enforce.
+   fn parse(options: &str, remote: IpAddr) -> Option<Self> {
+      let mut permit = Self {
+         command:    None,
+         terminal:   true,
+         agent:      true,
+         forwarding: true,
+      };
+
+      for option in split(options, ',').filter(|option| !option.is_empty()) {
+         let (name, value) = match option.split_once('=') {
+            Some((name, quoted)) => (name, Some(unquote(quoted)?)),
+            None => (option, None),
+         };
+
+         match (name.to_ascii_lowercase().as_str(), value) {
+            ("restrict", None) => {
+               permit.terminal = false;
+               permit.agent = false;
+               permit.forwarding = false;
+            },
+            ("pty", None) => permit.terminal = true,
+            ("no-pty", None) => permit.terminal = false,
+            ("agent-forwarding", None) => permit.agent = true,
+            ("no-agent-forwarding", None) => permit.agent = false,
+            ("port-forwarding", None) => permit.forwarding = true,
+            ("no-port-forwarding", None) => permit.forwarding = false,
+            ("x11-forwarding" | "no-x11-forwarding" | "user-rc" | "no-user-rc", None) => {},
+            ("command", Some(line)) => permit.command = Some(line),
+            ("from", Some(list)) if admits(&list, remote) => {},
+            _ => return None,
+         }
+      }
+
+      Some(permit)
+   }
+}
+
+/// The index of each `separator` in `text` that no double quotes enclose.
+fn unquoted(text: &str, separator: impl Fn(char) -> bool) -> impl Iterator<Item = usize> {
+   let mut quoted = false;
+   let mut escaped = false;
+
+   text.char_indices().filter_map(move |(at, letter)| {
+      if letter == '"' && !escaped {
+         quoted = !quoted;
+      }
+
+      escaped = letter == '\\' && !escaped;
+      (!quoted && separator(letter)).then_some(at)
+   })
+}
+
+/// Splits `text` at each `separator` that no double quotes enclose.
+fn split(text: &str, separator: char) -> impl Iterator<Item = &str> {
+   let mut start = 0;
+
+   unquoted(text, move |letter| letter == separator)
+      .chain(iter::once(text.len()))
+      .filter_map(move |end| {
+         let part = text.get(start..end);
+         start = end + separator.len_utf8();
+         part
+      })
+}
+
+/// The text between double quotes, with `\"` standing for a quote.
+fn unquote(value: &str) -> Option<String> {
+   let inner = value.strip_prefix('"')?.strip_suffix('"')?;
+   Some(inner.replace("\\\"", "\""))
+}
+
+/// The options and the key of one `authorized_keys` line.
+fn entry(line: &str) -> Option<(&str, PublicKey)> {
+   let trimmed = line.trim();
+
+   if let Ok(key) = trimmed.parse() {
+      return Some(("", key));
+   }
+
+   let (options, rest) =
+      trimmed.split_at_checked(unquoted(trimmed, char::is_whitespace).next()?)?;
+   Some((options, rest.parse().ok()?))
+}
+
+/// Whether a `from=` pattern list lets a client at `remote` in. A pattern is
+/// a network in CIDR form or an address with `*` and `?` wildcards, and `!`
+/// in front of one keeps its matches out. Host names never match, since
+/// nothing here looks a name up.
+fn admits(list: &str, remote: IpAddr) -> bool {
+   let address = remote.to_string();
+   let mut admitted = false;
+
+   for listed in list.split(',') {
+      let (negated, pattern) = listed
+         .strip_prefix('!')
+         .map_or((false, listed), |rest| (true, rest));
+
+      let matched =
+         within(pattern, remote).unwrap_or_else(|| glob(pattern.as_bytes(), address.as_bytes()));
+
+      if matched && negated {
+         return false;
+      }
+
+      admitted |= matched;
+   }
+
+   admitted
+}
+
+/// Whether `remote` is in the network `pattern` names, or `None` when
+/// `pattern` is not in CIDR form.
+fn within(pattern: &str, remote: IpAddr) -> Option<bool> {
+   let (address, length) = pattern.split_once('/')?;
+   let network = address.parse::<IpAddr>().ok()?;
+   let bits = length.parse::<u32>().ok()?;
+
+   let shared = |left: u128, right: u128, width: u32| {
+      bits <= width && (bits == 0 || (left ^ right) >> (width - bits) == 0)
+   };
+
+   Some(match (network, remote) {
+      (IpAddr::V4(left), IpAddr::V4(right)) => {
+         shared(left.to_bits().into(), right.to_bits().into(), 32)
+      },
+      (IpAddr::V6(left), IpAddr::V6(right)) => shared(left.to_bits(), right.to_bits(), 128),
+      (IpAddr::V4(_), IpAddr::V6(_)) | (IpAddr::V6(_), IpAddr::V4(_)) => false,
+   })
+}
+
+/// Whether `text` matches `pattern`, where `*` stands for any run of bytes
+/// and `?` for one.
+fn glob(pattern: &[u8], text: &[u8]) -> bool {
+   match (pattern.split_first(), text.split_first()) {
+      (None, None) => true,
+      (Some((&b'*', rest)), following) => {
+         glob(rest, text) || following.is_some_and(|(_, tail)| glob(pattern, tail))
+      },
+      (Some((&b'?', rest)), Some((_, tail))) => glob(rest, tail),
+      (Some((want, rest)), Some((have, tail))) => want == have && glob(rest, tail),
+      (None, Some(_)) | (Some(_), None) => false,
+   }
+}
+
 #[cfg(test)]
 mod tests {
    use std::{
       env,
       fs,
+      net::IpAddr,
       path::PathBuf,
       process,
    };
@@ -249,6 +419,7 @@ mod tests {
    use crate::{
       auth::{
          Account,
+         Permit,
          Request,
          challenge,
       },
@@ -282,17 +453,21 @@ mod tests {
       assert!(request.verify(&[3; 32]).is_err(), "another user");
    }
 
-   /// A key behind `authorized_keys` options does not log in, since the
-   /// options would not be enforced.
+   /// The options on an `authorized_keys` line limit the key, and a line
+   /// with an option that cannot be enforced does not log in.
    #[test]
-   fn restricted_key_is_skipped() {
+   fn options_limit_a_key() {
       let plain = PublicKey::Ed25519([1; 32]);
-      let restricted = PublicKey::Ed25519([2; 32]);
+      let forced = PublicKey::Ed25519([2; 32]);
+      let unknown = PublicKey::Ed25519([3; 32]);
 
       let path = env::temp_dir().join(format!("quicsh-authorized-keys-{}", process::id()));
       fs::write(
          &path,
-         format!("# keys\ncommand=\"date\" {restricted}\n{plain} laptop\n"),
+         format!(
+            "# keys\nfrom=\"10.0.0.0/8,!10.9.*\",restrict,command=\"echo \\\"a, b\\\"\" {forced} \
+             backup\ntunnel=\"1\" {unknown}\n{plain} laptop\n"
+         ),
       )
       .unwrap();
 
@@ -304,11 +479,29 @@ mod tests {
          shell: PathBuf::from("/bin/sh"),
       };
 
-      let listed = account.authorizes(&plain, Some(&path));
-      let skipped = account.authorizes(&restricted, Some(&path));
+      let inside = IpAddr::from([10, 1, 2, 3]);
+      let check = |key, remote| account.authorizes(key, Some(&path), remote).unwrap();
+
+      let listed = check(&plain, inside);
+      let limited = check(&forced, inside);
+      let negated = check(&forced, IpAddr::from([10, 9, 2, 3]));
+      let outside = check(&forced, IpAddr::from([192, 168, 1, 1]));
+      let skipped = check(&unknown, inside);
       fs::remove_file(&path).unwrap();
 
-      assert!(listed.unwrap(), "plain line");
-      assert!(!skipped.unwrap(), "line with options");
+      assert!(listed.is_some_and(|permit| permit.terminal), "plain line");
+      assert_eq!(
+         limited,
+         Some(Permit {
+            command:    Some("echo \"a, b\"".to_owned()),
+            terminal:   false,
+            agent:      false,
+            forwarding: false,
+         }),
+         "restricted line"
+      );
+      assert_eq!(negated, None, "negated pattern");
+      assert_eq!(outside, None, "address outside the network");
+      assert_eq!(skipped, None, "option that is not enforced");
    }
 }

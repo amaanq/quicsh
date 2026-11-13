@@ -61,6 +61,8 @@ const RESUMED: u8 = 14;
 const GONE: u8 = 15;
 /// Tag of [`Message::Resumable`].
 const RESUMABLE: u8 = 16;
+/// Tag of [`Message::Failed`].
+const FAILED: u8 = 17;
 
 /// How long a terminal session waits for a client whose connection died.
 pub const DETACH_LIMIT: Duration = Duration::from_hours(1);
@@ -159,6 +161,11 @@ pub enum Message {
    Resumable {
       session: u32,
       token:   Token,
+   },
+   /// The server did not start the session, and why.
+   Failed {
+      session: u32,
+      reason:  String,
    },
 }
 
@@ -315,6 +322,14 @@ impl Message {
             put_u32(&mut payload, session);
             put_string(&mut payload, token);
          },
+         Self::Failed {
+            session,
+            ref reason,
+         } => {
+            payload.push(FAILED);
+            put_u32(&mut payload, session);
+            put_string(&mut payload, reason.as_bytes());
+         },
       }
 
       let mut frame = Vec::with_capacity(payload.len() + 4);
@@ -406,6 +421,12 @@ impl Message {
             Self::Resumable {
                session: reader.u32()?,
                token:   reader.array()?,
+            }
+         },
+         FAILED => {
+            Self::Failed {
+               session: reader.u32()?,
+               reason:  text(&mut reader)?,
             }
          },
          _ => return Err(Error::Frame),

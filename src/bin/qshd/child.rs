@@ -91,6 +91,8 @@ pub struct Launch {
    pub terminal: Option<String>,
    /// The command, or `None` for a login shell.
    pub command:  Option<String>,
+   /// What the client asked for when the key forces another command.
+   pub original: Option<String>,
    /// Where the session finds the client's forwarded SSH agent.
    pub agent:    Option<PathBuf>,
 }
@@ -136,6 +138,10 @@ impl Launch {
 
       if let Some(ref agent) = self.agent {
          shell.env("SSH_AUTH_SOCK", agent);
+      }
+
+      if let Some(ref original) = self.original {
+         shell.env("SSH_ORIGINAL_COMMAND", original);
       }
 
       if let Some(ref command) = self.command {

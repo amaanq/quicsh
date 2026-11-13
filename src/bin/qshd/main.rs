@@ -52,11 +52,13 @@ fn main() -> Result<()> {
          rows,
          command,
          agent,
+         original_command,
       }) => {
          let hold = Hold {
             user,
             terminal: term,
             command,
+            original: original_command,
             agent,
             size: Size { columns, rows },
          };
@@ -68,11 +70,13 @@ fn main() -> Result<()> {
          term,
          command,
          agent_socket,
+         original_command,
       }) => {
          let launch = Launch {
             user,
             terminal: term,
             command,
+            original: original_command,
             agent: agent_socket,
          };
 

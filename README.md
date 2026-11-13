@@ -112,6 +112,12 @@ server tell old clients their connection is gone. Whoever steals it can cut
 connections they can observe until the next reboot, and that's all it's good
 for.
 
+Two `authorized_keys` options lean on that unprivileged process. `from=` is
+checked by the root half against the client address the other half reports,
+and `no-port-forwarding` is enforced where forwarded connections are opened.
+Someone who took over the network process could get around both, though
+they'd still need the private key to log in.
+
 Each terminal session gets a third process that runs as the account, owns the
 terminal and keeps recent output. The server talks to it over a socket in a
 directory only root can enter, which is how a session outlives both a lost
@@ -159,8 +165,11 @@ switch. I'd like to close that gap, but it isn't closed.
 - Most of `ssh_config`. Only `Host`, `Match all`, `Include`, `HostName`,
   `User`, `IdentityFile` and `QshPort` are read.
 - Key types other than `ed25519` and `ed25519-sk`.
-- `authorized_keys` options. A line with `command=` or `from=` is skipped
-  instead of being honored without its restriction.
+- Some `authorized_keys` options. `command=`, `from=`, `restrict` and the
+  `pty`, `agent-forwarding` and `port-forwarding` switches are enforced. A
+  line with any other option, such as `expiry-time=` or `environment=`, is
+  skipped instead of being honored without its restriction. `from=` matches
+  addresses and networks and never host names.
 - Accounts that only exist in LDAP or another NSS source. Lookups read
   `/etc/passwd`.
 - Restarts for anything but terminal sessions. Remote commands on pipes and

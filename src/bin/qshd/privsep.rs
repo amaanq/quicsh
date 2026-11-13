@@ -125,6 +125,8 @@ pub enum Request {
       login:    auth::Request,
       /// The connection's TLS exporter value.
       exporter: [u8; 32],
+      /// Where the client is.
+      remote:   SocketAddr,
    },
    /// Asks for a listening agent socket that the grant's sessions can reach.
    Agent {
@@ -173,7 +175,11 @@ pub enum Reply {
    /// Stands for a successful login in later requests.
    Granted {
       /// The number that names this login.
-      grant: u64,
+      grant:      u64,
+      /// Whether the key may forward its agent.
+      agent:      bool,
+      /// Whether the key may forward ports.
+      forwarding: bool,
    },
    /// The login was refused.
    Denied,
@@ -233,9 +239,14 @@ impl Request {
             put_address(&mut out, local);
             put_address(&mut out, remote);
          },
-         Self::Login { login, exporter } => {
+         Self::Login {
+            login,
+            exporter,
+            remote,
+         } => {
             out.push(LOGIN);
             put_string(&mut out, &exporter);
+            put_address(&mut out, remote);
             out.extend_from_slice(&Message::Request(login).encode());
          },
          Self::Agent { grant } => {
@@ -280,12 +291,17 @@ impl Request {
          },
          LOGIN => {
             let exporter = reader.array()?;
+            let remote = address(&mut reader)?;
 
             let Message::Request(login) = Message::decode(reader.string()?)? else {
                return Err(Error::Frame);
             };
 
-            Self::Login { login, exporter }
+            Self::Login {
+               login,
+               exporter,
+               remote,
+            }
          },
          AGENT => {
             Self::Agent {
@@ -348,9 +364,14 @@ impl Reply {
             out.push(SIGNATURE);
             put_string(&mut out, signature);
          },
-         Self::Granted { grant } => {
+         Self::Granted {
+            grant,
+            agent,
+            forwarding,
+         } => {
             out.push(GRANTED);
             put_u64(&mut out, grant);
+            out.extend_from_slice(&[u8::from(agent), u8::from(forwarding)]);
          },
          Self::Denied => out.push(DENIED),
          Self::Spawned { session } => {
@@ -386,7 +407,9 @@ impl Reply {
          SIGNATURE => Self::Signature(reader.string()?.to_vec()),
          GRANTED => {
             Self::Granted {
-               grant: u64_from(&mut reader)?,
+               grant:      u64_from(&mut reader)?,
+               agent:      reader.byte()? != 0,
+               forwarding: reader.byte()? != 0,
             }
          },
          DENIED => Self::Denied,
@@ -597,10 +620,21 @@ impl Helper {
       self.descriptor(Request::Socket { local, remote })
    }
 
-   /// The grant for a login the monitor accepted, or `None`.
-   pub fn login(&self, login: auth::Request, exporter: [u8; 32]) -> Result<Option<u64>> {
-      match self.call(Request::Login { login, exporter })? {
-         (Reply::Granted { grant }, _) => Ok(Some(grant)),
+   /// The monitor's [`Reply::Granted`] for a login it accepted, or `None`.
+   pub fn login(
+      &self,
+      login: auth::Request,
+      exporter: [u8; 32],
+      remote: SocketAddr,
+   ) -> Result<Option<Reply>> {
+      let request = Request::Login {
+         login,
+         exporter,
+         remote,
+      };
+
+      match self.call(request)? {
+         (granted @ Reply::Granted { .. }, _) => Ok(Some(granted)),
          (Reply::Denied, _) => Ok(None),
          _ => bail!("unexpected reply from the monitor"),
       }

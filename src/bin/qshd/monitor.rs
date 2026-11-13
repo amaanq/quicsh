@@ -13,7 +13,10 @@ use std::{
       self,
       Write as _,
    },
-   net::SocketAddr,
+   net::{
+      IpAddr,
+      SocketAddr,
+   },
    os::{
       fd::OwnedFd,
       unix::{
@@ -57,6 +60,7 @@ use quicsh::{
    auth::{
       self,
       Account,
+      Permit,
    },
    control::{
       Open,
@@ -168,6 +172,8 @@ impl Drop for AgentDirectory {
 struct Grant {
    /// Who logged in.
    account: Account,
+   /// What the key that logged in may do.
+   permit:  Permit,
    /// The agent socket, once a session asked for one.
    agent:   Option<AgentDirectory>,
 }
@@ -223,7 +229,12 @@ impl Monitor {
    }
 
    /// Checks a login against its signature and the authorized keys.
-   fn login(&mut self, login: &auth::Request, exporter: &[u8; 32]) -> Result<Reply> {
+   fn login(
+      &mut self,
+      login: &auth::Request,
+      exporter: &[u8; 32],
+      remote: IpAddr,
+   ) -> Result<Reply> {
       if login.verify(exporter).is_err() {
          return Ok(Reply::Denied);
       }
@@ -240,23 +251,34 @@ impl Monitor {
          return Ok(Reply::Denied);
       }
 
-      if !account.authorizes(&login.key, self.authorized_keys.as_deref())? {
+      let keys_file = self.authorized_keys.as_deref();
+
+      let Some(permit) = account.authorizes(&login.key, keys_file, remote)? else {
          return Ok(Reply::Denied);
+      };
+
+      let reply = Reply::Granted {
+         grant:      self.issue(),
+         agent:      permit.agent,
+         forwarding: permit.forwarding,
+      };
+
+      if let Reply::Granted { grant, .. } = reply {
+         self.grants.insert(grant, Grant {
+            account,
+            permit,
+            agent: None,
+         });
       }
 
-      let grant = self.issue();
-      self.grants.insert(grant, Grant {
-         account,
-         agent: None,
-      });
-
-      Ok(Reply::Granted { grant })
+      Ok(reply)
    }
 
    /// Makes the agent socket in a new directory that only the account can
    /// enter.
    fn agent(&mut self, id: u64) -> Result<(Reply, Vec<OwnedFd>)> {
       let grant = self.grants.get_mut(&id).context("unknown grant")?;
+      ensure!(grant.permit.agent, "this key may not forward an agent");
       ensure!(grant.agent.is_none(), "agent socket already exists");
 
       let mut random = [0; 8];
@@ -307,7 +329,26 @@ impl Monitor {
       Ok(link)
    }
 
-   /// The command line the login shell gets, or `None` for the shell alone.
+   /// Tells a session or holder process what to run. A command that the
+   /// key's line forces replaces the client's, which the session finds in
+   /// `SSH_ORIGINAL_COMMAND`.
+   fn program(&self, grant: &Grant, open: &Open, command: &mut Command) -> Result<()> {
+      let asked = self.command(&open.program)?;
+
+      if let Some(ref forced) = grant.permit.command {
+         command.arg("--command").arg(forced);
+
+         if let Some(text) = asked {
+            command.arg("--original-command").arg(text);
+         }
+      } else if let Some(text) = asked {
+         command.arg("--command").arg(text);
+      }
+
+      Ok(())
+   }
+
+   /// The command line the client asked for, or `None` for the shell alone.
    fn command(&self, program: &Program) -> Result<Option<String>> {
       Ok(match *program {
          Program::Shell => None,
@@ -341,6 +382,7 @@ impl Monitor {
    /// root and could not make one in a directory only root can enter.
    fn hold(&self, id: u64, open: &Open, terminal: &Terminal) -> Result<(Reply, Vec<OwnedFd>)> {
       let grant = self.grants.get(&id).context("unknown grant")?;
+      ensure!(grant.permit.terminal, "this key may not open a terminal");
 
       let mut token = Token::default();
       SystemRandom::new()
@@ -371,13 +413,11 @@ impl Monitor {
          .arg("--rows")
          .arg(terminal.size.rows.to_string());
 
-      if open.agent {
+      if open.agent && grant.permit.agent {
          command.arg("--agent");
       }
 
-      if let Some(text) = self.command(&open.program)? {
-         command.arg("--command").arg(text);
-      }
+      self.program(grant, open, &mut command)?;
 
       let mut child = command
          .stdin(listener)
@@ -453,9 +493,7 @@ impl Monitor {
          command.arg("--agent-socket").arg(&agent.socket);
       }
 
-      if let Some(text) = self.command(&open.program)? {
-         command.arg("--command").arg(text);
-      }
+      self.program(grant, open, &mut command)?;
 
       command
          .stdin(Stdio::piped())
@@ -536,7 +574,11 @@ impl Monitor {
 
             Ok((Reply::Done, vec![udp_socket(local, Some(remote))?]))
          },
-         Request::Login { login, exporter } => plain(self.login(&login, &exporter)?),
+         Request::Login {
+            login,
+            exporter,
+            remote,
+         } => plain(self.login(&login, &exporter, remote.ip().to_canonical())?),
          Request::Agent { grant } => self.agent(grant),
          Request::Spawn { grant, open } => self.spawn(grant, &open),
          Request::Hangup { session } => {

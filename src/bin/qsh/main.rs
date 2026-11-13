@@ -786,6 +786,10 @@ impl Client {
                }
             },
             Message::Exit { status, .. } => self.status = Some(status),
+            Message::Failed { reason, .. } => {
+               eprintln!("qsh: the server did not start the session: {reason}\r");
+               self.status = Some(255);
+            },
             Message::Listening { listener, port } => {
                let chosen = usize::try_from(listener)
                   .ok()
