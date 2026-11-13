@@ -90,6 +90,11 @@ same format as `ssh-keygen -Y sign` under its own namespace, so it can't be
 replayed as an OpenSSH login or the other way around. This is also why FIDO
 keys work, since they can't sign a TLS handshake directly.
 
+The key exchange is X25519MLKEM768, the hybrid of X25519 and ML-KEM-768 that
+browsers ship. Someone who records a session today can't decrypt it later
+unless both of them fall. Host keys and logins are still `ed25519`, so this
+covers recorded traffic and not a forged login.
+
 Each client gets its own UDP socket on the server. Without that, one client's
 bulk transfer sits in the same kernel queue as another client's keystrokes.
 The send window is sized from the measured round trip time for the same
@@ -124,7 +129,6 @@ switch. I'd like to close that gap, but it isn't closed.
   instead of being honored without its restriction.
 - Accounts that only exist in LDAP or another NSS source. Lookups read
   `/etc/passwd`.
-- A post-quantum key exchange. This is planned.
 - Sessions that outlive the server. Restarting `qshd` ends every session,
   so don't upgrade it from inside one.
 - Anything but Linux.

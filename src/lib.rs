@@ -4,6 +4,7 @@ pub mod config;
 pub mod control;
 pub mod error;
 pub mod forward;
+mod kex;
 pub mod key;
 pub mod known_hosts;
 pub mod pipe;

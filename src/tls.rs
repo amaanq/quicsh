@@ -44,18 +44,20 @@ use rustls::{
 
 use crate::{
    error::Error,
+   kex::X25519_MLKEM768,
    key::PublicKey,
 };
 
 /// ALPN protocol name.
 const ALPN: &[u8] = b"quicsh";
 
-/// The ring provider limited to one cipher suite.
+/// The ring provider limited to one cipher suite and the hybrid key exchange.
 fn provider() -> Arc<CryptoProvider> {
    let mut provider = default_provider();
    provider
       .cipher_suites
       .retain(|suite| suite.suite() == CipherSuite::TLS13_AES_128_GCM_SHA256);
+   provider.kx_groups = vec![X25519_MLKEM768];
    Arc::new(provider)
 }
 

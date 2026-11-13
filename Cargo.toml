@@ -13,6 +13,7 @@ bytes       = "1.12.1"
 flub        = "0.1.0"
 knell       = "1.0.1"
 misstep     = { version = "0.4.1", features = [ "pretty" ] }
+ml-kem      = { version = "0.3.4", features = [ "getrandom", "zeroize" ] }
 pound       = "0.6.1"
 quinn-proto = { version = "0.11.19", default-features = false, features = [ "rustls-ring" ] }
 quinn-udp   = { version = "0.6.3", default-features = false }
