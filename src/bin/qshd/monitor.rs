@@ -520,6 +520,8 @@ fn sweep(directory: &Path) {
 pub fn run(settings: Settings) -> Result<()> {
    let key_text = fs::read_to_string(&settings.host_key)
       .with_context(|| format!("reading host key {}", settings.host_key.display()))?;
+   let key = tls::signing_key(&private_from_openssh(&key_text)?)
+      .with_context(|| format!("loading host key {}", settings.host_key.display()))?;
 
    let listener = udp_socket(settings.listen, None)
       .with_context(|| format!("listening on {}", settings.listen))?;
@@ -560,14 +562,14 @@ pub fn run(settings: Settings) -> Result<()> {
    let signal = reopen(signals.read_fd())?;
 
    let mut monitor = Monitor {
-      key:             tls::signing_key(&private_from_openssh(&key_text)?)?,
-      listen:          settings.listen,
-      listener:        Some(listener),
+      key,
+      listen: settings.listen,
+      listener: Some(listener),
       authorized_keys: settings.authorized_keys,
-      sftp_server:     settings.sftp_server,
-      grants:          HashMap::new(),
-      holders:         holders()?,
-      issued:          0,
+      sftp_server: settings.sftp_server,
+      grants: HashMap::new(),
+      holders: holders()?,
+      issued: 0,
    };
 
    println!("listening on udp {}", settings.listen);
