@@ -3,6 +3,7 @@
 use std::{
    collections::VecDeque,
    fs::File,
+   mem,
    os::fd::OwnedFd,
    slice,
    sync::{
@@ -16,7 +17,10 @@ use std::{
    },
 };
 
-use bytes::Bytes;
+use bytes::{
+   Bytes,
+   BytesMut,
+};
 use quinn_proto::{
    Connection,
    StreamId,
@@ -39,6 +43,8 @@ use crate::{
    transport::drain,
 };
 
+/// Most stream bytes joined into one write to the sink.
+const MERGE_LIMIT: usize = 1 << 16;
 /// How much sent data a relay keeps for a peer that reconnects.
 const TAIL_LIMIT: usize = 256 << 10;
 
@@ -343,7 +349,22 @@ impl Relay {
                return Ok(());
             }
 
-            self.unwritten.extend(chunks);
+            // The stream yields about one packet's payload per chunk, and the
+            // sink's thread does one write and one wake for each chunk.
+            let mut merged = BytesMut::new();
+
+            for chunk in chunks {
+               if merged.len() + chunk.len() > MERGE_LIMIT {
+                  self.unwritten.push_back(mem::take(&mut merged).freeze());
+               }
+
+               merged.extend_from_slice(&chunk);
+            }
+
+            if !merged.is_empty() {
+               self.unwritten.push_back(merged.freeze());
+            }
+
             continue;
          };
 
