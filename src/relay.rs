@@ -68,6 +68,14 @@ impl Tail {
       self.bytes.drain(..excess);
    }
 
+   /// How many of the bytes after the first `received` are no longer kept.
+   const fn dropped(&self, received: u64) -> u64 {
+      self
+         .total
+         .saturating_sub(received)
+         .saturating_sub(self.bytes.len() as u64)
+   }
+
    /// The bytes after the first `received`, or as many of them as are kept.
    fn since(&self, received: u64) -> Vec<u8> {
       let missing = usize::try_from(self.total.saturating_sub(received)).unwrap_or(usize::MAX);
@@ -178,6 +186,19 @@ impl Relay {
    #[must_use]
    pub const fn taken(&self) -> u64 {
       self.taken
+   }
+
+   /// Counts stream bytes that the peer could not send again, so that the
+   /// count keeps matching the peer's.
+   pub const fn skip(&mut self, bytes: u64) {
+      self.taken += bytes;
+   }
+
+   /// How much input a peer that has the first `received` bytes cannot get
+   /// back from [`Relay::resume`].
+   #[must_use]
+   pub fn dropped(&self, received: u64) -> u64 {
+      self.tail.as_ref().map_or(0, |tail| tail.dropped(received))
    }
 
    /// Moves the relay to `stream` on a new connection. `frame` goes out
@@ -411,6 +432,8 @@ mod tests {
       tail.record(&vec![b'x'; TAIL_LIMIT]);
 
       assert_eq!(tail.since(0).len(), TAIL_LIMIT, "older bytes are gone");
+      assert_eq!(tail.dropped(0), 11, "the first two chunks");
+      assert_eq!(tail.dropped(11), 0, "nothing the peer lacks");
       assert_eq!(tail.since(tail.total - 3), b"xxx", "count still lines up");
    }
 }

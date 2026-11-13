@@ -480,8 +480,8 @@ impl Client {
          deframer.push(&bytes);
       }
 
-      let received = match deframer.pop()? {
-         Some(Message::Resumed { received }) => received,
+      let (received, skipped) = match deframer.pop()? {
+         Some(Message::Resumed { received, skipped }) => (received, skipped),
          Some(Message::Gone) => bail!("the session ended while the connection was down"),
          Some(_) => bail!("unexpected answer to a resume request"),
          None if finished => bail!("the server gave no answer to a resume request"),
@@ -493,15 +493,19 @@ impl Client {
          .take()
          .map_or_else(Vec::new, |(_, answer, _)| answer.into_rest());
 
-      self
-         .session
-         .as_mut()
-         .context("no session to resume")?
-         .resume(connection, stream, Vec::new(), received, (rest, finished));
+      let session = self.session.as_mut().context("no session to resume")?;
+      session.skip(skipped);
+      session.resume(connection, stream, Vec::new(), received, (rest, finished));
 
       self.lost = None;
       self.raw = Some(RawMode::enable()?);
-      eprint!("qsh: reconnected\r\n");
+
+      if skipped == 0 {
+         eprint!("qsh: reconnected\r\n");
+      } else {
+         eprint!("qsh: reconnected, {skipped} bytes of output were not kept\r\n");
+      }
+
       Ok(())
    }
 

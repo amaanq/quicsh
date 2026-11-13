@@ -140,6 +140,8 @@ pub enum Message {
    Resumed {
       /// How many bytes of the session's input the server has.
       received: u64,
+      /// How many bytes of output the server no longer has for the client.
+      skipped:  u64,
    },
    /// The server's answer to [`Message::Resume`] for a session that ended or
    /// was never there.
@@ -282,9 +284,10 @@ impl Message {
             put_u32(&mut payload, session);
             put_string(&mut payload, &received.to_be_bytes());
          },
-         Self::Resumed { received } => {
+         Self::Resumed { received, skipped } => {
             payload.push(RESUMED);
             put_string(&mut payload, &received.to_be_bytes());
+            put_string(&mut payload, &skipped.to_be_bytes());
          },
          Self::Gone => payload.push(GONE),
       }
@@ -374,6 +377,7 @@ impl Message {
          RESUMED => {
             Self::Resumed {
                received: u64::from_be_bytes(reader.array()?),
+               skipped:  u64::from_be_bytes(reader.array()?),
             }
          },
          GONE => Self::Gone,

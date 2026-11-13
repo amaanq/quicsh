@@ -187,6 +187,7 @@ impl Session {
 
       let answer = Message::Resumed {
          received: self.relay.taken(),
+         skipped:  self.relay.dropped(received),
       };
 
       self

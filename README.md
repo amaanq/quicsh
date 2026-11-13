@@ -25,7 +25,8 @@ afford to lose :)
 - IPv4 and IPv6 on one socket
 - Roaming. A session carries on when the client changes networks
 - Reattaching. A terminal session survives up to an hour without a
-  connection, and `qsh` picks it up again without losing output
+  connection, and `qsh` picks it up again. The server keeps the last 256 KiB
+  of output for that, and `qsh` says so when more was produced
 - `ed25519` keys, signed through `ssh-agent`
 - `ed25519-sk` keys in the same way, though I haven't tried one against real
   hardware yet
