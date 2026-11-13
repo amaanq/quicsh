@@ -203,7 +203,8 @@ impl Session {
    /// session. A client that takes the session over says in `had` what it
    /// has, and is first told how much input the holder has and how much
    /// output it missed for good. `buffered` and `finished` describe input
-   /// already read from `stream`.
+   /// already read from `stream`. `None` means the holder is from another
+   /// version of this program and cannot be talked to.
    pub fn attach(
       link: OwnedFd,
       label: u32,
@@ -212,7 +213,7 @@ impl Session {
       (buffered, finished): (Vec<u8>, bool),
       connection: &mut Connection,
       waker: &Arc<Waker>,
-   ) -> Result<Self> {
+   ) -> Result<Option<Self>> {
       let Had { received, errors } = had.unwrap_or(Had {
          received: 0,
          errors:   0,
@@ -222,16 +223,17 @@ impl Session {
 
       let mut buffer = vec![0; PACKET_LIMIT];
 
-      let Some((
-         Packet::Attached {
-            taken,
-            skipped,
-            piped,
-         },
-         _,
-      )) = Packet::receive(&link, &mut buffer)?
-      else {
-         bail!("the session holder did not answer");
+      let (taken, skipped, piped) = match Packet::receive(&link, &mut buffer)? {
+         Some((
+            Packet::Attached {
+               taken,
+               skipped,
+               piped,
+            },
+            _,
+         )) => (taken, skipped, piped),
+         Some((Packet::Foreign, _)) => return Ok(None),
+         Some(_) | None => bail!("the session holder did not answer"),
       };
 
       let (chunks, outbound) = sync_channel(QUEUE);
@@ -308,7 +310,7 @@ impl Session {
          relay.prefix(answer.encode());
       }
 
-      Ok(Self {
+      Ok(Some(Self {
          relay,
          errors: side,
          link,
@@ -320,7 +322,7 @@ impl Session {
          exit,
          status: None,
          reported: false,
-      })
+      }))
    }
 
    /// The next program that wants the client's SSH agent.

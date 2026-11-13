@@ -487,7 +487,8 @@ impl Server {
          token,
       });
 
-      let session = Session::attach(link, label, None, stream, pending, connection, waker)?;
+      let session = Session::attach(link, label, None, stream, pending, connection, waker)?
+         .context("the session holder is from another version")?;
       peer.sessions.insert(label, session);
 
       Ok(())
@@ -550,25 +551,34 @@ impl Server {
                .attach(grant, token)?
                .filter(|_| !peer.sessions.contains_key(&label));
 
-            if let Some(holder) = link {
-               let pending = (buffered, finished);
-               let session = Session::attach(
-                  holder,
-                  label,
-                  Some(Had { received, errors }),
-                  stream,
-                  pending,
-                  connection,
-                  &self.waker,
-               )?;
+            let pending = (buffered, finished);
+            let had = Some(Had { received, errors });
 
-               peer.sessions.insert(label, session);
-            } else {
-               let _ = connection
-                  .send_stream(stream)
-                  .write(&Message::Gone.encode());
-               let _ = connection.send_stream(stream).finish();
-            }
+            // A holder that an older server started may speak a format
+            // this one does not, and its session then stays out of reach.
+            let answer = match link {
+               Some(holder) => {
+                  match Session::attach(
+                     holder,
+                     label,
+                     had,
+                     stream,
+                     pending,
+                     connection,
+                     &self.waker,
+                  )? {
+                     Some(session) => {
+                        peer.sessions.insert(label, session);
+                        return Ok(());
+                     },
+                     None => Message::Upgraded,
+                  }
+               },
+               None => Message::Gone,
+            };
+
+            let _ = connection.send_stream(stream).write(&answer.encode());
+            let _ = connection.send_stream(stream).finish();
          },
          Message::Associate { host, port } => {
             let permitted = peer

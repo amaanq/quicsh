@@ -82,6 +82,8 @@ const BIND: u8 = 22;
 const CERTIFY: u8 = 23;
 /// Tag of [`Message::HostCertificate`].
 const HOST_CERTIFICATE: u8 = 24;
+/// Tag of [`Message::Upgraded`].
+const UPGRADED: u8 = 25;
 
 /// How long a session waits for a client whose connection died.
 pub const DETACH_LIMIT: Duration = Duration::from_hours(1);
@@ -197,6 +199,9 @@ pub enum Message {
    /// The server's answer to [`Message::Resume`] for a session that ended or
    /// was never there.
    Gone,
+   /// The server's answer to [`Message::Resume`] for a session that an
+   /// older server started in a way this one cannot continue.
+   Upgraded,
    /// Tells the client that a session can be resumed, and with what.
    Resumable {
       session: u32,
@@ -461,6 +466,7 @@ impl Message {
             put_string(&mut payload, &skipped.to_be_bytes());
          },
          Self::Gone => payload.push(GONE),
+         Self::Upgraded => payload.push(UPGRADED),
          Self::Resumable { session, ref token } => {
             payload.push(RESUMABLE);
             put_u32(&mut payload, session);
@@ -590,6 +596,7 @@ impl Message {
             }
          },
          GONE => Self::Gone,
+         UPGRADED => Self::Upgraded,
          RESUMABLE => {
             Self::Resumable {
                session: reader.u32()?,

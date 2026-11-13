@@ -484,6 +484,9 @@ impl Channel {
       let (received, skipped) = match deframer.pop()? {
          Some(Message::Resumed { received, skipped }) => (received, skipped),
          Some(Message::Gone) => bail!("the session ended while the connection was down"),
+         Some(Message::Upgraded) => {
+            bail!("the server was upgraded to a version that cannot continue the session")
+         },
          Some(_) => bail!("unexpected answer to a resume request"),
          None if finished => bail!("the server gave no answer to a resume request"),
          None => return Ok(()),
