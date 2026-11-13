@@ -149,11 +149,13 @@ pub enum Reply {
    /// Comes with the listening UDP socket.
    Hello {
       /// The host key as a `SubjectPublicKeyInfo` document.
-      key:    Vec<u8>,
+      key:         Vec<u8>,
       /// Address the server listens on.
-      listen: SocketAddr,
+      listen:      SocketAddr,
       /// Key material that stays the same across restarts.
-      secret: Vec<u8>,
+      secret:      Vec<u8>,
+      /// The host certificate, empty without one.
+      certificate: Vec<u8>,
    },
    /// A host key signature.
    Signature(Vec<u8>),
@@ -355,11 +357,13 @@ impl Reply {
             ref key,
             listen,
             ref secret,
+            ref certificate,
          } => {
             out.push(HELLO);
             put_string(&mut out, key);
             put_address(&mut out, listen);
             put_string(&mut out, secret);
+            put_string(&mut out, certificate);
          },
          Self::Signature(ref signature) => {
             out.push(SIGNATURE);
@@ -397,9 +401,10 @@ impl Reply {
       Ok(match reader.byte()? {
          HELLO => {
             Self::Hello {
-               key:    reader.string()?.to_vec(),
-               listen: address(&mut reader)?,
-               secret: reader.string()?.to_vec(),
+               key:         reader.string()?.to_vec(),
+               listen:      address(&mut reader)?,
+               secret:      reader.string()?.to_vec(),
+               certificate: reader.string()?.to_vec(),
             }
          },
          SIGNATURE => Self::Signature(reader.string()?.to_vec()),

@@ -45,19 +45,20 @@ fn main() -> Result<()> {
    match options.stage {
       None => {
          monitor::run(Settings {
-            listen:          options
+            listen:           options
                .listen
                .unwrap_or_else(|| (Ipv6Addr::UNSPECIFIED, DEFAULT_PORT).into()),
-            host_key:        options.host_key,
-            authorized_keys: options.authorized_keys,
-            sftp_server:     options.sftp_server,
-            accept_env:      if options.accept_env.is_empty() {
+            host_key:         options.host_key,
+            host_certificate: options.host_certificate,
+            authorized_keys:  options.authorized_keys,
+            sftp_server:      options.sftp_server,
+            accept_env:       if options.accept_env.is_empty() {
                ACCEPTED_ENVIRONMENT.map(str::to_owned).to_vec()
             } else {
                options.accept_env
             },
-            user:            options.user,
-            congestion:      options.congestion,
+            user:             options.user,
+            congestion:       options.congestion,
          })
       },
       Some(Stage::Network) => network::run(options.congestion),

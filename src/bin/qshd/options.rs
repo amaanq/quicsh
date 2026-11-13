@@ -18,29 +18,34 @@ pub struct Options {
    /// Address and UDP port to listen on. An IPv6 address also serves IPv4,
    /// and the default is [::]:22.
    #[pound(long, value_name = "ADDR:PORT")]
-   pub listen:          Option<SocketAddr>,
+   pub listen:           Option<SocketAddr>,
    /// The host key in OpenSSH format, an ed25519, P-256 or P-384 key.
    #[pound(long, value_name = "FILE", default = "/etc/ssh/ssh_host_ed25519_key")]
-   pub host_key:        PathBuf,
+   pub host_key:         PathBuf,
+   /// What a certificate authority says about the host key, as ssh-keygen
+   /// -s -h writes it. Clients that trust the authority then need no entry
+   /// for this host.
+   #[pound(long, value_name = "FILE")]
+   pub host_certificate: Option<PathBuf>,
    /// Check every login against FILE instead of each account's own key file.
    #[pound(long, value_name = "FILE")]
-   pub authorized_keys: Option<PathBuf>,
+   pub authorized_keys:  Option<PathBuf>,
    /// The program behind the sftp subsystem, which scp and sftp ask for.
    /// Without it, the usual places for OpenSSH's sftp-server are tried.
    #[pound(long, value_name = "FILE")]
-   pub sftp_server:     Option<PathBuf>,
+   pub sftp_server:      Option<PathBuf>,
    /// Let clients set the environment variables that PATTERN matches, with
    /// the wildcards * and ?. Without the option, LANG, LC_* and COLORTERM
    /// pass.
    #[pound(long, value_name = "PATTERN")]
-   pub accept_env:      Vec<String>,
+   pub accept_env:       Vec<String>,
    /// The account the network process runs as when the server is root.
    #[pound(long, value_name = "NAME", default = "sshd")]
-   pub user:            String,
+   pub user:             String,
    /// Congestion controller for what this side sends, bbr or cubic. Cubic is
    /// faster on a clean local network and collapses on a lossy one.
    #[pound(long, value_name = "NAME", default = "bbr")]
-   pub congestion:      Congestion,
+   pub congestion:       Congestion,
 
    /// The internal process to run, absent when started by an operator.
    #[pound(subcommand)]

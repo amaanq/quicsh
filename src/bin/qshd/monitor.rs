@@ -57,12 +57,16 @@ use quicsh::{
       Attempt,
       Permit,
    },
+   certificate::Certificate,
    control::{
       Open,
       Program,
       Token,
    },
-   key::private_from_openssh,
+   key::{
+      PublicKey,
+      private_from_openssh,
+   },
    known_hosts::glob,
    pipe::reopen,
    tls::{
@@ -129,19 +133,21 @@ const MAX_TRANSCRIPT_HASH: usize = 64;
 /// How the server was asked to run.
 pub struct Settings {
    /// Address and UDP port to listen on.
-   pub listen:          SocketAddr,
+   pub listen:           SocketAddr,
    /// Path of the host private key.
-   pub host_key:        PathBuf,
+   pub host_key:         PathBuf,
+   /// Path of the host certificate.
+   pub host_certificate: Option<PathBuf>,
    /// File that replaces every account's own `authorized_keys`.
-   pub authorized_keys: Option<PathBuf>,
+   pub authorized_keys:  Option<PathBuf>,
    /// Program behind the `sftp` subsystem.
-   pub sftp_server:     Option<PathBuf>,
+   pub sftp_server:      Option<PathBuf>,
    /// Patterns for the environment variables a client may set.
-   pub accept_env:      Vec<String>,
+   pub accept_env:       Vec<String>,
    /// The account the network process runs as when the monitor is root.
-   pub user:            String,
+   pub user:             String,
    /// Congestion controller the network process uses.
-   pub congestion:      Congestion,
+   pub congestion:       Congestion,
 }
 
 /// One successful login.
@@ -156,6 +162,8 @@ struct Grant {
 struct Monitor {
    /// The host key.
    key:             Arc<dyn SigningKey>,
+   /// The host certificate, empty without one.
+   certificate:     Vec<u8>,
    /// Address the server listens on.
    listen:          SocketAddr,
    /// The listening socket, until the network process takes it.
@@ -510,9 +518,10 @@ impl Monitor {
                .context("host key has no public half")?;
 
             let reply = Reply::Hello {
-               key:    key.to_vec(),
-               listen: self.listen,
-               secret: self.secret()?,
+               key:         key.to_vec(),
+               listen:      self.listen,
+               secret:      self.secret()?,
+               certificate: self.certificate.clone(),
             };
 
             Ok((reply, vec![listener]))
@@ -600,6 +609,25 @@ pub fn run(settings: Settings) -> Result<()> {
    let key = tls::signing_key(&private_from_openssh(&key_text)?)
       .with_context(|| format!("loading host key {}", settings.host_key.display()))?;
 
+   let certificate = match settings.host_certificate {
+      Some(ref path) => {
+         let about = fs::read_to_string(path)
+            .with_context(|| format!("reading host certificate {}", path.display()))?
+            .parse::<Certificate>()
+            .with_context(|| format!("loading host certificate {}", path.display()))?;
+
+         let public = key.public_key().context("host key has no public half")?;
+         ensure!(
+            *about.key() == PublicKey::from_spki(&public)?,
+            "the host certificate {} is about another key",
+            path.display()
+         );
+
+         about.to_blob().to_vec()
+      },
+      None => Vec::new(),
+   };
+
    let listener = udp_socket(settings.listen, None)
       .with_context(|| format!("listening on {}", settings.listen))?;
 
@@ -640,6 +668,7 @@ pub fn run(settings: Settings) -> Result<()> {
 
    let mut monitor = Monitor {
       key,
+      certificate,
       listen: settings.listen,
       listener: Some(listener),
       authorized_keys: settings.authorized_keys,

@@ -44,6 +44,22 @@ pub fn check(text: &str, host: &str, port: u16, key: &PublicKey) -> Trust {
    }
 }
 
+/// The keys of the certificate authorities that `@cert-authority` lines
+/// name for `host`, by its bare name or by its name with `port`.
+#[must_use]
+pub fn authorities(text: &str, host: &str, port: u16) -> Vec<PublicKey> {
+   let lowered = host.to_ascii_lowercase();
+   let ported = name(&lowered, port);
+
+   text
+      .lines()
+      .filter_map(|line| line.trim().strip_prefix("@cert-authority"))
+      .filter_map(|rest| rest.trim_start().split_once(char::is_whitespace))
+      .filter(|&(hosts, _)| matches(hosts, &lowered) || matches(hosts, &ported))
+      .filter_map(|(_, listed)| listed.parse().ok())
+      .collect()
+}
+
 /// The line that records `key` for `host` on `port`.
 #[must_use]
 pub fn entry(host: &str, port: u16, key: &PublicKey) -> String {

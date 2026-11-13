@@ -23,6 +23,7 @@ use std::{
       Read as _,
       Write as _,
    },
+   iter,
    net::{
       Ipv4Addr,
       SocketAddr,
@@ -64,6 +65,8 @@ use std::{
    time::{
       Duration,
       Instant,
+      SystemTime,
+      UNIX_EPOCH,
    },
 };
 
@@ -92,6 +95,10 @@ use quicsh::{
       exporter,
       message,
    },
+   certificate::{
+      Certificate,
+      Kind,
+   },
    control::{
       DETACH_LIMIT,
       Deframer,
@@ -108,6 +115,7 @@ use quicsh::{
    key::PublicKey,
    known_hosts::{
       Trust,
+      authorities,
       check,
       entry,
    },
@@ -207,9 +215,9 @@ fn home() -> Result<PathBuf> {
    ))
 }
 
-/// Stops unless the user's known hosts vouch for `key`, asking on first
-/// contact.
-fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
+/// The known hosts files in one text, and the path of the one this program
+/// writes.
+fn known_hosts() -> Result<(String, PathBuf)> {
    let ssh = home()?.join(".ssh");
    let own = ssh.join("known_hosts_quicsh");
 
@@ -230,6 +238,13 @@ fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
       }
    }
 
+   Ok((known, own))
+}
+
+/// Stops unless the user's known hosts vouch for `key`, asking on first
+/// contact.
+fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
+   let (known, own) = known_hosts()?;
    let fingerprint = key.fingerprint();
    let named = login.alias.as_deref().unwrap_or(&login.host);
 
@@ -277,10 +292,12 @@ fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
       },
    }
 
+   let ssh = own.parent().unwrap_or(&own);
+
    DirBuilder::new()
       .recursive(true)
       .mode(0o700)
-      .create(&ssh)
+      .create(ssh)
       .with_context(|| format!("creating {}", ssh.display()))?;
 
    let mut file = OpenOptions::new()
@@ -297,16 +314,19 @@ fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
 /// A signed login, or `None` once every agent key has been tried.
 type Attempt = Result<Option<Request>>;
 
-/// Checks the host, then yields one signed login per usable agent key, each
-/// time the main loop asks for the next.
+/// Checks a host that no certificate authority vouched for, then yields one
+/// signed login per usable agent key, each time the main loop asks for the
+/// next.
 fn authenticate(
    login: &Login,
-   host_key: &PublicKey,
+   host: Option<&PublicKey>,
    secret: &[u8; 32],
    attempts: &Sender<Attempt>,
    next: &Receiver<()>,
 ) -> Result<()> {
-   trust_host(login, host_key)?;
+   if let Some(host_key) = host {
+      trust_host(login, host_key)?;
+   }
 
    // The main loop takes one login and asks for the next when the server
    // refuses it.
@@ -560,6 +580,9 @@ struct Client {
    deframer: Deframer,
    /// Control messages waiting for send window.
    outbox:   Outbox,
+   /// The host key and the authorities that may vouch for it, while the
+   /// server is asked for its certificate.
+   vouching: Option<(PublicKey, Vec<PublicKey>)>,
    /// Signed logins from the authentication thread.
    attempts: Option<Receiver<Attempt>>,
    /// Asks the authentication thread for the next key.
@@ -619,6 +642,7 @@ impl Client {
       self.control = None;
       self.deframer = Deframer::default();
       self.outbox = Outbox::default();
+      self.vouching = None;
       self.attempts = None;
       self.next = None;
       self.opening.clear();
@@ -939,6 +963,7 @@ impl Client {
                   channel.release(taken);
                }
             },
+            Message::HostCertificate(blob) => self.vouched(connection, &blob)?,
             Message::Failed { session, reason } => {
                if let Some(channel) = self.channels.get_mut(&session) {
                   channel.fail(&format!("the server did not start the session: {reason}"));
@@ -975,6 +1000,79 @@ impl Client {
             _ => bail!("unexpected control message from the server"),
          }
       }
+
+      Ok(())
+   }
+
+   /// Starts the login on a new connection. A host that the known hosts do
+   /// not list is first asked for its certificate, when they name a
+   /// certificate authority for it.
+   fn connected(&mut self, connection: &mut Connection) -> Result<()> {
+      let host_key = tls::peer_key(connection)?;
+      let named = self.login.alias.as_deref().unwrap_or(&self.login.host);
+      let (known, _) = known_hosts()?;
+
+      let listed = matches!(
+         check(&known, named, self.login.port, &host_key),
+         Trust::Known | Trust::Revoked
+      );
+      let trusted = authorities(&known, named, self.login.port);
+
+      if listed || trusted.is_empty() {
+         return self.authenticate(connection, Some(host_key));
+      }
+
+      let control = connection
+         .streams()
+         .open(Dir::Bi)
+         .context("no stream credit")?;
+
+      self.control = Some(control);
+      self.outbox.push(&Message::Certify);
+      self.vouching = Some((host_key, trusted));
+      Ok(())
+   }
+
+   /// Goes on with the login once the server sent its certificate, which
+   /// stands in for a known hosts entry when an authority the user trusts
+   /// signed it for this host's name and key.
+   fn vouched(&mut self, connection: &Connection, blob: &[u8]) -> Result<()> {
+      let Some((host_key, trusted)) = self.vouching.take() else {
+         bail!("unexpected host certificate");
+      };
+
+      let named = self.login.alias.as_deref().unwrap_or(&self.login.host);
+      let now = SystemTime::now()
+         .duration_since(UNIX_EPOCH)
+         .map_or(u64::MAX, |since| since.as_secs());
+
+      let vouches = Certificate::from_blob(blob).is_ok_and(|certificate| {
+         *certificate.key() == host_key
+            && trusted.contains(certificate.authority())
+            && certificate.admits(Kind::Host, iter::once(named), now)
+      });
+
+      self.authenticate(connection, (!vouches).then_some(host_key))
+   }
+
+   /// Starts the thread that checks `host`, when there is a key left to
+   /// check, and signs the logins.
+   fn authenticate(&mut self, connection: &Connection, host: Option<PublicKey>) -> Result<()> {
+      let login = self.login.clone();
+      let secret = exporter(connection)?;
+
+      let (attempt_tx, attempt_rx) = channel();
+      let (next_tx, next_rx) = channel();
+      self.attempts = Some(attempt_rx);
+      self.next = Some(next_tx);
+
+      // The host prompt and a FIDO touch can block for a long time, and
+      // the loop must keep sending keep-alives meanwhile.
+      thread::spawn(move || {
+         if let Err(error) = authenticate(&login, host.as_ref(), &secret, &attempt_tx, &next_rx) {
+            let _ = attempt_tx.send(Err(error));
+         }
+      });
 
       Ok(())
    }
@@ -1023,23 +1121,7 @@ impl App for Client {
       match event {
          Event::Connected => {
             self.dialed = None;
-
-            let login = self.login.clone();
-            let host_key = tls::peer_key(connection)?;
-            let secret = exporter(connection)?;
-
-            let (attempt_tx, attempt_rx) = channel();
-            let (next_tx, next_rx) = channel();
-            self.attempts = Some(attempt_rx);
-            self.next = Some(next_tx);
-
-            // The host prompt and a FIDO touch can block for a long time, and
-            // the loop must keep sending keep-alives meanwhile.
-            thread::spawn(move || {
-               if let Err(error) = authenticate(&login, &host_key, &secret, &attempt_tx, &next_rx) {
-                  let _ = attempt_tx.send(Err(error));
-               }
-            });
+            self.connected(connection)?;
          },
          Event::Stream(StreamEvent::Readable { id }) if Some(id) == self.control => {
             self.control(connection, id)?;
@@ -1607,6 +1689,7 @@ fn main() -> Result<()> {
       control: None,
       deframer: Deframer::default(),
       outbox: Outbox::default(),
+      vouching: None,
       attempts: None,
       next: None,
       headings: HashMap::new(),
@@ -1627,8 +1710,7 @@ fn main() -> Result<()> {
       None => client.status.unwrap_or(255),
    };
 
-   drop(client);
-   drop(sockets);
+   drop((client, sockets));
    ended?;
 
    process::exit(i32::try_from(status).unwrap_or(255))

@@ -323,11 +323,13 @@ struct Binding {
 /// State of the network process.
 struct Server {
    /// Every connection whose handshake finished.
-   peers:  HashMap<ConnectionHandle, Peer>,
+   peers:       HashMap<ConnectionHandle, Peer>,
    /// Reaches the monitor.
-   helper: Helper,
+   helper:      Helper,
+   /// The host certificate, empty without one.
+   certificate: Vec<u8>,
    /// Wakes the loop from I/O threads.
-   waker:  Arc<Waker>,
+   waker:       Arc<Waker>,
 }
 
 impl Server {
@@ -437,6 +439,11 @@ impl Server {
                peer.outbox.push(&reply);
             },
             Message::Bind { listener, path } => peer.listen(listener, path, &self.waker)?,
+            Message::Certify => {
+               peer
+                  .outbox
+                  .push(&Message::HostCertificate(self.certificate.clone()));
+            },
             _ => bail!("unexpected control message"),
          }
       }
@@ -819,6 +826,7 @@ pub fn run(congestion: Congestion) -> Result<()> {
          key: public,
          listen,
          secret,
+         certificate,
       },
       socket,
    ) = helper.hello()?
@@ -843,6 +851,7 @@ pub fn run(congestion: Congestion) -> Result<()> {
    let mut server = Server {
       peers: HashMap::new(),
       helper,
+      certificate,
       waker: Arc::new(Waker::new()?),
    };
 

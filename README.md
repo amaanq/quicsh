@@ -53,6 +53,9 @@ afford to lose :)
   every key that authority signed for the account, or for one of the line's
   `principals=`. `qsh` finds the certificate beside the key, in the agent or
   through `CertificateFile`
+- Host certificates. `qshd --host-certificate` shows one, and a
+  `@cert-authority` line in `known_hosts` makes `qsh` take it in place of an
+  entry for the host
 - `ed25519-sk` keys in the same way, with the PIN and the touch
 
 ## Usage

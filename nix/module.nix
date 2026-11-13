@@ -56,6 +56,15 @@ in
       '';
     };
 
+    hostCertificate = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        What a certificate authority says about the host key, as
+        `ssh-keygen -s -h` writes it.
+      '';
+    };
+
     authorizedKeysFile = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
@@ -154,6 +163,10 @@ in
           ++ lib.optionals (cfg.authorizedKeysFile != null) [
             "--authorized-keys"
             cfg.authorizedKeysFile
+          ]
+          ++ lib.optionals (cfg.hostCertificate != null) [
+            "--host-certificate"
+            cfg.hostCertificate
           ]
           ++ lib.concatMap (pattern: [
             "--accept-env"

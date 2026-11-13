@@ -78,6 +78,10 @@ const CLOSE: u8 = 20;
 const REACH: u8 = 21;
 /// Tag of [`Message::Bind`].
 const BIND: u8 = 22;
+/// Tag of [`Message::Certify`].
+const CERTIFY: u8 = 23;
+/// Tag of [`Message::HostCertificate`].
+const HOST_CERTIFICATE: u8 = 24;
 
 /// How long a session waits for a client whose connection died.
 pub const DETACH_LIMIT: Duration = Duration::from_hours(1);
@@ -216,6 +220,11 @@ pub enum Message {
    Close {
       session: u32,
    },
+   /// Asks the server, before the login, what a certificate authority says
+   /// about its host key.
+   Certify,
+   /// The server's host certificate, which is empty when it has none.
+   HostCertificate(Vec<u8>),
 }
 
 /// Appends a count and that many pairs of a name and a value.
@@ -290,6 +299,37 @@ fn text(reader: &mut Reader<'_>) -> Result<String, Error> {
    Ok(str::from_utf8(bytes).map_err(|_| Error::Frame)?.to_owned())
 }
 
+/// Appends the tag and the fields of [`Message::Request`].
+fn put_request(out: &mut Vec<u8>, request: &Request) {
+   out.push(REQUEST);
+   put_string(out, request.user.as_bytes());
+   put_string(out, &request.key.to_blob());
+   put_string(out, &request.signature);
+
+   let certificate = request.certificate.as_deref();
+   put_string(out, certificate.map_or(&[], Certificate::to_blob));
+}
+
+/// Reads the fields of [`Message::Request`].
+fn request(reader: &mut Reader<'_>) -> Result<Request, Error> {
+   let user = text(reader)?;
+
+   if user.is_empty() || user.len() > MAX_USER {
+      return Err(Error::Frame);
+   }
+
+   Ok(Request {
+      user,
+      key: PublicKey::from_blob(reader.string()?)?,
+      signature: reader.string()?.to_vec(),
+      certificate: Some(reader.string()?)
+         .filter(|blob| !blob.is_empty())
+         .map(Certificate::from_blob)
+         .transpose()?
+         .map(Box::new),
+   })
+}
+
 /// Reads the fields of [`Message::Open`].
 fn open(reader: &mut Reader<'_>) -> Result<Open, Error> {
    let session = reader.u32()?;
@@ -340,15 +380,7 @@ impl Message {
       let mut payload = Vec::new();
 
       match *self {
-         Self::Request(ref request) => {
-            payload.push(REQUEST);
-            put_string(&mut payload, request.user.as_bytes());
-            put_string(&mut payload, &request.key.to_blob());
-            put_string(&mut payload, &request.signature);
-
-            let certificate = request.certificate.as_deref();
-            put_string(&mut payload, certificate.map_or(&[], Certificate::to_blob));
-         },
+         Self::Request(ref request) => put_request(&mut payload, request),
          Self::Accepted => payload.push(ACCEPTED),
          Self::Rejected => payload.push(REJECTED),
          Self::Open(ref open) => {
@@ -418,6 +450,11 @@ impl Message {
             errors,
          } => put_counts(&mut payload, TAKEN, session, [taken, errors]),
          Self::Close { session } => put_numbered(&mut payload, CLOSE, session),
+         Self::Certify => payload.push(CERTIFY),
+         Self::HostCertificate(ref blob) => {
+            payload.push(HOST_CERTIFICATE);
+            put_string(&mut payload, blob);
+         },
          Self::Resumed { received, skipped } => {
             payload.push(RESUMED);
             put_string(&mut payload, &received.to_be_bytes());
@@ -487,24 +524,7 @@ impl Message {
       let mut reader = Reader::new(payload);
 
       let message = match reader.byte()? {
-         REQUEST => {
-            let user = text(&mut reader)?;
-
-            if user.is_empty() || user.len() > MAX_USER {
-               return Err(Error::Frame);
-            }
-
-            Self::Request(Request {
-               user,
-               key: PublicKey::from_blob(reader.string()?)?,
-               signature: reader.string()?.to_vec(),
-               certificate: Some(reader.string()?)
-                  .filter(|blob| !blob.is_empty())
-                  .map(Certificate::from_blob)
-                  .transpose()?
-                  .map(Box::new),
-            })
-         },
+         REQUEST => Self::Request(request(&mut reader)?),
          ACCEPTED => Self::Accepted,
          REJECTED => Self::Rejected,
          OPEN => Self::Open(open(&mut reader)?),
@@ -561,6 +581,8 @@ impl Message {
                session: reader.u32()?,
             }
          },
+         CERTIFY => Self::Certify,
+         HOST_CERTIFICATE => Self::HostCertificate(reader.string()?.to_vec()),
          RESUMED => {
             Self::Resumed {
                received: u64::from_be_bytes(reader.array()?),
