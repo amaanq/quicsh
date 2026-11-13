@@ -40,6 +40,16 @@ It listens on UDP port 22, which you'll have to open in your firewall.
 qshd
 ```
 
+On NixOS the flake has a module for it.
+
+```nix
+{
+  imports = [ inputs.quicsh.nixosModules.default ];
+
+  services.qshd.enable = true;
+}
+```
+
 The client takes the flags you'd expect from `ssh`.
 
 ```sh

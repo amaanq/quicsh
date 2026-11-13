@@ -60,6 +60,14 @@
         }
       );
 
+      nixosModules.qshd =
+        { pkgs, ... }:
+        {
+          imports = [ ./nix/module.nix ];
+          services.qshd.package = lib.mkDefault self.packages.${pkgs.stdenv.hostPlatform.system}.quicsh;
+        };
+      nixosModules.default = self.nixosModules.qshd;
+
       checks = forAllSystems (system: {
         quicsh = self.packages.${system}.quicsh;
       });
