@@ -51,8 +51,10 @@ use crate::{
    key::PublicKey,
 };
 
+/// ALPN protocol name.
 const ALPN: &[u8] = b"ssh-quic";
 
+/// The ring provider limited to one cipher suite.
 fn provider() -> Arc<CryptoProvider> {
    let mut provider = default_provider();
    provider
@@ -137,6 +139,7 @@ pub fn peer_key(connection: &Connection) -> Result<PublicKey, Error> {
    PublicKey::from_spki(chain.first().ok_or(Error::PeerKey)?)
 }
 
+/// Accepts any server key whose handshake signature is valid.
 #[derive(Debug)]
 struct AcceptAnyKey(WebPkiSupportedAlgorithms);
 

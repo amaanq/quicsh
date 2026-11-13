@@ -31,7 +31,9 @@ use crate::{
    wire::put_string,
 };
 
+/// TLS exporter label that binds a login to one connection.
 const EXPORTER_LABEL: &[u8] = b"EXPORTER-ssh-quic-auth";
+/// `SSHSIG` namespace that keeps these signatures out of other protocols.
 const NAMESPACE: &[u8] = b"ssh-quic-auth";
 
 /// The secret both sides derive from this connection's TLS handshake.
@@ -101,11 +103,11 @@ impl Account {
 
       Ok(passwd.lines().find_map(|line| {
          let fields: Vec<&str> = line.split(':').collect();
-         let [user, _password, uid, gid, _gecos, home, shell] = fields.as_slice() else {
+         let [user, _password, uid, gid, _gecos, home, shell] = *fields.as_slice() else {
             return None;
          };
 
-         (*user == name).then_some(())?;
+         (user == name).then_some(())?;
 
          Some(Self {
             name:  name.to_owned(),
@@ -128,7 +130,7 @@ impl Account {
 
       let supplementary = group.lines().filter_map(|line| {
          let fields: Vec<&str> = line.split(':').collect();
-         let [_name, _password, gid, members] = fields.as_slice() else {
+         let [_name, _password, gid, members] = *fields.as_slice() else {
             return None;
          };
 
@@ -177,6 +179,7 @@ impl Account {
          .any(|listed| listed == *key))
    }
 
+   /// Whether only the account or root can write `path`.
    fn controls(&self, path: &Path) -> bool {
       fs::metadata(path).is_ok_and(|metadata| {
          (metadata.uid() == self.uid || metadata.uid() == 0) && metadata.mode() & 0o022 == 0

@@ -16,6 +16,7 @@ impl<'bytes> Reader<'bytes> {
       self.0.is_empty()
    }
 
+   /// The next `count` bytes.
    fn take(&mut self, count: usize) -> Result<&'bytes [u8], Error> {
       let (head, tail) = self.0.split_at_checked(count).ok_or(Error::Truncated)?;
       self.0 = tail;
@@ -33,8 +34,8 @@ impl<'bytes> Reader<'bytes> {
    ///
    /// Fails when fewer than four bytes are left.
    pub fn u32(&mut self) -> Result<u32, Error> {
-      let bytes = self.take(4)?;
-      Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+      let bytes = self.take(4)?.first_chunk().ok_or(Error::Truncated)?;
+      Ok(u32::from_be_bytes(*bytes))
    }
 
    /// # Errors
@@ -56,6 +57,10 @@ impl<'bytes> Reader<'bytes> {
 /// # Panics
 ///
 /// Panics when `bytes` is longer than `u32::MAX` bytes.
+#[expect(
+   clippy::expect_used,
+   reason = "no caller builds a 4 GiB field, and a truncated length would corrupt the stream"
+)]
 pub fn put_string(out: &mut Vec<u8>, bytes: &[u8]) {
    let length = u32::try_from(bytes.len()).expect("wire strings stay below 4 GiB");
    out.extend_from_slice(&length.to_be_bytes());

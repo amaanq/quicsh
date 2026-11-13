@@ -27,6 +27,7 @@ pub struct Options {
    #[pound(long, value_name = "NAME", default = "sshd")]
    pub user:            String,
 
+   /// The internal process to run, absent when started by an operator.
    #[pound(subcommand)]
    pub stage: Option<Stage>,
 }
@@ -34,15 +35,21 @@ pub struct Options {
 /// The processes the monitor starts from its own binary.
 #[derive(pound::Parse)]
 pub enum Stage {
+   /// The unprivileged network process.
    #[pound(hidden)]
    Network,
+   /// One session, run as its account.
    #[pound(hidden)]
    Session {
+      /// Account the session runs as.
       user:         String,
+      /// The client's `TERM`.
       #[pound(long)]
       term:         Option<String>,
+      /// The command, absent for a login shell.
       #[pound(long, allow_hyphen_values)]
       command:      Option<String>,
+      /// Socket that reaches the client's SSH agent.
       #[pound(long)]
       agent_socket: Option<PathBuf>,
    },

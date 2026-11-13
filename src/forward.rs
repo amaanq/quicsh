@@ -47,13 +47,17 @@ use crate::{
    relay::Relay,
 };
 
+/// Pause after a failed accept.
 const ACCEPT_RETRY: Duration = Duration::from_millis(50);
 
 /// A listening socket whose accepted connections arrive on a channel.
 /// Dropping it stops the listener.
 pub struct Acceptor {
+   /// Connections the accept thread has taken.
    incoming: Receiver<OwnedFd>,
+   /// The listening socket, kept to shut it down.
    listener: OwnedFd,
+   /// Tells the accept thread to stop.
    closed:   Arc<AtomicBool>,
 }
 
@@ -90,6 +94,7 @@ impl Acceptor {
       Ok(Self::spawn(handle, accept, waker))
    }
 
+   /// Starts the thread that accepts on `listener`.
    fn spawn(
       listener: OwnedFd,
       mut accept: impl FnMut() -> io::Result<OwnedFd> + Send + 'static,
@@ -98,7 +103,7 @@ impl Acceptor {
       let (accepted, incoming) = channel();
       let closed = Arc::new(AtomicBool::new(false));
       let stop = Arc::clone(&closed);
-      let waker = Arc::clone(waker);
+      let notifier = Arc::clone(waker);
 
       thread::spawn(move || {
          while !stop.load(Ordering::Relaxed) {
@@ -108,7 +113,7 @@ impl Acceptor {
                      break;
                   }
 
-                  waker.wake();
+                  notifier.wake();
                },
                // A failed accept is usually one aborted connection or a
                // briefly full descriptor table.
@@ -143,7 +148,7 @@ impl Drop for Acceptor {
 /// Connects to `host:port` on a thread. The receiver yields the result once.
 fn dial(host: String, port: u16, waker: &Arc<Waker>) -> Receiver<io::Result<OwnedFd>> {
    let (result, receiver) = channel();
-   let waker = Arc::clone(waker);
+   let notifier = Arc::clone(waker);
 
    thread::spawn(move || {
       let connected = TcpStream::connect((host.as_str(), port)).and_then(|stream| {
@@ -152,7 +157,7 @@ fn dial(host: String, port: u16, waker: &Arc<Waker>) -> Receiver<io::Result<Owne
       });
 
       let _ = result.send(connected);
-      waker.wake();
+      notifier.wake();
    });
 
    receiver
@@ -160,16 +165,22 @@ fn dial(host: String, port: u16, waker: &Arc<Waker>) -> Receiver<io::Result<Owne
 
 /// A stream waiting for its TCP connection.
 struct Dial {
+   /// The stream to join.
    stream:   StreamId,
+   /// Yields the connection or the reason it failed.
    pending:  Receiver<io::Result<OwnedFd>>,
+   /// Stream data read before the connection existed.
    buffered: Vec<u8>,
+   /// Whether that data reached the end of the stream.
    finished: bool,
 }
 
 /// Every forwarded connection on one QUIC connection.
 #[derive(Default)]
 pub struct Forwards {
+   /// Streams waiting for a TCP connection.
    dials:  Vec<Dial>,
+   /// Streams joined to a socket.
    relays: Vec<Relay>,
 }
 

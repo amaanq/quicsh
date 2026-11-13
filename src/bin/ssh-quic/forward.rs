@@ -32,16 +32,23 @@ use misstep::{
 };
 use ssh_quic::pipe::Waker;
 
+/// SOCKS protocol version this proxy speaks.
 const SOCKS_VERSION: u8 = 5;
+/// SOCKS command that opens a TCP connection.
 const SOCKS_CONNECT: u8 = 1;
+/// How long a SOCKS client may take to name its target.
 const SOCKS_TIMEOUT: Duration = Duration::from_secs(10);
+/// Pause after a failed accept.
 const ACCEPT_RETRY: Duration = Duration::from_millis(50);
 
 /// A connection a local listener accepted, with the address the server should
 /// connect it to.
 pub struct Inbound {
+   /// The accepted connection.
    pub socket: OwnedFd,
+   /// Host the server should connect to.
    pub host:   String,
+   /// Port the server should connect to.
    pub port:   u16,
 }
 
@@ -49,32 +56,44 @@ pub struct Inbound {
 #[derive(Clone)]
 pub enum Target {
    /// `-L`, always the same remote address.
-   Fixed { host: String, port: u16 },
+   Fixed {
+      /// Host the server connects to.
+      host: String,
+      /// Port the server connects to.
+      port: u16,
+   },
    /// `-D`, whatever each connection asks for over SOCKS5.
    Socks,
 }
 
+/// A local listener and where its connections go.
 pub struct Local {
+   /// Address the listener binds.
    pub bind:   SocketAddr,
+   /// Where accepted connections are sent.
    pub target: Target,
 }
 
 /// `-R`: the server listens on `port` and connections go to `host:target`
 /// as seen from the client.
 pub struct Remote {
+   /// Port the server listens on, 0 to let it choose.
    pub port:   u16,
+   /// Host the client connects to.
    pub host:   String,
+   /// Port the client connects to.
    pub target: u16,
 }
 
+/// Parses a bind address and port, with loopback as the default address.
 fn bind(address: Option<&str>, port: &str) -> Result<SocketAddr> {
-   let address = match address {
-      Some(address) => address.parse::<IpAddr>().context("bad bind address")?,
+   let ip = match address {
+      Some(text) => text.parse::<IpAddr>().context("bad bind address")?,
       None => Ipv4Addr::LOCALHOST.into(),
    };
 
    Ok(SocketAddr::new(
-      address,
+      ip,
       port.parse::<u16>().context("bad port")?,
    ))
 }
@@ -88,14 +107,14 @@ impl FromStr for Fixed {
    fn from_str(spec: &str) -> Result<Self> {
       let fields: Vec<&str> = spec.split(':').collect();
 
-      let (bind, host, port) = match fields.as_slice() {
+      let (bind, host, port) = match *fields.as_slice() {
          [port, host, target] => (bind(None, port)?, host, target),
          [address, port, host, target] => (bind(Some(address), port)?, host, target),
          _ => bail!("expected [bind:]port:host:hostport, got {spec}"),
       };
 
       let target = Target::Fixed {
-         host: (*host).to_owned(),
+         host: host.to_owned(),
          port: port.parse::<u16>().context("bad target port")?,
       };
 
@@ -140,10 +159,10 @@ impl Local {
    pub fn listen(self, inbound: &Sender<Inbound>, waker: &Arc<Waker>) -> Result<()> {
       let listener =
          TcpListener::bind(self.bind).with_context(|| format!("listening on {}", self.bind))?;
-      let inbound = inbound.clone();
-      let waker = Arc::clone(waker);
+      let sender = inbound.clone();
+      let notifier = Arc::clone(waker);
 
-      thread::spawn(move || {
+      thread::spawn(move || -> ! {
          loop {
             let Ok((stream, _)) = listener.accept() else {
                thread::sleep(ACCEPT_RETRY);
@@ -151,8 +170,8 @@ impl Local {
             };
 
             let target = self.target.clone();
-            let inbound = inbound.clone();
-            let waker = Arc::clone(&waker);
+            let forward = sender.clone();
+            let notify = Arc::clone(&notifier);
 
             // A SOCKS client may be slow to state its target, so each
             // connection negotiates on its own thread.
@@ -163,8 +182,8 @@ impl Local {
 
                let socket = OwnedFd::from(stream);
 
-               if inbound.send(Inbound { socket, host, port }).is_ok() {
-                  waker.wake();
+               if forward.send(Inbound { socket, host, port }).is_ok() {
+                  notify.wake();
                }
             });
          }
@@ -181,18 +200,19 @@ impl FromStr for Remote {
    fn from_str(spec: &str) -> Result<Self> {
       let fields: Vec<&str> = spec.split(':').collect();
 
-      let [port, host, target] = fields.as_slice() else {
+      let [port, host, target] = *fields.as_slice() else {
          bail!("expected port:host:hostport, got {spec}");
       };
 
       Ok(Self {
          port:   port.parse::<u16>().context("bad port")?,
-         host:   (*host).to_owned(),
+         host:   host.to_owned(),
          target: target.parse::<u16>().context("bad target port")?,
       })
    }
 }
 
+/// Finds the address a new connection should reach.
 fn resolve(stream: &TcpStream, target: Target) -> io::Result<(String, u16)> {
    stream.set_nodelay(true)?;
 

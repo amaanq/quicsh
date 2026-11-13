@@ -66,25 +66,42 @@ use ssh_quic::{
    },
 };
 
+/// Largest request or reply.
 const MAX_MESSAGE: usize = 128 << 10;
+/// Most descriptors one message carries.
 const MAX_DESCRIPTORS: usize = 4;
 
+/// Tag of [`Request::Hello`] and [`Reply::Hello`].
 const HELLO: u8 = 1;
+/// Tag of [`Request::Sign`].
 const SIGN: u8 = 2;
+/// Tag of [`Request::Socket`].
 const SOCKET: u8 = 3;
+/// Tag of [`Request::Login`].
 const LOGIN: u8 = 4;
+/// Tag of [`Request::Agent`].
 const AGENT: u8 = 5;
+/// Tag of [`Request::Spawn`].
 const SPAWN: u8 = 6;
+/// Tag of [`Request::Hangup`].
 const HANGUP: u8 = 7;
+/// Tag of [`Request::Logout`].
 const LOGOUT: u8 = 8;
 
+/// Tag of [`Reply::Signature`].
 const SIGNATURE: u8 = 2;
+/// Tag of [`Reply::Granted`].
 const GRANTED: u8 = 4;
+/// Tag of [`Reply::Denied`].
 const DENIED: u8 = 5;
+/// Tag of [`Reply::Spawned`].
 const SPAWNED: u8 = 6;
+/// Tag of [`Reply::Done`].
 const DONE: u8 = 7;
+/// Tag of [`Reply::Failed`].
 const FAILED: u8 = 8;
 
+/// What the network process asks of the monitor.
 pub enum Request {
    /// Asks for the host public key and the listening socket.
    Hello,
@@ -92,65 +109,89 @@ pub enum Request {
    Sign(Vec<u8>),
    /// Asks for the UDP socket of one connection.
    Socket {
+      /// Address to bind.
       local:  SocketAddr,
+      /// The client's address.
       remote: SocketAddr,
    },
+   /// Asks whether a login is valid.
    Login {
+      /// What the client sent.
       login:    auth::Request,
+      /// The connection's TLS exporter value.
       exporter: [u8; 32],
    },
    /// Asks for a listening agent socket that the grant's sessions can reach.
    Agent {
+      /// The login the socket is for.
       grant: u64,
    },
+   /// Asks for a new session.
    Spawn {
+      /// The login the session runs as.
       grant: u64,
+      /// What the client asked to run.
       open:  Open,
    },
+   /// Asks to hang up a session.
    Hangup {
+      /// The session to hang up.
       session: u64,
    },
+   /// Ends a login and removes its agent socket.
    Logout {
+      /// The login to end.
       grant: u64,
    },
 }
 
+/// The monitor's answer to one request.
 pub enum Reply {
    /// Comes with the listening UDP socket.
    Hello {
       /// The host key as a `SubjectPublicKeyInfo` document.
       key:    Vec<u8>,
+      /// Address the server listens on.
       listen: SocketAddr,
    },
+   /// A host key signature.
    Signature(Vec<u8>),
    /// Stands for a successful login in later requests.
    Granted {
+      /// The number that names this login.
       grant: u64,
    },
+   /// The login was refused.
    Denied,
    /// Comes with the terminal and a status pipe, or with standard input,
    /// output and error and a status pipe.
    Spawned {
+      /// The number that names this session.
       session: u64,
    },
    /// Success with nothing to say, or with one descriptor that the request
    /// asked for.
    Done,
+   /// The request failed, with the reason.
    Failed(String),
 }
 
+/// Appends a 64-bit number.
 fn put_u64(out: &mut Vec<u8>, value: u64) {
    put_string(out, &value.to_be_bytes());
 }
 
+/// Appends an address in its text form.
 fn put_address(out: &mut Vec<u8>, address: SocketAddr) {
    put_string(out, address.to_string().as_bytes());
 }
 
+/// Reads a 64-bit number.
 fn u64_from(reader: &mut Reader<'_>) -> Result<u64, Error> {
    Ok(u64::from_be_bytes(reader.array()?))
 }
 
+/// Reads an address from its text form.
 fn address(reader: &mut Reader<'_>) -> Result<SocketAddr, Error> {
    str::from_utf8(reader.string()?)
       .ok()
@@ -159,6 +200,7 @@ fn address(reader: &mut Reader<'_>) -> Result<SocketAddr, Error> {
 }
 
 impl Request {
+   /// The bytes of one channel message.
    fn encode(self) -> Vec<u8> {
       let mut out = Vec::new();
 
@@ -200,6 +242,7 @@ impl Request {
       out
    }
 
+   /// Parses one channel message.
    fn decode(bytes: &[u8]) -> Result<Self, Error> {
       let mut reader = Reader::new(bytes);
 
@@ -257,30 +300,31 @@ impl Request {
 }
 
 impl Reply {
+   /// The bytes of one channel message.
    fn encode(&self) -> Vec<u8> {
       let mut out = Vec::new();
 
-      match self {
-         Self::Hello { key, listen } => {
+      match *self {
+         Self::Hello { ref key, listen } => {
             out.push(HELLO);
             put_string(&mut out, key);
-            put_address(&mut out, *listen);
+            put_address(&mut out, listen);
          },
-         Self::Signature(signature) => {
+         Self::Signature(ref signature) => {
             out.push(SIGNATURE);
             put_string(&mut out, signature);
          },
          Self::Granted { grant } => {
             out.push(GRANTED);
-            put_u64(&mut out, *grant);
+            put_u64(&mut out, grant);
          },
          Self::Denied => out.push(DENIED),
          Self::Spawned { session } => {
             out.push(SPAWNED);
-            put_u64(&mut out, *session);
+            put_u64(&mut out, session);
          },
          Self::Done => out.push(DONE),
-         Self::Failed(text) => {
+         Self::Failed(ref text) => {
             out.push(FAILED);
             put_string(&mut out, text.as_bytes());
          },
@@ -289,6 +333,7 @@ impl Reply {
       out
    }
 
+   /// Parses one channel message.
    fn decode(bytes: &[u8]) -> Result<Self, Error> {
       let mut reader = Reader::new(bytes);
 
@@ -318,6 +363,7 @@ impl Reply {
    }
 }
 
+/// Sends one message with its descriptors.
 fn send(channel: &OwnedFd, bytes: &[u8], descriptors: &[BorrowedFd<'_>]) -> io::Result<()> {
    let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(MAX_DESCRIPTORS))];
    let mut ancillary = SendAncillaryBuffer::new(&mut space);
@@ -379,11 +425,10 @@ pub enum Ended {
 /// Answers requests with `handle` until the network process goes away or
 /// `signal` reports a shutdown signal. A request that fails is reported to
 /// the network process and serving goes on.
-pub fn serve(
-   channel: &OwnedFd,
-   signal: &File,
-   mut handle: impl FnMut(Request) -> Result<(Reply, Vec<OwnedFd>)>,
-) -> Result<Ended> {
+pub fn serve<Handler>(channel: &OwnedFd, signal: &File, mut handle: Handler) -> Result<Ended>
+where
+   Handler: FnMut(Request) -> Result<(Reply, Vec<OwnedFd>)>,
+{
    loop {
       let mut watched = [
          PollFd::new(channel, PollFlags::IN),
@@ -419,7 +464,9 @@ pub fn serve(
 
 /// What the monitor returns for a started session.
 pub struct Spawned {
+   /// The number that names the session.
    pub session:     u64,
+   /// The terminal or pipes, followed by the status pipe.
    pub descriptors: Vec<OwnedFd>,
 }
 
@@ -428,10 +475,12 @@ pub struct Spawned {
 pub struct Helper(Arc<Mutex<OwnedFd>>);
 
 impl Helper {
+   /// Wraps the channel the network process inherited.
    pub fn new(channel: OwnedFd) -> Self {
       Self(Arc::new(Mutex::new(channel)))
    }
 
+   /// Sends a request and waits for its reply.
    fn call(&self, request: Request) -> Result<(Reply, Vec<OwnedFd>)> {
       let channel = self
          .0
@@ -447,6 +496,7 @@ impl Helper {
       }
    }
 
+   /// Sends a request whose answer is one descriptor.
    fn descriptor(&self, request: Request) -> Result<OwnedFd> {
       match self.call(request)? {
          (Reply::Done, descriptors) => {
@@ -474,6 +524,7 @@ impl Helper {
       }
    }
 
+   /// Asks for a host key signature over a handshake transcript.
    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
       match self.call(Request::Sign(message.to_vec()))? {
          (Reply::Signature(signature), _) => Ok(signature),
@@ -481,6 +532,7 @@ impl Helper {
       }
    }
 
+   /// Asks for the UDP socket of one connection.
    pub fn socket(&self, local: SocketAddr, remote: SocketAddr) -> Result<OwnedFd> {
       self.descriptor(Request::Socket { local, remote })
    }
@@ -494,10 +546,12 @@ impl Helper {
       }
    }
 
+   /// Asks for a listening socket that reaches the client's SSH agent.
    pub fn agent(&self, grant: u64) -> Result<OwnedFd> {
       self.descriptor(Request::Agent { grant })
    }
 
+   /// Asks the monitor to start a session.
    pub fn spawn(&self, grant: u64, open: Open) -> Result<Spawned> {
       match self.call(Request::Spawn { grant, open })? {
          (Reply::Spawned { session }, descriptors) => {
@@ -510,10 +564,12 @@ impl Helper {
       }
    }
 
+   /// Asks the monitor to hang up a session.
    pub fn hangup(&self, session: u64) {
       let _ = self.call(Request::Hangup { session });
    }
 
+   /// Ends a login.
    pub fn logout(&self, grant: u64) {
       let _ = self.call(Request::Logout { grant });
    }

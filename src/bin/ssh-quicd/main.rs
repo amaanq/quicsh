@@ -1,8 +1,10 @@
 mod child;
 mod monitor;
 mod network;
+/// Command line options.
 mod options;
 mod privsep;
+/// The network process's side of a session.
 mod session;
 
 use std::net::Ipv6Addr;

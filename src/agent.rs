@@ -19,11 +19,17 @@ use crate::{
    },
 };
 
+/// Reply type for a request the agent refused.
 const FAILURE: u8 = 5;
+/// Request type that lists keys.
 const REQUEST_IDENTITIES: u8 = 11;
+/// Reply type that carries the key list.
 const IDENTITIES_ANSWER: u8 = 12;
+/// Request type that asks for a signature.
 const SIGN_REQUEST: u8 = 13;
+/// Reply type that carries a signature.
 const SIGN_RESPONSE: u8 = 14;
+/// Largest reply the client accepts from the agent.
 const MAX_REPLY: usize = 256 << 10;
 
 pub struct Identity {
@@ -82,15 +88,16 @@ impl Agent {
       Ok(Reader::new(&reply).string()?.to_vec())
    }
 
+   /// Sends one request and returns the reply body after checking its type.
    fn call(&mut self, request: &[u8], expected: u8) -> Result<Vec<u8>, Error> {
       let mut message = Vec::with_capacity(request.len() + 4);
       put_string(&mut message, request);
       self.0.write_all(&message).map_err(Error::Agent)?;
 
-      let mut length = [0; 4];
-      self.0.read_exact(&mut length).map_err(Error::Agent)?;
+      let mut prefix = [0; 4];
+      self.0.read_exact(&mut prefix).map_err(Error::Agent)?;
 
-      let length = usize::try_from(u32::from_be_bytes(length)).map_err(|_| Error::Truncated)?;
+      let length = usize::try_from(u32::from_be_bytes(prefix)).map_err(|_| Error::Truncated)?;
 
       if length == 0 || length > MAX_REPLY {
          return Err(Error::Truncated);

@@ -50,7 +50,9 @@ use rustix::{
 
 use crate::error::Error;
 
+/// Most bytes one read takes.
 const CHUNK: usize = 1 << 16;
+/// Chunks a channel holds before its thread waits.
 const QUEUE: usize = 16;
 
 /// An eventfd the loop polls beside its sockets.
@@ -66,6 +68,10 @@ impl Waker {
          .map_err(|errno| Error::Socket(errno.into()))
    }
 
+   #[expect(
+      clippy::host_endian_bytes,
+      reason = "the kernel reads an eventfd counter in the host's byte order"
+   )]
    pub fn wake(&self) {
       // The only failure is a full counter, which already wakes the loop.
       let _ = write(&self.0, &1_u64.to_ne_bytes());
@@ -153,10 +159,10 @@ pub fn reader(mut source: File, waker: Arc<Waker>) -> Receiver<Bytes> {
 /// Writes every chunk sent to it and closes `sink` once the sender is dropped.
 /// The handle finishes after the last write.
 #[must_use]
-pub fn writer<Sink: Write + Send + 'static>(
-   mut sink: Sink,
-   waker: Arc<Waker>,
-) -> (SyncSender<Bytes>, JoinHandle<()>) {
+pub fn writer<Sink>(mut sink: Sink, waker: Arc<Waker>) -> (SyncSender<Bytes>, JoinHandle<()>)
+where
+   Sink: Write + Send + 'static,
+{
    let (sender, chunks) = sync_channel::<Bytes>(QUEUE);
 
    let handle = thread::spawn(move || {

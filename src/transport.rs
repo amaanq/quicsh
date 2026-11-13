@@ -9,7 +9,7 @@
 //!   receives first packets and packets from peers that changed address.
 
 use std::{
-   collections::HashMap,
+   collections::BTreeMap,
    io::{
       self,
       IoSliceMut,
@@ -100,17 +100,29 @@ pub const INTERACTIVE_WINDOW: u64 = 256 << 10;
 /// Send window floor for a connection that carries only bulk data.
 pub const BULK_WINDOW: u64 = 1 << 20;
 
+/// Largest datagram batch one receive slot holds.
 const RECV_LEN: usize = 1 << 16;
+/// Kernel buffer size requested for each socket.
 const SOCKET_BUFFER: usize = 4 << 20;
+/// Receive batches taken from one socket per loop turn.
 const RECV_ROUNDS: usize = 8;
+/// Datagram batches sent for one connection per loop turn.
 const SEND_ROUNDS: usize = 64;
+/// Largest send window.
 const SEND_WINDOW_CEILING: u64 = 64 << 20;
+/// Rate the send window is sized for, in bytes per second.
 const RATE_CEILING: f64 = 10.0e9 / 8.0;
+/// Smallest UDP payload QUIC allows.
 const MIN_UDP_PAYLOAD: u16 = 1200;
-const MAX_UDP_PAYLOAD: u16 = 65527;
+/// Largest UDP payload over IPv6.
+const MAX_UDP_PAYLOAD: u16 = u16::MAX - 8;
+/// Largest UDP payload over IPv4.
 const MAX_UDP_PAYLOAD_V4: u16 = 65507;
+/// Idle time after which a connection is closed.
 const IDLE_TIMEOUT_MS: u32 = 60_000;
+/// Gap between keep-alive packets.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
+/// Handshakes allowed in progress at once.
 const MAX_HANDSHAKES: usize = 64;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -141,6 +153,7 @@ pub struct Tuning {
 }
 
 impl Tuning {
+   /// The QUIC transport settings for a path with this payload bound.
    fn transport(self, route_bound: u16) -> Arc<TransportConfig> {
       let mut discovery = MtuDiscoveryConfig::default();
       discovery.upper_bound(self.mtu_bound.unwrap_or(route_bound));
@@ -254,8 +267,8 @@ pub fn udp_socket(local: SocketAddr, remote: Option<SocketAddr>) -> io::Result<O
 
    bind(&fd, &local)?;
 
-   if let Some(remote) = remote {
-      connect(&fd, &remote)?;
+   if let Some(peer) = remote {
+      connect(&fd, &peer)?;
    }
 
    Ok(fd)
@@ -265,16 +278,21 @@ pub fn udp_socket(local: SocketAddr, remote: Option<SocketAddr>) -> io::Result<O
 /// and connected to the second.
 pub type Opener = Box<dyn Fn(SocketAddr, SocketAddr) -> io::Result<OwnedFd>>;
 
+/// A UDP socket with its offload state.
 struct Socket {
+   /// The socket.
    io:    UdpSocket,
+   /// What the kernel supports for segmentation and receive batching.
    state: UdpSocketState,
 }
 
 impl Socket {
+   /// Opens a socket bound to `local`.
    fn open(local: SocketAddr, remote: Option<SocketAddr>) -> Result<Self, Error> {
       Self::adopt(udp_socket(local, remote).map_err(Error::Socket)?)
    }
 
+   /// Takes over a socket that is already bound.
    fn adopt(fd: OwnedFd) -> Result<Self, Error> {
       let setup = || {
          let io = UdpSocket::from(fd);
@@ -302,7 +320,7 @@ impl Socket {
          .map_err(|errno| Error::Socket(errno.into()))?
          .saturating_sub(overhead);
 
-      Ok(u16::try_from(payload).map_or(ceiling, |payload| payload.clamp(MIN_UDP_PAYLOAD, ceiling)))
+      Ok(u16::try_from(payload).map_or(ceiling, |fits| fits.clamp(MIN_UDP_PAYLOAD, ceiling)))
    }
 
    /// Returns the number of filled buffers, or `None` when the socket has
@@ -330,6 +348,7 @@ impl Socket {
       }
    }
 
+   /// Sends one batch of datagrams.
    fn transmit(&self, meta: &Transmit, contents: &[u8]) -> Result<(), Error> {
       let datagrams = quinn_udp::Transmit {
          destination:  meta.destination,
@@ -361,9 +380,13 @@ impl Socket {
    }
 }
 
+/// One connection and the socket it owns.
 struct Session {
+   /// The QUIC state machine.
    connection:   Connection,
+   /// The connected socket.
    socket:       Socket,
+   /// Smallest send window this connection gets.
    window_floor: u64,
 }
 
@@ -401,25 +424,39 @@ impl Session {
    }
 }
 
+/// What accepting connections needs.
 struct Listener {
+   /// The socket that receives first packets.
    socket: Socket,
+   /// The address it is bound to.
    local:  SocketAddr,
+   /// TLS and transport settings for new connections.
    config: ServerConfig,
+   /// Makes the socket for each new connection.
    opener: Opener,
 }
 
+/// Where a datagram batch came from.
 #[derive(Clone, Copy)]
 enum Source {
+   /// The listening socket.
    Listener,
+   /// A connection's own socket.
    Session(ConnectionHandle),
 }
 
 pub struct Transport {
+   /// Routes datagrams to connections.
    endpoint: Endpoint,
+   /// Present when the transport accepts connections.
    listener: Option<Listener>,
-   sessions: HashMap<ConnectionHandle, Session>,
+   /// Every live connection.
+   sessions: BTreeMap<ConnectionHandle, Session>,
+   /// Settings for new connections.
    tuning:   Tuning,
+   /// Receive buffer.
    recv:     Vec<u8>,
+   /// Send buffer.
    send:     Vec<u8>,
 }
 
@@ -444,7 +481,7 @@ impl Transport {
       tuning: Tuning,
    ) -> Result<Self, Error> {
       let socket = udp_socket(local, None).map_err(Error::Socket)?;
-      let opener = Box::new(|local, remote| udp_socket(local, Some(remote)));
+      let opener = Box::new(|bound, peer| udp_socket(bound, Some(peer)));
 
       Self::adopt(socket, local, crypto, tuning, opener)
    }
@@ -472,6 +509,7 @@ impl Transport {
       Self::build(Some(listener), tuning)
    }
 
+   /// Builds the endpoint around an optional listener.
    fn build(listener: Option<Listener>, tuning: Tuning) -> Result<Self, Error> {
       let mut config = EndpointConfig::default();
       config
@@ -480,12 +518,12 @@ impl Transport {
 
       let server = listener
          .as_ref()
-         .map(|listener| Arc::new(listener.config.clone()));
+         .map(|accepting| Arc::new(accepting.config.clone()));
 
       Ok(Self {
          endpoint: Endpoint::new(Arc::new(config), server, true, None),
          listener,
-         sessions: HashMap::new(),
+         sessions: BTreeMap::new(),
          tuning,
          recv: vec![0; RECV_LEN * BATCH_SIZE],
          send: Vec::with_capacity(RECV_LEN),
@@ -534,7 +572,10 @@ impl Transport {
    /// # Errors
    ///
    /// Returns the first socket failure or the first error from `app`.
-   pub fn run<A: App>(&mut self, app: &mut A) -> Result<(), A::Error> {
+   pub fn run<A>(&mut self, app: &mut A) -> Result<(), A::Error>
+   where
+      A: App,
+   {
       let mut handles = Vec::new();
 
       loop {
@@ -600,6 +641,7 @@ impl Transport {
       }
    }
 
+   /// Sleeps until a socket is readable, the waker fires or `deadline` passes.
    fn wait(&self, deadline: Option<Instant>, waker: Option<&Waker>) -> Result<(), Error> {
       let timeout = deadline.map(|at| {
          let wait = at.saturating_duration_since(Instant::now());
@@ -616,7 +658,7 @@ impl Transport {
          .map(|listener| &listener.socket)
          .chain(self.sessions.values().map(|session| &session.socket))
          .map(|socket| PollFd::new(&socket.io, PollFlags::IN))
-         .chain(waker.map(|waker| PollFd::new(waker, PollFlags::IN)))
+         .chain(waker.map(|eventfd| PollFd::new(eventfd, PollFlags::IN)))
          .collect();
 
       match poll(&mut sockets, timeout.as_ref()) {
@@ -626,6 +668,7 @@ impl Transport {
       }
    }
 
+   /// Reads and dispatches what one socket has queued.
    fn receive(&mut self, now: Instant, source: Source) -> Result<(), Error> {
       let mut metas = [RecvMeta::default(); BATCH_SIZE];
 
@@ -636,7 +679,7 @@ impl Transport {
          };
 
          let Some(count) = socket
-            .map(|socket| socket.receive(&mut self.recv, &mut metas))
+            .map(|readable| readable.receive(&mut self.recv, &mut metas))
             .transpose()?
             .flatten()
          else {
@@ -656,6 +699,7 @@ impl Transport {
       Ok(())
    }
 
+   /// Hands one datagram to the endpoint and acts on its answer.
    fn dispatch(&mut self, now: Instant, meta: &RecvMeta, datagram: BytesMut) -> Result<(), Error> {
       let ecn = meta
          .ecn
@@ -667,9 +711,9 @@ impl Transport {
          .handle(now, meta.addr, meta.dst_ip, ecn, datagram, &mut self.send);
 
       match event {
-         Some(DatagramEvent::ConnectionEvent(handle, event)) => {
-            if let Some(session) = self.sessions.get_mut(&handle) {
-               session.connection.handle_event(event);
+         Some(DatagramEvent::ConnectionEvent(target, routed)) => {
+            if let Some(session) = self.sessions.get_mut(&target) {
+               session.connection.handle_event(routed);
             }
 
             Ok(())
@@ -680,8 +724,9 @@ impl Transport {
       }
    }
 
+   /// Accepts or refuses a new connection.
    fn accept(&mut self, now: Instant, incoming: Incoming) -> Result<(), Error> {
-      let Some(listener) = &self.listener else {
+      let Some(ref listener) = self.listener else {
          self.endpoint.ignore(incoming);
          return Ok(());
       };
@@ -708,12 +753,12 @@ impl Transport {
          .filter(|session| session.connection.is_handshaking())
          .count();
 
-      let socket = (handshaking < MAX_HANDSHAKES)
+      let opened = (handshaking < MAX_HANDSHAKES)
          .then(|| (listener.opener)(local, remote).ok())
          .flatten()
          .and_then(|fd| Socket::adopt(fd).ok());
 
-      let Some(socket) = socket else {
+      let Some(socket) = opened else {
          let refusal = self.endpoint.refuse(incoming, &mut self.send);
          return listener.socket.transmit(&refusal, &self.send);
       };
@@ -743,6 +788,7 @@ impl Transport {
       }
    }
 
+   /// Sends a stateless reply from the endpoint.
    fn respond(&self, response: &Transmit) -> Result<(), Error> {
       let socket = self.listener.as_ref().map_or_else(
          || {
@@ -755,6 +801,6 @@ impl Transport {
          |listener| Some(&listener.socket),
       );
 
-      socket.map_or(Ok(()), |socket| socket.transmit(response, &self.send))
+      socket.map_or(Ok(()), |chosen| chosen.transmit(response, &self.send))
    }
 }

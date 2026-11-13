@@ -40,18 +40,23 @@ use rustix::{
 };
 use ssh_quic::auth::Account;
 
+/// `PATH` for sessions when the server has none.
 const FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
+/// What one session process runs.
 pub struct Launch {
+   /// Account the session runs as.
    pub user:     String,
    /// The client's `TERM`, present when standard input is a terminal to adopt.
    pub terminal: Option<String>,
+   /// The command, or `None` for a login shell.
    pub command:  Option<String>,
    /// Where the session finds the client's forwarded SSH agent.
    pub agent:    Option<PathBuf>,
 }
 
 impl Launch {
+   /// Becomes the account and replaces this process with its shell.
    pub fn run(&self) -> Result<Infallible> {
       let account = Account::lookup(&self.user)?.context("account vanished after login")?;
 
@@ -98,15 +103,15 @@ impl Launch {
             Path::new("/")
          });
 
-      if let Some(terminal) = &self.terminal {
+      if let Some(ref terminal) = self.terminal {
          shell.env("TERM", terminal);
       }
 
-      if let Some(agent) = &self.agent {
+      if let Some(ref agent) = self.agent {
          shell.env("SSH_AUTH_SOCK", agent);
       }
 
-      if let Some(command) = &self.command {
+      if let Some(ref command) = self.command {
          shell.arg("-c").arg(command);
       } else {
          let name = account

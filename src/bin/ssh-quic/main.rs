@@ -1,4 +1,5 @@
 mod forward;
+/// Command line options.
 mod options;
 
 use std::{
@@ -127,11 +128,16 @@ use crate::{
    },
 };
 
+/// How often the loop checks the authentication thread.
 const WORKER_POLL: Duration = Duration::from_millis(20);
+/// How often the loop checks the terminal size.
 const RESIZE_POLL: Duration = Duration::from_millis(250);
+/// TLS server name, unused because the host key is checked instead.
 const SERVER_NAME: &str = "ssh-quic";
+/// The number this client gives its one session.
 const SESSION: u32 = 1;
 
+/// The user's home directory.
 fn home() -> Result<PathBuf> {
    Ok(PathBuf::from(
       env::var_os("HOME").context("HOME is not set")?,
@@ -249,6 +255,7 @@ fn authenticate(
 struct RawMode(Termios);
 
 impl RawMode {
+   /// Switches the terminal to raw mode and remembers the old settings.
    fn enable() -> Result<Self> {
       let saved = tcgetattr(io::stdin())?;
 
@@ -266,6 +273,7 @@ impl Drop for RawMode {
    }
 }
 
+/// The current size of the local terminal.
 fn window() -> Result<Size> {
    let size = tcgetwinsize(io::stdin())?;
 
@@ -275,37 +283,59 @@ fn window() -> Result<Size> {
    })
 }
 
+/// What the session runs.
 struct Shell {
+   /// The remote command, or `None` for a login shell.
    command:  Option<String>,
    /// Run the command on a terminal, as `ssh -t` does.
    terminal: bool,
 }
 
+/// Event loop state for one connection to a server.
 struct Client {
+   /// Who to log in as, until the handshake finishes.
    login:    Option<Login>,
    /// The session to start after login.
    shell:    Option<Shell>,
+   /// Whether to forward the local SSH agent.
    agent:    bool,
+   /// The `-R` forwards, indexed by listener number.
    remotes:  Vec<Remote>,
+   /// Connections the local listeners accepted.
    inbound:  Receiver<Inbound>,
    /// Streams the server opened, until their first frame arrived.
    opening:  HashMap<StreamId, Deframer>,
+   /// Every forwarded connection in progress.
    forwards: Forwards,
+   /// Whether the server accepted the login.
    accepted: bool,
+   /// Wakes the loop from I/O threads.
    waker:    Arc<Waker>,
+   /// The control stream, once the first login is sent.
    control:  Option<StreamId>,
+   /// Reassembles control messages from the server.
    deframer: Deframer,
+   /// Control messages waiting for send window.
    outbox:   Outbox,
+   /// Signed logins from the authentication thread.
    attempts: Option<Receiver<Attempt>>,
+   /// Asks the authentication thread for the next key.
    next:     Option<Sender<()>>,
+   /// The session stream.
    session:  Option<Relay>,
    /// The server's stderr stream, until its four byte session header arrived.
    heading:  Option<(StreamId, Vec<u8>)>,
+   /// The session's standard error.
    errors:   Option<Relay>,
+   /// Threads still writing to standard output and error.
    writers:  Vec<JoinHandle<()>>,
+   /// Restores the terminal when dropped.
    raw:      Option<RawMode>,
+   /// The terminal size last sent to the server.
    size:     Option<Size>,
+   /// Exit status of the remote command.
    status:   Option<u32>,
+   /// Whether the connection was closed.
    done:     bool,
 }
 
@@ -361,7 +391,7 @@ impl Client {
 
    /// Reads the stderr stream's header, then relays the rest to stderr.
    fn heading(&mut self, connection: &mut Connection) -> Result<()> {
-      let Some((stream, header)) = &mut self.heading else {
+      let Some((ref mut stream, ref mut header)) = self.heading else {
          return Ok(());
       };
 
@@ -406,7 +436,7 @@ impl Client {
          return Ok(());
       };
 
-      let (message, finished) = match drain(connection, stream) {
+      let (popped, finished) = match drain(connection, stream) {
          Ok((chunks, finished)) => {
             for bytes in chunks {
                deframer.push(&bytes);
@@ -417,8 +447,8 @@ impl Client {
          Err(error) => (Err(error), true),
       };
 
-      let message = match message {
-         Ok(Some(message)) => message,
+      let message = match popped {
+         Ok(Some(found)) => found,
          Ok(None) if !finished => return Ok(()),
          Ok(None) | Err(_) => {
             self.opening.remove(&stream);
@@ -439,11 +469,11 @@ impl Client {
 
       match message {
          Message::Forwarded { listener } => {
-            let remote = usize::try_from(listener)
+            let target = usize::try_from(listener)
                .ok()
                .and_then(|index| self.remotes.get(index));
 
-            if let Some(remote) = remote {
+            if let Some(remote) = target {
                self.forwards.dial(
                   stream,
                   (remote.host.clone(), remote.target),
@@ -491,8 +521,9 @@ impl Client {
       Ok(())
    }
 
+   /// Sends the next signed login when the authentication thread has one.
    fn login(&mut self, connection: &mut Connection) -> Result<()> {
-      let Some(attempts) = &self.attempts else {
+      let Some(ref attempts) = self.attempts else {
          return Ok(());
       };
 
@@ -564,7 +595,7 @@ impl App for Client {
                      }
                   },
                   Message::Rejected => {
-                     if let Some(next) = &self.next {
+                     if let Some(ref next) = self.next {
                         let _ = next.send(());
                      }
                   },

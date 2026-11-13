@@ -31,11 +31,11 @@ pub enum Trust {
 /// about this port, so it reports [`Trust::Unknown`].
 #[must_use]
 pub fn check(text: &str, host: &str, port: u16, key: &PublicKey) -> Trust {
-   let host = host.to_ascii_lowercase();
+   let lowered = host.to_ascii_lowercase();
 
-   match lookup(text, &name(&host, port), key) {
+   match lookup(text, &name(&lowered, port), key) {
       Trust::Unknown => {
-         match lookup(text, &host, key) {
+         match lookup(text, &lowered, key) {
             Trust::Changed => Trust::Unknown,
             other => other,
          }
@@ -50,10 +50,12 @@ pub fn entry(host: &str, port: u16, key: &PublicKey) -> String {
    format!("{} {key}\n", name(&host.to_ascii_lowercase(), port))
 }
 
+/// The `[host]:port` form that names one port of a host.
 fn name(host: &str, port: u16) -> String {
    format!("[{host}]:{port}")
 }
 
+/// What the entries for `name` say about `key`.
 fn lookup(text: &str, name: &str, key: &PublicKey) -> Trust {
    let mut trust = Trust::Unknown;
 
@@ -76,11 +78,11 @@ fn lookup(text: &str, name: &str, key: &PublicKey) -> Trust {
          continue;
       }
 
-      let Ok(listed) = listed.parse::<PublicKey>() else {
+      let Ok(parsed) = listed.parse::<PublicKey>() else {
          continue;
       };
 
-      match (marker, listed == *key) {
+      match (marker, parsed == *key) {
          ("@revoked", true) => return Trust::Revoked,
          ("@revoked", false) => {},
          (_, true) => trust = Trust::Known,
@@ -92,18 +94,19 @@ fn lookup(text: &str, name: &str, key: &PublicKey) -> Trust {
    trust
 }
 
+/// Whether a host field, hashed or a pattern list, covers `name`.
 fn matches(hosts: &str, name: &str) -> bool {
    if let Some(hashed) = hosts.strip_prefix("|1|") {
       let Some((salt, hash)) = hashed.split_once('|') else {
          return false;
       };
 
-      let (Ok(salt), Ok(hash)) = (decode(salt), decode(hash)) else {
+      let (Ok(seed), Ok(expected)) = (decode(salt), decode(hash)) else {
          return false;
       };
 
-      let key = Key::new(HMAC_SHA1_FOR_LEGACY_USE_ONLY, &salt);
-      return verify(&key, name.as_bytes(), &hash).is_ok();
+      let key = Key::new(HMAC_SHA1_FOR_LEGACY_USE_ONLY, &seed);
+      return verify(&key, name.as_bytes(), &expected).is_ok();
    }
 
    let mut matched = false;
@@ -119,11 +122,12 @@ fn matches(hosts: &str, name: &str) -> bool {
    matched
 }
 
+/// Whether `name` matches a pattern with `*` and `?`.
 fn glob(pattern: &[u8], name: &[u8]) -> bool {
    match pattern.split_first() {
       None => name.is_empty(),
-      Some((b'*', rest)) => (0..=name.len()).any(|skip| glob(rest, &name[skip..])),
-      Some((b'?', rest)) => !name.is_empty() && glob(rest, &name[1..]),
+      Some((&b'*', rest)) => (0..=name.len()).any(|skip| glob(rest, &name[skip..])),
+      Some((&b'?', rest)) => !name.is_empty() && glob(rest, &name[1..]),
       Some((literal, rest)) => name.first() == Some(literal) && glob(rest, &name[1..]),
    }
 }

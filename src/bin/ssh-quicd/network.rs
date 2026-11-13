@@ -2,7 +2,10 @@
 //! and moves session data, and it asks the monitor for anything privileged.
 
 use std::{
-   collections::HashMap,
+   collections::{
+      BTreeMap,
+      HashMap,
+   },
    io,
    net::{
       Ipv4Addr,
@@ -77,13 +80,21 @@ use crate::{
    session::Session,
 };
 
+/// How long a client may take to log in.
 const LOGIN_GRACE: Duration = Duration::from_secs(120);
+/// Login attempts allowed on one connection.
 const MAX_ATTEMPTS: u32 = 6;
+/// Sessions allowed on one connection.
 const MAX_SESSIONS: usize = 64;
+/// Remote listeners allowed on one connection.
 const MAX_LISTENERS: usize = 16;
+/// Forwarded connections allowed on one connection.
 const MAX_FORWARDS: usize = 256;
+/// Lowest port a client may ask the server to listen on.
 const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
+/// Close code for a client that broke the protocol.
 const PROTOCOL_ERROR: VarInt = VarInt::from_u32(1);
+/// Close code for a client that failed to log in.
 const AUTH_FAILED: VarInt = VarInt::from_u32(2);
 
 /// The client's address, with an IPv4 client of the IPv6 socket in IPv4 form.
@@ -95,7 +106,9 @@ fn origin(connection: &Connection) -> SocketAddr {
 /// A host key that only the monitor can sign with.
 #[derive(Debug)]
 struct RemoteKey {
+   /// Reaches the monitor, which holds the private half.
    helper: Helper,
+   /// The public half as a `SubjectPublicKeyInfo` document.
    public: Vec<u8>,
 }
 
@@ -115,6 +128,7 @@ impl SigningKey for RemoteKey {
    }
 }
 
+/// Signs through the monitor.
 #[derive(Debug)]
 struct RemoteSigner(Helper);
 
@@ -134,7 +148,9 @@ impl Signer for RemoteSigner {
 /// A login the monitor accepted. Dropping it ends the monitor's record of
 /// the login and removes the agent socket.
 struct Grant {
+   /// The number the monitor gave this login.
    id:     u64,
+   /// Reaches the monitor.
    helper: Helper,
 }
 
@@ -144,28 +160,44 @@ impl Drop for Grant {
    }
 }
 
+/// State of one client connection.
 struct Peer {
+   /// The control stream, once the client opened it.
    control:   Option<StreamId>,
+   /// Reassembles control messages from the client.
    deframer:  Deframer,
+   /// Control messages waiting for send window.
    outbox:    Outbox,
+   /// Login attempts so far.
    attempts:  u32,
+   /// The accepted login.
    grant:     Option<Grant>,
+   /// When an unauthenticated connection is closed.
    deadline:  Instant,
    /// Client streams whose opening frame has not fully arrived.
    opening:   HashMap<StreamId, Deframer>,
-   sessions:  HashMap<u32, Session>,
+   /// Running sessions by the client's number for them.
+   sessions:  BTreeMap<u32, Session>,
+   /// Every forwarded connection in progress.
    forwards:  Forwards,
-   listeners: HashMap<u32, Acceptor>,
+   /// Remote listeners by the client's number for them.
+   listeners: BTreeMap<u32, Acceptor>,
+   /// Accepts programs that want the client's SSH agent.
    agent:     Option<Acceptor>,
 }
 
+/// State of the network process.
 struct Server {
+   /// Every connection whose handshake finished.
    peers:  HashMap<ConnectionHandle, Peer>,
+   /// Reaches the monitor.
    helper: Helper,
+   /// Wakes the loop from I/O threads.
    waker:  Arc<Waker>,
 }
 
 impl Server {
+   /// Handles what arrived on the control stream.
    fn control(
       &mut self,
       now: Instant,
@@ -217,8 +249,8 @@ impl Server {
                });
             },
             Message::Resize { session, size } => {
-               if let Some(session) = peer.sessions.get(&session) {
-                  session.resize(size)?;
+               if let Some(resized) = peer.sessions.get(&session) {
+                  resized.resize(size)?;
                }
             },
             Message::Listen { listener, port } => {
@@ -236,9 +268,12 @@ impl Server {
                   .flatten();
 
                let reply = match bound {
-                  Some((acceptor, port)) => {
+                  Some((acceptor, chosen)) => {
                      peer.listeners.insert(listener, acceptor);
-                     Message::Listening { listener, port }
+                     Message::Listening {
+                        listener,
+                        port: chosen,
+                     }
                   },
                   None => Message::Refused { listener },
                };
@@ -327,6 +362,7 @@ impl Server {
       Ok(())
    }
 
+   /// Handles one connection event, failing on a protocol violation.
    fn handle(
       &mut self,
       now: Instant,
@@ -344,9 +380,9 @@ impl Server {
                grant:     None,
                deadline:  now + LOGIN_GRACE,
                opening:   HashMap::new(),
-               sessions:  HashMap::new(),
+               sessions:  BTreeMap::new(),
                forwards:  Forwards::default(),
-               listeners: HashMap::new(),
+               listeners: BTreeMap::new(),
                agent:     None,
             });
          },
@@ -454,6 +490,7 @@ impl Server {
          .min())
    }
 
+   /// Closes a connection and forgets its state.
    fn drop_peer(&mut self, now: Instant, handle: ConnectionHandle, connection: &mut Connection) {
       connection.close(now, PROTOCOL_ERROR, Bytes::from_static(b"protocol error"));
       self.peers.remove(&handle);

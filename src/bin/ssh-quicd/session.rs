@@ -47,8 +47,10 @@ use crate::privsep::{
 /// How long output may keep flowing after the command exits. A background
 /// process that inherited the terminal would otherwise hold the session open.
 const EXIT_GRACE: Duration = Duration::from_millis(200);
+/// Exit status reported when the monitor sent none.
 const NO_STATUS: u32 = 255;
 
+/// The terminal size in the form the kernel takes.
 pub const fn winsize(size: Size) -> Winsize {
    Winsize {
       ws_col:    size.columns,
@@ -60,13 +62,19 @@ pub const fn winsize(size: Size) -> Winsize {
 
 /// The network process's side of a session that the monitor started.
 pub struct Session {
+   /// Standard input and output.
    relay:    Relay,
+   /// Standard error, for a session without a terminal.
    errors:   Option<Relay>,
+   /// The terminal, kept to resize it.
    terminal: Option<OwnedFd>,
+   /// The monitor's number for the session.
    id:       u64,
+   /// Reaches the monitor.
    helper:   Helper,
    /// Yields the exit status once, as four bytes.
    exit:     Receiver<Bytes>,
+   /// Exit status and when it arrived.
    exited:   Option<(u32, Instant)>,
 }
 
@@ -101,15 +109,15 @@ impl Session {
             (input, output, None, Some(master), next()?)
          },
          4 => {
-            let (input, output, errors) = (next()?, next()?, next()?);
+            let (input, output, stderr) = (next()?, next()?, next()?);
 
             let side = connection
                .streams()
                .open(Dir::Uni)
                .context("no stream credit for stderr")?;
 
-            let errors = reader(File::from(errors), Arc::clone(waker));
-            let mut errors = Relay::new(side, Some(errors), None, Vec::new(), false);
+            let lines = reader(File::from(stderr), Arc::clone(waker));
+            let mut errors = Relay::new(side, Some(lines), None, Vec::new(), false);
             errors.prefix(label.to_be_bytes().to_vec());
 
             (input, output, Some(errors), None, next()?)
@@ -117,11 +125,11 @@ impl Session {
          _ => bail!("monitor sent an unexpected set of descriptors"),
       };
 
-      let output = reader(File::from(output), Arc::clone(waker));
-      let (input, _) = writer(File::from(input), Arc::clone(waker));
+      let outbound = reader(File::from(output), Arc::clone(waker));
+      let (inbound, _) = writer(File::from(input), Arc::clone(waker));
 
       Ok(Self {
-         relay: Relay::new(stream, Some(output), Some(input), buffered, finished),
+         relay: Relay::new(stream, Some(outbound), Some(inbound), buffered, finished),
          errors,
          terminal,
          id: spawned.session,
@@ -131,8 +139,9 @@ impl Session {
       })
    }
 
+   /// Sets the terminal's size.
    pub fn resize(&self, size: Size) -> Result<()> {
-      if let Some(terminal) = &self.terminal {
+      if let Some(ref terminal) = self.terminal {
          tcsetwinsize(terminal, winsize(size))?;
       }
 
@@ -143,7 +152,7 @@ impl Session {
    pub fn pump(&mut self, now: Instant, connection: &mut Connection) -> Result<Option<u32>> {
       self.relay.pump(connection)?;
 
-      if let Some(errors) = &mut self.errors {
+      if let Some(ref mut errors) = self.errors {
          errors.pump(connection)?;
       }
 
@@ -160,7 +169,7 @@ impl Session {
             Err(TryRecvError::Empty) => None,
          };
 
-         self.exited = status.map(|status| (status, now));
+         self.exited = status.map(|code| (code, now));
       }
 
       let Some((status, at)) = self.exited else {

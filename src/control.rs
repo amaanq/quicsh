@@ -20,19 +20,33 @@ use crate::{
    },
 };
 
+/// Largest frame either side accepts.
 const MAX_FRAME: usize = 64 << 10;
+/// Longest account name a login may carry.
 const MAX_USER: usize = 64;
+/// Tag of [`Message::Request`].
 const REQUEST: u8 = 1;
+/// Tag of [`Message::Accepted`].
 const ACCEPTED: u8 = 2;
+/// Tag of [`Message::Rejected`].
 const REJECTED: u8 = 3;
+/// Tag of [`Message::Open`].
 const OPEN: u8 = 4;
+/// Tag of [`Message::Resize`].
 const RESIZE: u8 = 5;
+/// Tag of [`Message::Exit`].
 const EXIT: u8 = 6;
+/// Tag of [`Message::Connect`].
 const CONNECT: u8 = 7;
+/// Tag of [`Message::Listen`].
 const LISTEN: u8 = 8;
+/// Tag of [`Message::Listening`].
 const LISTENING: u8 = 9;
+/// Tag of [`Message::Refused`].
 const REFUSED: u8 = 10;
+/// Tag of [`Message::Forwarded`].
 const FORWARDED: u8 = 11;
+/// Tag of [`Message::Agent`].
 const AGENT: u8 = 12;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,15 +110,18 @@ pub enum Message {
    Agent,
 }
 
+/// Appends a 32-bit number.
 fn put_u32(out: &mut Vec<u8>, value: u32) {
    out.extend_from_slice(&value.to_be_bytes());
 }
 
+/// Appends a terminal size.
 fn put_size(out: &mut Vec<u8>, size: Size) {
    put_u32(out, size.columns.into());
    put_u32(out, size.rows.into());
 }
 
+/// Reads a terminal size.
 fn size(reader: &mut Reader<'_>) -> Result<Size, Error> {
    Ok(Size {
       columns: reader.u32()?.try_into().map_err(|_| Error::Frame)?,
@@ -112,10 +129,12 @@ fn size(reader: &mut Reader<'_>) -> Result<Size, Error> {
    })
 }
 
+/// Reads a port number.
 fn port(reader: &mut Reader<'_>) -> Result<u16, Error> {
    reader.u32()?.try_into().map_err(|_| Error::Frame)
 }
 
+/// Reads a UTF-8 string.
 fn text(reader: &mut Reader<'_>) -> Result<String, Error> {
    let bytes = reader.string()?;
    Ok(str::from_utf8(bytes).map_err(|_| Error::Frame)?.to_owned())
@@ -127,8 +146,8 @@ impl Message {
    pub fn encode(&self) -> Vec<u8> {
       let mut payload = Vec::new();
 
-      match self {
-         Self::Request(request) => {
+      match *self {
+         Self::Request(ref request) => {
             payload.push(REQUEST);
             put_string(&mut payload, request.user.as_bytes());
             put_string(&mut payload, &request.key.to_blob());
@@ -136,18 +155,18 @@ impl Message {
          },
          Self::Accepted => payload.push(ACCEPTED),
          Self::Rejected => payload.push(REJECTED),
-         Self::Open(open) => {
+         Self::Open(ref open) => {
             payload.push(OPEN);
             put_u32(&mut payload, open.session);
 
             payload.push(u8::from(open.terminal.is_some()));
-            if let Some(terminal) = &open.terminal {
+            if let Some(ref terminal) = open.terminal {
                put_string(&mut payload, terminal.name.as_bytes());
                put_size(&mut payload, terminal.size);
             }
 
             payload.push(u8::from(open.command.is_some()));
-            if let Some(command) = &open.command {
+            if let Some(ref command) = open.command {
                put_string(&mut payload, command.as_bytes());
             }
 
@@ -155,36 +174,36 @@ impl Message {
          },
          Self::Resize { session, size } => {
             payload.push(RESIZE);
-            put_u32(&mut payload, *session);
-            put_size(&mut payload, *size);
+            put_u32(&mut payload, session);
+            put_size(&mut payload, size);
          },
          Self::Exit { session, status } => {
             payload.push(EXIT);
-            put_u32(&mut payload, *session);
-            put_u32(&mut payload, *status);
+            put_u32(&mut payload, session);
+            put_u32(&mut payload, status);
          },
-         Self::Connect { host, port } => {
+         Self::Connect { ref host, port } => {
             payload.push(CONNECT);
             put_string(&mut payload, host.as_bytes());
-            put_u32(&mut payload, (*port).into());
+            put_u32(&mut payload, (port).into());
          },
          Self::Listen { listener, port } => {
             payload.push(LISTEN);
-            put_u32(&mut payload, *listener);
-            put_u32(&mut payload, (*port).into());
+            put_u32(&mut payload, listener);
+            put_u32(&mut payload, port.into());
          },
          Self::Listening { listener, port } => {
             payload.push(LISTENING);
-            put_u32(&mut payload, *listener);
-            put_u32(&mut payload, (*port).into());
+            put_u32(&mut payload, listener);
+            put_u32(&mut payload, port.into());
          },
          Self::Refused { listener } => {
             payload.push(REFUSED);
-            put_u32(&mut payload, *listener);
+            put_u32(&mut payload, listener);
          },
          Self::Forwarded { listener } => {
             payload.push(FORWARDED);
-            put_u32(&mut payload, *listener);
+            put_u32(&mut payload, listener);
          },
          Self::Agent => payload.push(AGENT),
       }

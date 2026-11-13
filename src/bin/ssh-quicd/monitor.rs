@@ -106,12 +106,18 @@ use crate::{
 /// What a TLS 1.3 server signs in `CertificateVerify` (RFC 8446 section
 /// 4.4.3), up to the transcript hash.
 const TRANSCRIPT_CONTEXT: &[u8] = b"TLS 1.3, server CertificateVerify\0";
+/// Spaces that precede the context string in what the server signs.
 const TRANSCRIPT_PADDING: usize = 64;
+/// Longest transcript hash any TLS 1.3 cipher suite produces.
 const MAX_TRANSCRIPT_HASH: usize = 64;
 
+/// How the server was asked to run.
 pub struct Settings {
+   /// Address and UDP port to listen on.
    pub listen:          SocketAddr,
+   /// Path of the host private key.
    pub host_key:        PathBuf,
+   /// File that replaces every account's own `authorized_keys`.
    pub authorized_keys: Option<PathBuf>,
    /// The account the network process runs as when the monitor is root.
    pub user:            String,
@@ -120,7 +126,9 @@ pub struct Settings {
 /// The directory and socket that reach a client's SSH agent. Dropping it
 /// removes both.
 struct AgentDirectory {
+   /// The directory only the account can enter.
    directory: PathBuf,
+   /// The socket inside it.
    socket:    PathBuf,
 }
 
@@ -133,22 +141,32 @@ impl Drop for AgentDirectory {
 
 /// One successful login.
 struct Grant {
+   /// Who logged in.
    account: Account,
+   /// The agent socket, once a session asked for one.
    agent:   Option<AgentDirectory>,
 }
 
+/// State of the privileged process.
 struct Monitor {
+   /// The host key.
    key:             Arc<dyn SigningKey>,
+   /// Address the server listens on.
    listen:          SocketAddr,
+   /// The listening socket, until the network process takes it.
    listener:        Option<OwnedFd>,
+   /// File that replaces every account's own `authorized_keys`.
    authorized_keys: Option<PathBuf>,
+   /// Logins the network process may start sessions for.
    grants:          HashMap<u64, Grant>,
    /// The process group of every session that has not exited.
    sessions:        Arc<Mutex<HashMap<u64, Pid>>>,
+   /// The last grant or session number handed out.
    issued:          u64,
 }
 
 impl Monitor {
+   /// The next unused grant or session number.
    const fn issue(&mut self) -> u64 {
       self.issued += 1;
       self.issued
@@ -159,7 +177,7 @@ impl Monitor {
    fn sign(&self, message: &[u8]) -> Result<Reply> {
       let transcript = message
          .split_at_checked(TRANSCRIPT_PADDING)
-         .filter(|(padding, _)| padding.iter().all(|&byte| byte == b' '))
+         .filter(|&(padding, _)| padding.iter().all(|&byte| byte == b' '))
          .and_then(|(_, rest)| rest.strip_prefix(TRANSCRIPT_CONTEXT));
 
       ensure!(
@@ -175,6 +193,7 @@ impl Monitor {
       Ok(Reply::Signature(signer.sign(message)?))
    }
 
+   /// Checks a login against its signature and the authorized keys.
    fn login(&mut self, login: &auth::Request, exporter: &[u8; 32]) -> Result<Reply> {
       if login.verify(exporter).is_err() {
          return Ok(Reply::Denied);
@@ -207,8 +226,8 @@ impl Monitor {
 
    /// Makes the agent socket in a new directory that only the account can
    /// enter.
-   fn agent(&mut self, grant: u64) -> Result<(Reply, Vec<OwnedFd>)> {
-      let grant = self.grants.get_mut(&grant).context("unknown grant")?;
+   fn agent(&mut self, id: u64) -> Result<(Reply, Vec<OwnedFd>)> {
+      let grant = self.grants.get_mut(&id).context("unknown grant")?;
       ensure!(grant.agent.is_none(), "agent socket already exists");
 
       let mut random = [0; 8];
@@ -216,7 +235,7 @@ impl Monitor {
          .fill(&mut random)
          .map_err(|_| report!("system random source failed"))?;
 
-      let directory = env::temp_dir().join(format!("ssh-quic-{:016x}", u64::from_ne_bytes(random)));
+      let directory = env::temp_dir().join(format!("ssh-quic-{:016x}", u64::from_be_bytes(random)));
       let socket = directory.join("agent.sock");
 
       DirBuilder::new()
@@ -238,8 +257,8 @@ impl Monitor {
 
    /// Starts a session for the grant's account. The account is made owner
    /// of the terminal device, because programs such as tmux open it by path.
-   fn spawn(&mut self, grant: u64, open: &Open) -> Result<(Reply, Vec<OwnedFd>)> {
-      let grant = self.grants.get(&grant).context("unknown grant")?;
+   fn spawn(&mut self, id: u64, open: &Open) -> Result<(Reply, Vec<OwnedFd>)> {
+      let grant = self.grants.get(&id).context("unknown grant")?;
 
       let mut command = Command::new(env::current_exe()?);
       command.arg("session").arg(&grant.account.name);
@@ -248,11 +267,11 @@ impl Monitor {
          command.arg("--agent-socket").arg(&agent.socket);
       }
 
-      if let Some(text) = &open.command {
+      if let Some(ref text) = open.command {
          command.arg("--command").arg(text);
       }
 
-      let (mut child, mut descriptors) = if let Some(terminal) = &open.terminal {
+      let (mut child, mut descriptors) = if let Some(ref terminal) = open.terminal {
          let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
          let master = openpt(flags).context("opening a terminal")?;
          grantpt(&master)?;
@@ -292,8 +311,8 @@ impl Monitor {
       // and the terminal reports end of output only once they are closed.
       drop(command);
 
-      let (status, mut report) = io::pipe()?;
-      descriptors.push(status.into());
+      let (exit, mut report) = io::pipe()?;
+      descriptors.push(exit.into());
 
       let session = self.issue();
       let sessions = Arc::clone(&self.sessions);
@@ -312,8 +331,8 @@ impl Monitor {
                .unwrap_or(255)
          });
 
-         if let Ok(mut sessions) = sessions.lock() {
-            sessions.remove(&session);
+         if let Ok(mut running) = sessions.lock() {
+            running.remove(&session);
          }
 
          let _ = report.write_all(&code.to_be_bytes());
@@ -322,6 +341,7 @@ impl Monitor {
       Ok((Reply::Spawned { session }, descriptors))
    }
 
+   /// Hangs up one session, or every session for `None`.
    fn hangup(&self, session: Option<u64>) {
       let Ok(sessions) = self.sessions.lock() else {
          return;
@@ -337,6 +357,7 @@ impl Monitor {
       }
    }
 
+   /// Answers one request from the network process.
    fn handle(&mut self, request: Request) -> Result<(Reply, Vec<OwnedFd>)> {
       let plain = |reply| Ok((reply, Vec::new()));
 

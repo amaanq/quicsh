@@ -40,13 +40,17 @@ use crate::{
 };
 
 pub struct Relay {
+   /// The stream this relay serves.
    stream:    StreamId,
    /// Local input headed for the stream. `None` once the stream is finished.
    outbound:  Option<Receiver<Bytes>>,
+   /// A chunk the stream has not fully taken.
    unsent:    Option<Bytes>,
    /// Stream data headed for a local sink. `None` once the sink is closed.
    inbound:   Option<SyncSender<Bytes>>,
+   /// Stream data the sink has not taken.
    unwritten: VecDeque<Bytes>,
+   /// Whether the peer finished the stream.
    finished:  bool,
    /// Kept so that dropping the relay unblocks the thread reading the socket.
    socket:    Option<OwnedFd>,
@@ -54,7 +58,7 @@ pub struct Relay {
 
 impl Drop for Relay {
    fn drop(&mut self) {
-      if let Some(socket) = &self.socket {
+      if let Some(ref socket) = self.socket {
          let _ = shutdown(socket, Shutdown::Both);
       }
    }
@@ -163,8 +167,9 @@ impl Relay {
       self.receive(connection)
    }
 
+   /// Moves local input to the stream.
    fn send(&mut self, connection: &mut Connection) -> Result<(), Error> {
-      while let Some(outbound) = &self.outbound {
+      while let Some(ref outbound) = self.outbound {
          if self.unsent.is_none() {
             match outbound.try_recv() {
                Ok(chunk) => self.unsent = Some(chunk),
@@ -177,7 +182,7 @@ impl Relay {
             }
          }
 
-         let Some(chunk) = &mut self.unsent else {
+         let Some(ref mut chunk) = self.unsent else {
             return Ok(());
          };
 
@@ -200,8 +205,9 @@ impl Relay {
       Ok(())
    }
 
+   /// Moves stream data to the local sink.
    fn receive(&mut self, connection: &mut Connection) -> Result<(), Error> {
-      while let Some(inbound) = &self.inbound {
+      while let Some(ref inbound) = self.inbound {
          let Some(chunk) = self.unwritten.pop_front() else {
             if self.finished {
                self.inbound = None;
@@ -221,8 +227,8 @@ impl Relay {
 
          match inbound.try_send(chunk) {
             Ok(()) => {},
-            Err(TrySendError::Full(chunk)) => {
-               self.unwritten.push_front(chunk);
+            Err(TrySendError::Full(rejected)) => {
+               self.unwritten.push_front(rejected);
                return Ok(());
             },
             // The local sink closed, so the peer is told to stop sending.

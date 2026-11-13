@@ -25,10 +25,15 @@ use crate::forward::{
    Socks,
 };
 
+/// Where to connect and who to log in as.
 pub struct Login {
+   /// Account name on the server.
    pub user:     String,
+   /// Host name or address of the server.
    pub host:     String,
+   /// The server's UDP port.
    pub port:     u16,
+   /// The only key to offer, when one was named.
    pub identity: Option<PublicKey>,
 }
 
@@ -47,13 +52,13 @@ pub struct Options {
    pub terminal: bool,
    /// The server's UDP port, 22 when not given.
    #[pound(short = 'p', value_name = "PORT")]
-   port:         Option<u16>,
+   pub port:     Option<u16>,
    /// The account to log in to, the local user name when not given.
    #[pound(short = 'l', value_name = "USER")]
-   login:        Option<String>,
+   pub login:    Option<String>,
    /// Offer only the agent key whose public half is in FILE.
    #[pound(short = 'i', value_name = "FILE")]
-   identity:     Option<PathBuf>,
+   pub identity: Option<PathBuf>,
    /// Listen locally and connect each connection to HOST:HOSTPORT from the
    /// server.
    #[pound(short = 'L', value_name = "[BIND:]PORT:HOST:HOSTPORT")]
@@ -66,17 +71,19 @@ pub struct Options {
    #[pound(short = 'D', value_name = "[BIND:]PORT")]
    pub dynamic:  Vec<Socks>,
 
+   /// The server, with an optional account name.
    #[pound(value_name = "[USER@]HOST")]
-   target:      String,
+   pub target:  String,
    /// Runs in place of the login shell. Flags after HOST belong to it.
    #[pound(trailing, value_name = "COMMAND")]
    pub command: Vec<String>,
 }
 
 impl Options {
+   /// Resolves the account, host, port and identity the options name.
    pub fn login(&self) -> Result<Login> {
-      let identity = match &self.identity {
-         Some(path) => {
+      let identity = match self.identity {
+         Some(ref path) => {
             let text = fs::read_to_string(path)
                .with_context(|| format!("reading public key {}", path.display()))?;
             Some(text.parse()?)

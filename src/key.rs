@@ -31,18 +31,27 @@ use crate::{
    },
 };
 
+/// SSH name of a plain ed25519 key.
 const ED25519_NAME: &[u8] = b"ssh-ed25519";
+/// SSH name of a FIDO-backed ed25519 key.
 const SK_ED25519_NAME: &[u8] = b"sk-ssh-ed25519@openssh.com";
+/// DER bytes that precede the key in a `SubjectPublicKeyInfo` document.
 const SPKI_PREFIX: [u8; 12] = [
    0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00,
 ];
+/// DER bytes that precede the seed in a PKCS#8 document.
 const PKCS8_PREFIX: [u8; 16] = [
    0x30, 0x2E, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x04, 0x22, 0x04, 0x20,
 ];
+/// First bytes of an OpenSSH private key.
 const PRIVATE_MAGIC: &[u8] = b"openssh-key-v1\0";
+/// First line of an OpenSSH private key file.
 const PRIVATE_BEGIN: &str = "-----BEGIN OPENSSH PRIVATE KEY-----";
+/// Last line of an OpenSSH private key file.
 const PRIVATE_END: &str = "-----END OPENSSH PRIVATE KEY-----";
+/// Authenticator flag set when the user touched the key.
 const SK_USER_PRESENT: u8 = 0x01;
+/// The base64 alphabet.
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,9 +94,12 @@ impl PublicKey {
       let mut blob = Vec::new();
       put_string(&mut blob, self.name());
 
-      match self {
-         Self::Ed25519(key) => put_string(&mut blob, key),
-         Self::SkEd25519 { key, application } => {
+      match *self {
+         Self::Ed25519(ref key) => put_string(&mut blob, key),
+         Self::SkEd25519 {
+            ref key,
+            ref application,
+         } => {
             put_string(&mut blob, key);
             put_string(&mut blob, application);
          },
@@ -106,8 +118,9 @@ impl PublicKey {
       Ok(Self::Ed25519(key.try_into().map_err(|_| Error::KeyType)?))
    }
 
+   /// The SSH name of the key type.
    const fn name(&self) -> &'static [u8] {
-      match self {
+      match *self {
          Self::Ed25519(_) => ED25519_NAME,
          Self::SkEd25519 { .. } => SK_ED25519_NAME,
       }
@@ -135,9 +148,12 @@ impl PublicKey {
 
       let raw = reader.string()?;
 
-      let (key, signed) = match self {
-         Self::Ed25519(key) => (key, message.to_vec()),
-         Self::SkEd25519 { key, application } => {
+      let (key, signed) = match *self {
+         Self::Ed25519(ref key) => (key, message.to_vec()),
+         Self::SkEd25519 {
+            ref key,
+            ref application,
+         } => {
             let flags = reader.byte()?;
             let counter = reader.u32()?;
 
@@ -221,9 +237,8 @@ pub fn private_from_openssh(text: &str) -> Result<PrivatePkcs8KeyDer<'static>, E
       return Err(Error::PrivateKey);
    }
 
-   let _public = private.string()?;
-   let pair: [u8; 64] = private.array()?;
-   let pair = Zeroizing::new(pair);
+   let _repeated = private.string()?;
+   let pair = Zeroizing::new(private.array::<64>()?);
 
    let mut pkcs8 = Zeroizing::new(PKCS8_PREFIX.to_vec());
    pkcs8.extend_from_slice(&pair[..32]);
@@ -255,12 +270,12 @@ pub fn decode(text: &str) -> Result<Vec<u8>, Error> {
          .position(|&symbol| symbol == character)
          .ok_or(Error::Base64)?;
 
-      buffer = buffer << 6 | u32::try_from(value).map_err(|_| Error::Base64)?;
+      buffer = (buffer << 6) | u32::try_from(value).map_err(|_| Error::Base64)?;
       bits += 6;
 
       if bits >= 8 {
          bits -= 8;
-         out.push(u8::try_from(buffer >> bits & 0xFF).map_err(|_| Error::Base64)?);
+         out.push(u8::try_from((buffer >> bits) & 0xFF).map_err(|_| Error::Base64)?);
       }
    }
 
@@ -283,8 +298,8 @@ pub fn encode(bytes: &[u8]) -> String {
       ];
       let indices = [
          group[0] >> 2,
-         (group[0] & 0x03) << 4 | group[1] >> 4,
-         (group[1] & 0x0F) << 2 | group[2] >> 6,
+         ((group[0] & 0x03) << 4) | (group[1] >> 4),
+         ((group[1] & 0x0F) << 2) | (group[2] >> 6),
          group[2] & 0x3F,
       ];
 
