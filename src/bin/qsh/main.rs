@@ -294,11 +294,17 @@ fn authenticate(
    let files = if login.keys.is_empty() && tried.is_empty() {
       let ssh = home()?.join(".ssh");
 
-      ["id_ed25519", "id_ed25519_sk"]
-         .map(|name| ssh.join(name))
-         .into_iter()
-         .filter(|file| file.exists())
-         .collect()
+      [
+         "id_ed25519",
+         "id_ed25519_sk",
+         "id_ecdsa",
+         "id_ecdsa_sk",
+         "id_rsa",
+      ]
+      .map(|name| ssh.join(name))
+      .into_iter()
+      .filter(|file| file.exists())
+      .collect()
    } else {
       login
          .keys

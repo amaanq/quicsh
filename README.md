@@ -31,7 +31,8 @@ afford to lose :)
 - Restarting `qshd` under a terminal session. The session lives in a process
   of its own, and `qsh` reattaches with the next packet it sends, a keystroke
   or the keep-alive that goes out every 15 seconds
-- `ed25519` keys, signed through `ssh-agent` or `ssh-keygen`
+- `ed25519`, ECDSA (P-256 and P-384) and RSA keys, signed through `ssh-agent`
+  or `ssh-keygen`
 - `ed25519-sk` keys in the same way, with the PIN and the touch
 
 ## Usage
@@ -75,8 +76,8 @@ rsync -a -e qsh src/ host:dst/
 ```
 
 Keys come from `ssh-agent` when one is running. Without one, `ssh-keygen`
-signs with `~/.ssh/id_ed25519`, `~/.ssh/id_ed25519_sk` or the file you pass to
-`-i`, and it asks for the passphrase, PIN or touch itself. `qsh` never reads a
+signs with the usual `~/.ssh/id_*` files or the file you pass to `-i`, and it
+asks for the passphrase, PIN or touch itself. `qsh` never reads a
 private key file either way, so encrypted keys and FIDO keys work the same way
 plain ones do. `-i` also picks which agent key to offer, which is worth doing
 with security keys since every wrong one costs you a touch.
@@ -132,8 +133,8 @@ keys work, since they can't sign a TLS handshake directly.
 
 The key exchange is X25519MLKEM768, the hybrid of X25519 and ML-KEM-768 that
 browsers ship. Someone who records a session today can't decrypt it later
-unless both of them fall. Host keys and logins are still `ed25519`, so this
-covers recorded traffic and not a forged login.
+unless both of them fall. Host keys and logins still use classical
+signatures, so this covers recorded traffic and not a forged login.
 
 Each client gets its own UDP socket on the server. Without that, one client's
 bulk transfer sits in the same kernel queue as another client's keystrokes.
@@ -164,7 +165,9 @@ switch. I'd like to close that gap, but it isn't closed.
 - X11 forwarding.
 - Most of `ssh_config`. Only `Host`, `Match all`, `Include`, `HostName`,
   `User`, `IdentityFile` and `QshPort` are read.
-- Key types other than `ed25519` and `ed25519-sk`.
+- P-521 keys, RSA keys under 2048 bits and RSA signatures over SHA-1.
+  `ecdsa-sk` keys are accepted but nobody has tried one.
+- Host keys other than `ed25519`.
 - Some `authorized_keys` options. `command=`, `from=`, `restrict` and the
   `pty`, `agent-forwarding` and `port-forwarding` switches are enforced. A
   line with any other option, such as `expiry-time=` or `environment=`, is

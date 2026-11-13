@@ -1,5 +1,5 @@
-//! OpenSSH ed25519 keys, plain and FIDO-backed, in their text, blob and file
-//! forms.
+//! OpenSSH public keys in their text and blob forms, and the ed25519 host
+//! key file.
 
 use std::{
    fmt::{
@@ -16,7 +16,13 @@ use ring::{
       digest,
    },
    signature::{
+      ECDSA_P256_SHA256_FIXED,
+      ECDSA_P384_SHA384_FIXED,
       ED25519,
+      EcdsaVerificationAlgorithm,
+      RSA_PKCS1_2048_8192_SHA256,
+      RSA_PKCS1_2048_8192_SHA512,
+      RsaPublicKeyComponents,
       UnparsedPublicKey,
    },
 };
@@ -35,6 +41,14 @@ use crate::{
 const ED25519_NAME: &[u8] = b"ssh-ed25519";
 /// SSH name of a FIDO-backed ed25519 key.
 const SK_ED25519_NAME: &[u8] = b"sk-ssh-ed25519@openssh.com";
+/// SSH name of a FIDO-backed ECDSA key.
+const SK_ECDSA_NAME: &[u8] = b"sk-ecdsa-sha2-nistp256@openssh.com";
+/// SSH name of an RSA key.
+const RSA_NAME: &[u8] = b"ssh-rsa";
+/// SSH name of an RSA signature over SHA-256.
+const RSA_SHA256_NAME: &[u8] = b"rsa-sha2-256";
+/// SSH name of an RSA signature over SHA-512.
+const RSA_SHA512_NAME: &[u8] = b"rsa-sha2-512";
 /// DER bytes that precede the key in a `SubjectPublicKeyInfo` document.
 const SPKI_PREFIX: [u8; 12] = [
    0x30, 0x2A, 0x30, 0x05, 0x06, 0x03, 0x2B, 0x65, 0x70, 0x03, 0x21, 0x00,
@@ -54,6 +68,54 @@ const SK_USER_PRESENT: u8 = 0x01;
 /// The base64 alphabet.
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/// The NIST curve of an ECDSA key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Curve {
+   P256,
+   P384,
+}
+
+impl Curve {
+   /// The curve an SSH key type name or curve name stands for.
+   fn named(name: &[u8]) -> Option<Self> {
+      [Self::P256, Self::P384]
+         .into_iter()
+         .find(|curve| name == curve.key_name() || name == curve.name())
+   }
+
+   /// The SSH name of the curve.
+   const fn name(self) -> &'static [u8] {
+      match self {
+         Self::P256 => b"nistp256",
+         Self::P384 => b"nistp384",
+      }
+   }
+
+   /// The SSH name of a key on the curve.
+   const fn key_name(self) -> &'static [u8] {
+      match self {
+         Self::P256 => b"ecdsa-sha2-nistp256",
+         Self::P384 => b"ecdsa-sha2-nistp384",
+      }
+   }
+
+   /// Bytes in one coordinate.
+   const fn width(self) -> usize {
+      match self {
+         Self::P256 => 32,
+         Self::P384 => 48,
+      }
+   }
+
+   /// How ring checks a signature made on the curve.
+   fn algorithm(self) -> &'static EcdsaVerificationAlgorithm {
+      match self {
+         Self::P256 => &ECDSA_P256_SHA256_FIXED,
+         Self::P384 => &ECDSA_P384_SHA384_FIXED,
+      }
+   }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PublicKey {
    Ed25519([u8; 32]),
@@ -61,6 +123,21 @@ pub enum PublicKey {
    SkEd25519 {
       key:         [u8; 32],
       application: Vec<u8>,
+   },
+   /// `point` is the uncompressed public point.
+   Ecdsa {
+      curve: Curve,
+      point: Vec<u8>,
+   },
+   /// A P-256 key held by a FIDO authenticator.
+   SkEcdsa {
+      point:       Vec<u8>,
+      application: Vec<u8>,
+   },
+   /// Both numbers are big-endian, as the key file has them.
+   Rsa {
+      exponent: Vec<u8>,
+      modulus:  Vec<u8>,
    },
 }
 
@@ -71,7 +148,9 @@ impl PublicKey {
    pub fn from_blob(blob: &[u8]) -> Result<Self, Error> {
       let mut reader = Reader::new(blob);
 
-      let key = match reader.string()? {
+      let name = reader.string()?;
+
+      let key = match name {
          ED25519_NAME => Self::Ed25519(reader.array()?),
          SK_ED25519_NAME => {
             Self::SkEd25519 {
@@ -79,7 +158,34 @@ impl PublicKey {
                application: reader.string()?.to_vec(),
             }
          },
-         _ => return Err(Error::KeyType),
+         SK_ECDSA_NAME => {
+            if reader.string()? != Curve::P256.name() {
+               return Err(Error::KeyType);
+            }
+
+            Self::SkEcdsa {
+               point:       reader.string()?.to_vec(),
+               application: reader.string()?.to_vec(),
+            }
+         },
+         RSA_NAME => {
+            Self::Rsa {
+               exponent: reader.string()?.to_vec(),
+               modulus:  reader.string()?.to_vec(),
+            }
+         },
+         _ => {
+            let curve = Curve::named(name).ok_or(Error::KeyType)?;
+
+            if Curve::named(reader.string()?) != Some(curve) {
+               return Err(Error::KeyType);
+            }
+
+            Self::Ecdsa {
+               curve,
+               point: reader.string()?.to_vec(),
+            }
+         },
       };
 
       if reader.is_empty() {
@@ -103,6 +209,25 @@ impl PublicKey {
             put_string(&mut blob, key);
             put_string(&mut blob, application);
          },
+         Self::Ecdsa { curve, ref point } => {
+            put_string(&mut blob, curve.name());
+            put_string(&mut blob, point);
+         },
+         Self::SkEcdsa {
+            ref point,
+            ref application,
+         } => {
+            put_string(&mut blob, Curve::P256.name());
+            put_string(&mut blob, point);
+            put_string(&mut blob, application);
+         },
+         Self::Rsa {
+            ref exponent,
+            ref modulus,
+         } => {
+            put_string(&mut blob, exponent);
+            put_string(&mut blob, modulus);
+         },
       }
 
       blob
@@ -123,6 +248,9 @@ impl PublicKey {
       match *self {
          Self::Ed25519(_) => ED25519_NAME,
          Self::SkEd25519 { .. } => SK_ED25519_NAME,
+         Self::Ecdsa { curve, .. } => curve.key_name(),
+         Self::SkEcdsa { .. } => SK_ECDSA_NAME,
+         Self::Rsa { .. } => RSA_NAME,
       }
    }
 
@@ -141,18 +269,26 @@ impl PublicKey {
    /// FIDO user-presence flag, or does not verify.
    pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), Error> {
       let mut reader = Reader::new(signature);
+      let algorithm = reader.string()?;
+      let raw = reader.string()?;
 
-      if reader.string()? != self.name() {
+      let named = match *self {
+         Self::Rsa { .. } => algorithm == RSA_SHA512_NAME || algorithm == RSA_SHA256_NAME,
+         Self::Ed25519(_) | Self::SkEd25519 { .. } | Self::Ecdsa { .. } | Self::SkEcdsa { .. } => {
+            algorithm == self.name()
+         },
+      };
+
+      if !named {
          return Err(Error::Signature);
       }
 
-      let raw = reader.string()?;
-
-      let (key, signed) = match *self {
-         Self::Ed25519(ref key) => (key, message.to_vec()),
+      let signed = match *self {
          Self::SkEd25519 {
-            ref key,
-            ref application,
+            ref application, ..
+         }
+         | Self::SkEcdsa {
+            ref application, ..
          } => {
             let flags = reader.byte()?;
             let counter = reader.u32()?;
@@ -163,22 +299,83 @@ impl PublicKey {
 
             // OpenSSH PROTOCOL.u2f fixes this layout for what the authenticator
             // signs.
-            let mut signed = digest(&SHA256, application).as_ref().to_vec();
-            signed.push(flags);
-            signed.extend_from_slice(&counter.to_be_bytes());
-            signed.extend_from_slice(digest(&SHA256, message).as_ref());
-
-            (key, signed)
+            let mut framed = digest(&SHA256, application).as_ref().to_vec();
+            framed.push(flags);
+            framed.extend_from_slice(&counter.to_be_bytes());
+            framed.extend_from_slice(digest(&SHA256, message).as_ref());
+            framed
          },
+         Self::Ed25519(_) | Self::Ecdsa { .. } | Self::Rsa { .. } => message.to_vec(),
       };
 
       if !reader.is_empty() {
          return Err(Error::Signature);
       }
 
-      UnparsedPublicKey::new(&ED25519, key)
-         .verify(&signed, raw)
-         .map_err(|_| Error::Signature)
+      let checked = match *self {
+         Self::Ed25519(ref key) | Self::SkEd25519 { ref key, .. } => {
+            UnparsedPublicKey::new(&ED25519, key).verify(&signed, raw)
+         },
+         Self::Ecdsa { curve, ref point } => {
+            UnparsedPublicKey::new(curve.algorithm(), point)
+               .verify(&signed, &fixed(raw, curve.width())?)
+         },
+         Self::SkEcdsa { ref point, .. } => {
+            UnparsedPublicKey::new(Curve::P256.algorithm(), point)
+               .verify(&signed, &fixed(raw, Curve::P256.width())?)
+         },
+         Self::Rsa {
+            ref exponent,
+            ref modulus,
+         } => {
+            let parameters = if algorithm == RSA_SHA512_NAME {
+               &RSA_PKCS1_2048_8192_SHA512
+            } else {
+               &RSA_PKCS1_2048_8192_SHA256
+            };
+
+            let components = RsaPublicKeyComponents {
+               n: unsigned(modulus),
+               e: unsigned(exponent),
+            };
+
+            // ring wants a signature as long as the modulus, and some signers
+            // drop its leading zero bytes.
+            let mut padded = vec![0; components.n.len().saturating_sub(raw.len())];
+            padded.extend_from_slice(raw);
+
+            components.verify(parameters, &signed, &padded)
+         },
+      };
+
+      checked.map_err(|_| Error::Signature)
+   }
+}
+
+/// A big-endian number without the zero bytes SSH puts in front of it.
+fn unsigned(number: &[u8]) -> &[u8] {
+   let zeros = number.iter().take_while(|&&byte| byte == 0).count();
+   number.get(zeros..).unwrap_or_default()
+}
+
+/// Turns the two numbers of an SSH ECDSA signature into the fixed-width
+/// form ring verifies.
+fn fixed(raw: &[u8], width: usize) -> Result<Vec<u8>, Error> {
+   let mut reader = Reader::new(raw);
+   let mut joined = Vec::with_capacity(width * 2);
+
+   for _ in 0..2 {
+      let number = unsigned(reader.string()?);
+      let padding = width.checked_sub(number.len()).ok_or(Error::Signature)?;
+
+      joined.resize(joined.len() + padding, 0);
+      joined.extend_from_slice(number);
+   }
+
+   if reader.is_empty() {
+      Ok(joined)
+   } else {
+      Err(Error::Signature)
    }
 }
 

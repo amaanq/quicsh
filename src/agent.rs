@@ -29,6 +29,8 @@ const IDENTITIES_ANSWER: u8 = 12;
 const SIGN_REQUEST: u8 = 13;
 /// Reply type that carries a signature.
 const SIGN_RESPONSE: u8 = 14;
+/// Sign flag that asks for an RSA signature over SHA-512.
+const RSA_SHA2_512: u32 = 4;
 /// Largest reply the client accepts from the agent.
 const MAX_REPLY: usize = 256 << 10;
 
@@ -82,7 +84,15 @@ impl Agent {
       let mut request = vec![SIGN_REQUEST];
       put_string(&mut request, &key.to_blob());
       put_string(&mut request, data);
-      request.extend_from_slice(&0_u32.to_be_bytes());
+
+      // Without the flag an agent signs RSA over SHA-1, which nothing here
+      // accepts.
+      let flags = if matches!(*key, PublicKey::Rsa { .. }) {
+         RSA_SHA2_512
+      } else {
+         0
+      };
+      request.extend_from_slice(&flags.to_be_bytes());
 
       let reply = self.call(&request, SIGN_RESPONSE)?;
       Ok(Reader::new(&reply).string()?.to_vec())
