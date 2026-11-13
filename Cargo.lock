@@ -244,6 +244,7 @@ name = "quicsh"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "flub",
  "knell",
  "misstep",
  "pound",
@@ -252,7 +253,6 @@ dependencies = [
  "ring",
  "rustix",
  "rustls",
- "thiserror",
  "zeroize",
 ]
 

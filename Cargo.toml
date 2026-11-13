@@ -10,6 +10,7 @@ categories  = [ "command-line-utilities", "network-programming" ]
 
 [dependencies]
 bytes       = "1.12.1"
+flub        = "0.1.0"
 knell       = "1.0.1"
 misstep     = { version = "0.4.1", features = [ "pretty" ] }
 pound       = "0.6.1"
@@ -21,7 +22,6 @@ rustix      = {
   features = [ "event", "net", "process", "pty", "termios", "thread", "time" ]
 }
 rustls      = { version = "0.23.46", default-features = false, features = [ "ring", "std" ] }
-thiserror   = "2.0.21"
 zeroize     = "1.9.1"
 
 [lints.clippy]

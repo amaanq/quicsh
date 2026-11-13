@@ -1,5 +1,6 @@
 use std::io;
 
+use flub::Error;
 use quinn_proto::{
    ConfigError,
    ConnectError,
@@ -7,7 +8,6 @@ use quinn_proto::{
    WriteError,
    crypto::rustls::NoInitialCipherSuite,
 };
-use thiserror::Error;
 
 #[derive(Debug, Error)]
 #[non_exhaustive]
