@@ -70,7 +70,7 @@ impl Tail {
 
    /// How many of the bytes after the first `received` are no longer kept.
    #[must_use]
-   #[allow(
+   #[expect(
       clippy::missing_const_for_fn,
       reason = "VecDeque::len is const from Rust 1.101, and stable 1.100 rejects it"
    )]
