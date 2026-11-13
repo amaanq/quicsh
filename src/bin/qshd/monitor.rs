@@ -13,6 +13,7 @@ use std::{
       self,
       Write as _,
    },
+   mem,
    net::{
       IpAddr,
       SocketAddr,
@@ -42,6 +43,10 @@ use std::{
       Mutex,
    },
    thread,
+   time::{
+      SystemTime,
+      UNIX_EPOCH,
+   },
 };
 
 use knell::{
@@ -60,6 +65,7 @@ use quicsh::{
    auth::{
       self,
       Account,
+      Attempt,
       Permit,
    },
    control::{
@@ -235,9 +241,9 @@ impl Monitor {
       exporter: &[u8; 32],
       remote: IpAddr,
    ) -> Result<Reply> {
-      if login.verify(exporter).is_err() {
+      let Ok(presence) = login.verify(exporter) else {
          return Ok(Reply::Denied);
-      }
+      };
 
       let Some(account) = Account::lookup(&login.user)? else {
          return Ok(Reply::Denied);
@@ -253,14 +259,24 @@ impl Monitor {
 
       let keys_file = self.authorized_keys.as_deref();
 
-      let Some(permit) = account.authorizes(&login.key, keys_file, remote)? else {
+      // A clock that cannot be read makes every `expiry-time` count as past.
+      let attempt = Attempt {
+         remote,
+         presence,
+         now: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(u64::MAX, |since| since.as_secs()),
+      };
+
+      let Some(mut permit) = account.authorizes(&login.key, keys_file, &attempt)? else {
          return Ok(Reply::Denied);
       };
 
+      // The network process is the one that opens and accepts forwards.
       let reply = Reply::Granted {
          grant:      self.issue(),
          agent:      permit.agent,
-         forwarding: permit.forwarding,
+         forwarding: mem::take(&mut permit.forwarding),
       };
 
       if let Reply::Granted { grant, .. } = reply {

@@ -65,6 +65,8 @@ const PRIVATE_BEGIN: &str = "-----BEGIN OPENSSH PRIVATE KEY-----";
 const PRIVATE_END: &str = "-----END OPENSSH PRIVATE KEY-----";
 /// Authenticator flag set when the user touched the key.
 const SK_USER_PRESENT: u8 = 0x01;
+/// Authenticator flag set when the user gave a PIN or a fingerprint.
+const SK_USER_VERIFIED: u8 = 0x04;
 /// The base64 alphabet.
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -114,6 +116,16 @@ impl Curve {
          Self::P384 => &ECDSA_P384_SHA384_FIXED,
       }
    }
+}
+
+/// What a signature says about the person at the key. Only a FIDO
+/// authenticator reports this, and other keys count as both.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Presence {
+   /// Someone touched the authenticator.
+   pub touched:  bool,
+   /// The authenticator checked a PIN or a fingerprint.
+   pub verified: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -265,9 +277,9 @@ impl PublicKey {
    ///
    /// # Errors
    ///
-   /// Fails when the blob is malformed, names another key type, lacks the
-   /// FIDO user-presence flag, or does not verify.
-   pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<(), Error> {
+   /// Fails when the blob is malformed, names another key type, or does not
+   /// verify.
+   pub fn verify(&self, message: &[u8], signature: &[u8]) -> Result<Presence, Error> {
       let mut reader = Reader::new(signature);
       let algorithm = reader.string()?;
       let raw = reader.string()?;
@@ -283,6 +295,11 @@ impl PublicKey {
          return Err(Error::Signature);
       }
 
+      let mut presence = Presence {
+         touched:  true,
+         verified: true,
+      };
+
       let signed = match *self {
          Self::SkEd25519 {
             ref application, ..
@@ -293,9 +310,10 @@ impl PublicKey {
             let flags = reader.byte()?;
             let counter = reader.u32()?;
 
-            if flags & SK_USER_PRESENT == 0 {
-               return Err(Error::Signature);
-            }
+            presence = Presence {
+               touched:  flags & SK_USER_PRESENT != 0,
+               verified: flags & SK_USER_VERIFIED != 0,
+            };
 
             // OpenSSH PROTOCOL.u2f fixes this layout for what the authenticator
             // signs.
@@ -348,7 +366,7 @@ impl PublicKey {
          },
       };
 
-      checked.map_err(|_| Error::Signature)
+      checked.map(|()| presence).map_err(|_| Error::Signature)
    }
 }
 
@@ -612,7 +630,13 @@ mod tests {
          blob
       };
 
-      assert!(key.verify(b"message", &blob(1)).is_ok(), "touched");
-      assert!(key.verify(b"message", &blob(0)).is_err(), "not touched");
+      let touched = key.verify(b"message", &blob(1)).unwrap();
+      let verified = key.verify(b"message", &blob(4)).unwrap();
+
+      assert!(touched.touched && !touched.verified, "touched");
+      assert!(
+         !verified.touched && verified.verified,
+         "verified without a touch"
+      );
    }
 }

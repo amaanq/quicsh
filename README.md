@@ -120,11 +120,11 @@ server tell old clients their connection is gone. Whoever steals it can cut
 connections they can observe until the next reboot, and that's all it's good
 for.
 
-Two `authorized_keys` options lean on that unprivileged process. `from=` is
+A few `authorized_keys` options lean on that unprivileged process. `from=` is
 checked by the root half against the client address the other half reports,
-and `no-port-forwarding` is enforced where forwarded connections are opened.
-Someone who took over the network process could get around both, though
-they'd still need the private key to log in.
+and `no-port-forwarding`, `permitopen=` and `permitlisten=` are enforced where
+forwarded connections are opened. Someone who took over the network process
+could get around those, though they'd still need the private key to log in.
 
 Each terminal session gets a third process that runs as the account, owns the
 terminal and keeps recent output. The server talks to it over a socket in a
@@ -183,11 +183,14 @@ batch into real packets there, and I haven't measured it between two machines.
 - P-521 keys, RSA keys under 2048 bits and RSA signatures over SHA-1.
   `ecdsa-sk` keys are accepted but nobody has tried one.
 - Host keys other than `ed25519`.
-- Some `authorized_keys` options. `command=`, `from=`, `restrict` and the
-  `pty`, `agent-forwarding` and `port-forwarding` switches are enforced. A
-  line with any other option, such as `expiry-time=` or `environment=`, is
+- A few `authorized_keys` options. `command=`, `from=`, `expiry-time=`,
+  `permitopen=`, `permitlisten=`, `restrict`, `no-touch-required`,
+  `verify-required` and the `pty`, `agent-forwarding` and `port-forwarding`
+  switches are enforced. `environment=` is ignored, as `sshd` does by default.
+  A line with any other option, such as `cert-authority` or `tunnel=`, is
   skipped instead of being honored without its restriction. `from=` matches
-  addresses and networks and never host names.
+  addresses and networks and never host names. An `expiry-time=` without a
+  `Z` ends up to a day early, since `qshd` doesn't know your time zone.
 - Restarts for anything but terminal sessions. Remote commands on pipes and
   open forwarded connections end with the server.
 - Anything but Linux.

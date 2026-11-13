@@ -29,7 +29,10 @@ use misstep::{
    bail,
 };
 use quicsh::{
-   auth::exporter,
+   auth::{
+      Forwarding,
+      exporter,
+   },
    control::{
       Deframer,
       Message,
@@ -158,8 +161,8 @@ struct Grant {
    id:         u64,
    /// Whether the key may forward its agent.
    agent:      bool,
-   /// Whether the key may forward ports.
-   forwarding: bool,
+   /// Which ports the key may forward.
+   forwarding: Forwarding,
    /// Reaches the monitor.
    helper:     Helper,
 }
@@ -278,7 +281,7 @@ impl Server {
                };
 
                // The listener is reachable from this host only.
-               let allowed = grant.forwarding
+               let allowed = grant.forwarding.permits_listen(port)
                   && (port == 0 || port >= FIRST_UNPRIVILEGED_PORT)
                   && peer.listeners.len() < MAX_LISTENERS
                   && !peer.listeners.contains_key(&listener);
@@ -384,7 +387,7 @@ impl Server {
          .get_mut(&handle)
          .context("stream on an unknown connection")?;
       let granted = peer.grant.as_ref().context("stream before login")?;
-      let (grant, forwarding) = (granted.id, granted.forwarding);
+      let grant = granted.id;
 
       let Some(deframer) = peer.opening.get_mut(&stream) else {
          return Ok(());
@@ -447,7 +450,12 @@ impl Server {
             }
          },
          Message::Associate { host, port } => {
-            if !forwarding || peer.forwards.len() >= MAX_FORWARDS {
+            let permitted = peer
+               .grant
+               .as_ref()
+               .is_some_and(|login| login.forwarding.permits_open(&host, port));
+
+            if !permitted || peer.forwards.len() >= MAX_FORWARDS {
                Relay::abort(connection, stream);
                return Ok(());
             }
@@ -457,7 +465,12 @@ impl Server {
                .associate(stream, (host, port), (buffered, finished), &self.waker);
          },
          Message::Connect { host, port } => {
-            if !forwarding || peer.forwards.len() >= MAX_FORWARDS {
+            let permitted = peer
+               .grant
+               .as_ref()
+               .is_some_and(|login| login.forwarding.permits_open(&host, port));
+
+            if !permitted || peer.forwards.len() >= MAX_FORWARDS {
                Relay::abort(connection, stream);
                return Ok(());
             }

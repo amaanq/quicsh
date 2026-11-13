@@ -35,7 +35,10 @@ use misstep::{
    report,
 };
 use quicsh::{
-   auth,
+   auth::{
+      self,
+      Forwarding,
+   },
    control::{
       Message,
       Open,
@@ -178,8 +181,8 @@ pub enum Reply {
       grant:      u64,
       /// Whether the key may forward its agent.
       agent:      bool,
-      /// Whether the key may forward ports.
-      forwarding: bool,
+      /// Which ports the key may forward.
+      forwarding: Forwarding,
    },
    /// The login was refused.
    Denied,
@@ -198,6 +201,28 @@ pub enum Reply {
    Done,
    /// The request failed, with the reason.
    Failed(String),
+}
+
+/// Appends a count and that many strings.
+fn put_list(out: &mut Vec<u8>, items: &[String]) {
+   let count = u32::try_from(items.len()).unwrap_or(u32::MAX);
+   out.extend_from_slice(&count.to_be_bytes());
+
+   for item in items {
+      put_string(out, item.as_bytes());
+   }
+}
+
+/// Reads what [`put_list`] wrote.
+fn list(reader: &mut Reader<'_>) -> Result<Vec<String>, Error> {
+   let mut items = Vec::new();
+
+   for _ in 0..reader.u32()? {
+      let item = str::from_utf8(reader.string()?).map_err(|_| Error::Frame)?;
+      items.push(item.to_owned());
+   }
+
+   Ok(items)
 }
 
 /// Appends a 64-bit number.
@@ -367,11 +392,13 @@ impl Reply {
          Self::Granted {
             grant,
             agent,
-            forwarding,
+            ref forwarding,
          } => {
             out.push(GRANTED);
             put_u64(&mut out, grant);
-            out.extend_from_slice(&[u8::from(agent), u8::from(forwarding)]);
+            out.extend_from_slice(&[u8::from(agent), u8::from(forwarding.allowed)]);
+            put_list(&mut out, &forwarding.targets);
+            put_list(&mut out, &forwarding.ports);
          },
          Self::Denied => out.push(DENIED),
          Self::Spawned { session } => {
@@ -409,7 +436,11 @@ impl Reply {
             Self::Granted {
                grant:      u64_from(&mut reader)?,
                agent:      reader.byte()? != 0,
-               forwarding: reader.byte()? != 0,
+               forwarding: Forwarding {
+                  allowed: reader.byte()? != 0,
+                  targets: list(&mut reader)?,
+                  ports:   list(&mut reader)?,
+               },
             }
          },
          DENIED => Self::Denied,
