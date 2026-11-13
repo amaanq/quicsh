@@ -519,22 +519,27 @@ impl Holder {
    }
 
    /// Sends queued packets until the link would block.
-   fn flush(&mut self, now: Instant) {
+   fn flush(&mut self) {
       while let (Some(link), Some(packet)) = (self.link.as_ref(), self.outbox.front()) {
          match send(link, packet, SendFlags::NOSIGNAL | SendFlags::DONTWAIT) {
             Ok(_) => {
                self.outbox.pop_front();
             },
             Err(Errno::WOULDBLOCK) => return,
-            Err(_) => self.detach(now),
+            // A network process that hung up closed the link right after
+            // saying so, and that packet is still to be read.
+            Err(_) => {
+               self.attached = false;
+               self.outbox.clear();
+            },
          }
       }
    }
 
    /// Queues a packet for the link.
-   fn push(&mut self, now: Instant, packet: &Packet) {
+   fn push(&mut self, packet: &Packet) {
       self.outbox.push_back(packet.encode().into());
-      self.flush(now);
+      self.flush();
    }
 
    /// Hands a program that wants the SSH agent to the link. Without a link
@@ -568,7 +573,7 @@ impl Holder {
 
    /// Answers a link that asked for output with the counts it needs and the
    /// output its client lacks.
-   fn attach(&mut self, now: Instant, received: u64, errors: u64) {
+   fn attach(&mut self, received: u64, errors: u64) {
       self.attached = true;
       self.told = self.written;
 
@@ -591,7 +596,7 @@ impl Holder {
       }
 
       self.outbox.extend(packets.into_iter().map(Bytes::from));
-      self.flush(now);
+      self.flush();
    }
 
    /// Handles everything the link sent. Breaks when the client hung up.
@@ -604,7 +609,7 @@ impl Holder {
          };
 
          match packet {
-            Some(Packet::Attach { received, errors }) => self.attach(now, received, errors),
+            Some(Packet::Attach { received, errors }) => self.attach(received, errors),
             Some(Packet::Data(bytes)) => {
                self.taken += bytes.len() as u64;
                self.queue.push_back(bytes);
@@ -641,7 +646,7 @@ impl Holder {
    /// Gives queued input to the session and tells the link how far it got.
    /// Input for a session that closed its end counts as accepted, so that
    /// the sender never waits for it.
-   fn feed(&mut self, now: Instant) {
+   fn feed(&mut self) {
       while let (Some(input), Some(chunk)) = (self.input.as_ref(), self.queue.front_mut()) {
          match write(input, chunk) {
             Ok(count) => {
@@ -668,13 +673,13 @@ impl Holder {
 
       if self.attached && self.written != self.told && due {
          self.told = self.written;
-         self.push(now, &Packet::Written(self.written));
+         self.push(&Packet::Written(self.written));
       }
    }
 
    /// Reads one chunk of `stream`, keeps it and passes it to the link. An
    /// `overdue` stream with nothing to read has ended.
-   fn collect(&mut self, now: Instant, stream: Stream, overdue: bool, buffer: &mut [u8]) {
+   fn collect(&mut self, stream: Stream, overdue: bool, buffer: &mut [u8]) {
       let (tag, chosen) = match stream {
          Stream::Output => (DATA, Some(&mut self.output)),
          Stream::Errors => (ERRORS, self.errors.as_mut()),
@@ -694,7 +699,7 @@ impl Holder {
 
             if self.attached {
                self.outbox.push_back(packet);
-               self.flush(now);
+               self.flush();
             }
          },
          Err(Errno::WOULDBLOCK) => flow.ended = overdue,
@@ -818,7 +823,7 @@ impl Holder {
          && !self.reported
       {
          self.reported = true;
-         self.push(now, &Packet::Exit(status));
+         self.push(&Packet::Exit(status));
       }
 
       if self.link.is_none() && now >= self.detached + DETACH_LIMIT {
@@ -844,8 +849,8 @@ impl Holder {
             return Ok(ControlFlow::Break(()));
          }
 
-         self.flush(now);
-         self.feed(now);
+         self.flush();
+         self.feed();
       }
 
       if !ready.status.is_empty() {
@@ -856,7 +861,7 @@ impl Holder {
       }
 
       if !ready.input.is_empty() {
-         self.feed(now);
+         self.feed();
       }
 
       // A background process that inherited the output may hold it open
@@ -868,7 +873,7 @@ impl Holder {
          (Stream::Errors, ready.errors),
       ] {
          if reading && (overdue || !flags.is_empty()) {
-            self.collect(now, stream, overdue, buffer);
+            self.collect(stream, overdue, buffer);
          }
       }
 
