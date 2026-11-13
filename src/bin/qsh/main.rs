@@ -7,6 +7,7 @@ use std::{
    env,
    fs::{
       self,
+      DirBuilder,
       File,
       OpenOptions,
    },
@@ -23,7 +24,10 @@ use std::{
          OwnedFd,
       },
       unix::{
-         fs::OpenOptionsExt as _,
+         fs::{
+            DirBuilderExt as _,
+            OpenOptionsExt as _,
+         },
          net::UnixStream,
       },
    },
@@ -212,6 +216,12 @@ fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
    if answer.trim() != "yes" {
       bail!("host key not accepted");
    }
+
+   DirBuilder::new()
+      .recursive(true)
+      .mode(0o700)
+      .create(&ssh)
+      .with_context(|| format!("creating {}", ssh.display()))?;
 
    let mut file = OpenOptions::new()
       .append(true)
