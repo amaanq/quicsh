@@ -5,9 +5,9 @@
 //!   evaluated.
 //! - `HostName`, `User`, `IdentityFile`, `IdentityAgent`, `ProxyJump`,
 //!   `ForwardAgent`, the three forward keywords, `ClearAllForwardings`,
-//!   `RequestTTY`, `RemoteCommand`, `StrictHostKeyChecking` and `HostKeyAlias`.
-//!   `Port` is ignored, because it names sshd's TCP port and says nothing about
-//!   the UDP port.
+//!   `RequestTTY`, `RemoteCommand`, `StrictHostKeyChecking`, `HostKeyAlias`,
+//!   `ControlMaster`, `ControlPath` and `ControlPersist`. `Port` is ignored,
+//!   because it names sshd's TCP port and says nothing about the UDP port.
 //! - `QshPort` for the UDP port, which OpenSSH skips once the file says
 //!   `IgnoreUnknown QshPort`.
 //! - As in OpenSSH, the first value found for a keyword wins and identity files
@@ -31,35 +31,41 @@ const MAX_DEPTH: usize = 16;
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Host {
    /// The name to connect to in place of the one given.
-   pub hostname:       Option<String>,
+   pub hostname:        Option<String>,
    /// The account to log in to.
-   pub user:           Option<String>,
+   pub user:            Option<String>,
    /// The UDP port as written, which the caller parses.
-   pub port:           Option<String>,
+   pub port:            Option<String>,
    /// Private key files to log in with, in order.
-   pub identity_files: Vec<PathBuf>,
+   pub identity_files:  Vec<PathBuf>,
    /// The hosts to connect through, as written.
-   pub jump:           Option<String>,
+   pub jump:            Option<String>,
    /// `IdentityAgent`, as written.
-   pub agent:          Option<String>,
+   pub agent:           Option<String>,
    /// `ForwardAgent`, as written.
-   pub forward_agent:  Option<String>,
+   pub forward_agent:   Option<String>,
    /// Every `LocalForward`, as written.
-   pub locals:         Vec<String>,
+   pub locals:          Vec<String>,
    /// Every `RemoteForward`, as written.
-   pub remotes:        Vec<String>,
+   pub remotes:         Vec<String>,
    /// Every `DynamicForward`, as written.
-   pub dynamics:       Vec<String>,
+   pub dynamics:        Vec<String>,
    /// `ClearAllForwardings`, as written.
-   pub clear:          Option<String>,
+   pub clear:           Option<String>,
    /// `RequestTTY`, as written.
-   pub terminal:       Option<String>,
+   pub terminal:        Option<String>,
    /// `RemoteCommand`, as written.
-   pub command:        Option<String>,
+   pub command:         Option<String>,
    /// `StrictHostKeyChecking`, as written.
-   pub strict:         Option<String>,
+   pub strict:          Option<String>,
    /// The name to look the host key up under.
-   pub alias:          Option<String>,
+   pub alias:           Option<String>,
+   /// `ControlMaster`, as written.
+   pub control_master:  Option<String>,
+   /// `ControlPath`, as written.
+   pub control_path:    Option<String>,
+   /// `ControlPersist`, as written.
+   pub control_persist: Option<String>,
 }
 
 /// Replaces a leading `~/` with the home directory.
@@ -134,6 +140,9 @@ impl Host {
             "remotecommand" => Some(&mut self.command),
             "stricthostkeychecking" => Some(&mut self.strict),
             "hostkeyalias" => Some(&mut self.alias),
+            "controlmaster" => Some(&mut self.control_master),
+            "controlpath" => Some(&mut self.control_path),
+            "controlpersist" => Some(&mut self.control_persist),
             _ => None,
          };
 

@@ -46,6 +46,7 @@ use quinn_proto::{
    Connection,
    Dir,
    StreamId,
+   VarInt,
 };
 use rustix::{
    net::{
@@ -349,6 +350,18 @@ impl Session {
          self.told = written;
          written
       })
+   }
+
+   /// Ends the session's streams for a client that is done with it. A
+   /// connection that goes on would otherwise keep them.
+   pub fn close(self, connection: &mut Connection) {
+      Relay::abort(connection, self.relay.stream());
+
+      if let Some(ref errors) = self.errors {
+         let _ = connection
+            .send_stream(errors.stream())
+            .reset(VarInt::from_u32(0));
+      }
    }
 
    /// Lets the session go on after this side is dropped, for a client that

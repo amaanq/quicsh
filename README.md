@@ -37,6 +37,11 @@ afford to lose :)
   or the keep-alive that goes out every 15 seconds
 - `qsh -N` reconnects after an outage or a restart too, and its `-L`, `-R` and
   `-D` listeners work again
+- Connection sharing with `ControlMaster`, `ControlPath` and `ControlPersist`,
+  or `-S`. The first `qsh` leaves one in the background that holds the
+  connection, and later runs, `rsync`, `scp` and `sftp` included, go through
+  it without a handshake or a login. `qsh -O check` and `qsh -O exit` talk to
+  it
 - `ed25519`, ECDSA (P-256, P-384 and P-521) and RSA keys, signed through
   `ssh-agent` or `ssh-keygen`
 - `ed25519-sk` keys in the same way, with the PIN and the touch
@@ -138,6 +143,13 @@ session outlives both a lost connection and a restarted server. That process
 waits an hour for a client that vanished without closing the connection, so
 a command whose client was killed stays around that long.
 
+A shared connection is a logged-in connection that anything running as you
+can open sessions on, for as long as `ControlPersist` says, with no PIN and no
+touch. That's what the feature is for, and it's also what a security key's
+touch was protecting. `qsh` reads the same `ControlPath` line as `ssh` and puts
+`.qsh` after the name, so the two never share a socket. `-S none` turns it off
+for one run.
+
 Login doesn't use TLS client certificates. The client signs a value derived
 from the TLS handshake with its SSH key and sends that on the first stream. A
 signature is only good for one connection to one host key, and it uses the
@@ -188,9 +200,11 @@ batch into real packets there, and I haven't measured it between two machines.
 - Most of `ssh_config`. Only `Host`, `Match all`, `Include`, `HostName`,
   `User`, `IdentityFile`, `IdentityAgent`, `ProxyJump`, `ForwardAgent`,
   `LocalForward`, `RemoteForward`, `DynamicForward`, `ClearAllForwardings`,
-  `RequestTTY`, `RemoteCommand`, `StrictHostKeyChecking`, `HostKeyAlias` and
-  `QshPort` are read. `StrictHostKeyChecking no` behaves like `accept-new`,
-  so a changed host key is always refused.
+  `RequestTTY`, `RemoteCommand`, `StrictHostKeyChecking`, `HostKeyAlias`,
+  `ControlMaster`, `ControlPath`, `ControlPersist` and `QshPort` are read.
+  `ControlPath` takes `%h`, `%n`, `%p`, `%r`, `%u`, `%i` and `%C`, and `%C`
+  is not the hash `ssh` computes. `StrictHostKeyChecking no` behaves like
+  `accept-new`, so a changed host key is always refused.
 - RSA keys under 2048 bits and RSA signatures over SHA-1.
   `ecdsa-sk` keys are accepted but nobody has tried one.
 - RSA and P-521 host keys. `qshd` takes an `ed25519`, P-256 or P-384 key.
@@ -212,13 +226,13 @@ batch into real packets there, and I haven't measured it between two machines.
 nix build
 ```
 
-Or with a nightly toolchain,
+Or with a Rust toolchain,
 
 ```sh
 cargo build --release
 ```
 
-`nix develop` gives you that toolchain.
+`nix develop` gives you a toolchain.
 
 ## License
 

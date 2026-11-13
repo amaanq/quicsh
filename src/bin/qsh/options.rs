@@ -6,16 +6,19 @@
 
 use std::{
    env,
+   fmt::Write as _,
    fs,
    path::{
       Path,
       PathBuf,
    },
+   time::Duration,
 };
 
 use misstep::{
    Result,
    ResultExt as _,
+   bail,
 };
 use quicsh::{
    DEFAULT_PORT,
@@ -26,6 +29,11 @@ use quicsh::{
    key::PublicKey,
    transport::Congestion,
 };
+use ring::digest::{
+   SHA256,
+   digest,
+};
+use rustix::process::getuid;
 
 use crate::forward::{
    Fixed,
@@ -37,21 +45,34 @@ use crate::forward::{
 #[derive(Clone)]
 pub struct Login {
    /// Account name on the server.
-   pub user:   String,
+   pub user:    String,
    /// Host name or address of the server.
-   pub host:   String,
+   pub host:    String,
    /// The server's UDP port.
-   pub port:   u16,
+   pub port:    u16,
    /// The only keys to offer, when any were named.
-   pub keys:   Vec<Identity>,
+   pub keys:    Vec<Identity>,
    /// The hosts to connect through, the nearest first.
-   pub jump:   Option<String>,
+   pub jump:    Option<String>,
    /// Socket of the SSH agent, when there is one to use.
-   pub agent:  Option<PathBuf>,
+   pub agent:   Option<PathBuf>,
    /// What to do about a host key nobody vouched for yet.
-   pub strict: Strict,
+   pub strict:  Strict,
    /// The name to look the host key up under, in place of the host's.
-   pub alias:  Option<String>,
+   pub alias:   Option<String>,
+   /// The connection to share, when the configuration names a socket.
+   pub control: Option<Control>,
+}
+
+/// How a connection is shared with other runs of this program.
+#[derive(Clone)]
+pub struct Control {
+   /// The socket of the `qsh` that holds the connection.
+   pub path:    PathBuf,
+   /// Whether to start that `qsh` when none listens.
+   pub create:  bool,
+   /// How long it stays without a session, forever for `None`.
+   pub persist: Option<Duration>,
 }
 
 /// What to do about a host key that no known hosts file lists.
@@ -163,6 +184,16 @@ pub struct Options {
    /// Listen locally as a SOCKS5 proxy that connects from the server.
    #[pound(short = 'D', value_name = "[BIND:]PORT")]
    pub dynamic:    Vec<Socks>,
+   /// Share one connection through the socket at PATH, as `ControlPath` does.
+   /// The name gets .qsh at its end, and none turns sharing off.
+   #[pound(short = 'S', value_name = "PATH")]
+   pub control:    Option<String>,
+   /// Ask the qsh that shares its connection to check or to exit.
+   #[pound(short = 'O', value_name = "COMMAND")]
+   pub order:      Option<String>,
+   /// Hold the connection for other runs and start no session.
+   #[pound(long, hidden)]
+   pub master:     bool,
    /// Congestion controller for what this side sends, bbr or cubic. Cubic is
    /// faster on a clean local network and collapses on a lossy one.
    #[pound(long, value_name = "NAME", default = "bbr")]
@@ -192,7 +223,116 @@ fn socket(named: Option<&str>) -> Option<PathBuf> {
    }
 }
 
+/// How long `ControlPersist` keeps a connection without a session, forever
+/// for `None`.
+fn persist(text: Option<&str>) -> Result<Option<Duration>> {
+   let lowered = text.map(str::to_ascii_lowercase);
+
+   let spans = match lowered.as_deref() {
+      None | Some("no" | "false") => return Ok(Some(Duration::ZERO)),
+      Some("yes" | "true" | "0") => return Ok(None),
+      Some(spans) => spans,
+   };
+
+   let mut seconds = 0_u64;
+   let mut digits = String::new();
+
+   for symbol in spans.chars().chain(['s']) {
+      if symbol.is_ascii_digit() {
+         digits.push(symbol);
+         continue;
+      }
+
+      let unit = match symbol {
+         's' => 1,
+         'm' => 60,
+         'h' => 3600,
+         'd' => 86400,
+         'w' => 604_800,
+         _ => bail!("bad ControlPersist time {spans}"),
+      };
+
+      if !digits.is_empty() {
+         let count = digits
+            .parse::<u64>()
+            .with_context(|| format!("bad ControlPersist time {spans}"))?;
+
+         seconds = seconds.saturating_add(count.saturating_mul(unit));
+         digits.clear();
+      }
+   }
+
+   Ok(Some(Duration::from_secs(seconds)))
+}
+
+/// Fills in the `%` tokens of a `ControlPath`. The result ends in `.qsh`, so
+/// that it never names a socket that `ssh` made from the same line.
+fn socket_path(template: &str, user: &str, host: &str, alias: &str, port: u16) -> Result<PathBuf> {
+   let mut path = String::new();
+   let mut rest = template.chars();
+
+   while let Some(symbol) = rest.next() {
+      if symbol != '%' {
+         path.push(symbol);
+         continue;
+      }
+
+      match rest.next() {
+         Some('h') => path.push_str(host),
+         Some('n') => path.push_str(alias),
+         Some('p') => path.push_str(&port.to_string()),
+         Some('r') => path.push_str(user),
+         Some('u') => path.push_str(&env::var("USER").unwrap_or_default()),
+         Some('i') => path.push_str(&getuid().as_raw().to_string()),
+         Some('C') => {
+            let hash = digest(&SHA256, format!("{host}\0{port}\0{user}").as_bytes());
+
+            for byte in hash.as_ref().iter().take(20) {
+               let _ = write!(path, "{byte:02x}");
+            }
+         },
+         Some('%') => path.push('%'),
+         Some(other) => bail!("ControlPath token %{other} is not supported"),
+         None => bail!("ControlPath ends in a lone %"),
+      }
+   }
+
+   path.push_str(".qsh");
+   Ok(expand(&path))
+}
+
 impl Options {
+   /// The connection to share, when `-S` or the configuration names a
+   /// socket for it.
+   fn control(&self, host: &Host, user: &str, name: &str, port: u16) -> Result<Option<Control>> {
+      let template = self
+         .control
+         .as_deref()
+         .or(host.control_path.as_deref())
+         .filter(|path| !path.eq_ignore_ascii_case("none"));
+
+      let Some(path) = template else {
+         return Ok(None);
+      };
+
+      let alias = self
+         .target
+         .rsplit_once('@')
+         .map_or(self.target.as_str(), |(_, alias)| alias);
+
+      let create = host.control_master.as_deref().is_some_and(|mode| {
+         ["yes", "auto", "ask", "autoask"]
+            .iter()
+            .any(|known| mode.eq_ignore_ascii_case(known))
+      });
+
+      Ok(Some(Control {
+         path:    socket_path(path, user, name, alias, port)?,
+         create:  create || self.master,
+         persist: persist(host.control_persist.as_deref())?,
+      }))
+   }
+
    /// Takes the forwards, the command, the terminal and the agent switch from
    /// the OpenSSH client configuration where the command line left them open.
    fn adopt(&mut self, host: &Host) -> Result<()> {
@@ -312,7 +452,10 @@ impl Options {
          Some(_) | None => Strict::Ask,
       };
 
+      let control = self.control(&host, &user, &name, port)?;
+
       Ok(Login {
+         control,
          user,
          host: name,
          port,

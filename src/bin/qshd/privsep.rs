@@ -9,12 +9,6 @@
 
 use std::{
    fs::File,
-   io::{
-      self,
-      IoSlice,
-      IoSliceMut,
-   },
-   mem::MaybeUninit,
    net::SocketAddr,
    os::fd::{
       AsFd as _,
@@ -45,35 +39,26 @@ use quicsh::{
       Token,
    },
    error::Error,
+   pipe::{
+      receive_message,
+      send_message,
+   },
    wire::{
       Reader,
       put_string,
    },
 };
 use rustix::{
-   cmsg_space,
    event::{
       PollFd,
       PollFlags,
       poll,
    },
    io::Errno,
-   net::{
-      RecvAncillaryBuffer,
-      RecvAncillaryMessage,
-      RecvFlags,
-      SendAncillaryBuffer,
-      SendAncillaryMessage,
-      SendFlags,
-      recvmsg,
-      sendmsg,
-   },
 };
 
 /// Largest request or reply.
 const MAX_MESSAGE: usize = 128 << 10;
-/// Most descriptors one message carries.
-const MAX_DESCRIPTORS: usize = 4;
 
 /// Tag of [`Request::Hello`] and [`Reply::Hello`].
 const HELLO: u8 = 1;
@@ -409,57 +394,6 @@ impl Reply {
    }
 }
 
-/// Sends one message with its descriptors.
-fn send(channel: &OwnedFd, bytes: &[u8], descriptors: &[BorrowedFd<'_>]) -> io::Result<()> {
-   let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(MAX_DESCRIPTORS))];
-   let mut ancillary = SendAncillaryBuffer::new(&mut space);
-
-   if !descriptors.is_empty() && !ancillary.push(SendAncillaryMessage::ScmRights(descriptors)) {
-      return Err(io::Error::other("too many descriptors for one message"));
-   }
-
-   sendmsg(
-      channel,
-      &[IoSlice::new(bytes)],
-      &mut ancillary,
-      SendFlags::NOSIGNAL,
-   )?;
-
-   Ok(())
-}
-
-/// The next message, or `None` once the other process is gone.
-fn receive(channel: &OwnedFd) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
-   let mut bytes = vec![0; MAX_MESSAGE];
-   let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(MAX_DESCRIPTORS))];
-   let mut ancillary = RecvAncillaryBuffer::new(&mut space);
-
-   let received = recvmsg(
-      channel,
-      &mut [IoSliceMut::new(&mut bytes)],
-      &mut ancillary,
-      RecvFlags::CMSG_CLOEXEC,
-   )?;
-
-   if received.bytes == 0 {
-      return Ok(None);
-   }
-
-   let descriptors = ancillary
-      .drain()
-      .filter_map(|message| {
-         match message {
-            RecvAncillaryMessage::ScmRights(descriptors) => Some(descriptors),
-            _ => None,
-         }
-      })
-      .flatten()
-      .collect();
-
-   bytes.truncate(received.bytes);
-   Ok(Some((bytes, descriptors)))
-}
-
 /// Why [`serve`] returned.
 pub enum Ended {
    /// The monitor was told to stop with `SIGINT` or `SIGTERM`.
@@ -494,7 +428,7 @@ where
          continue;
       }
 
-      let Some((bytes, _)) = receive(channel)? else {
+      let Some((bytes, _)) = receive_message(channel, MAX_MESSAGE)? else {
          return Ok(Ended::Closed);
       };
 
@@ -507,7 +441,7 @@ where
          .iter()
          .map(OwnedFd::as_fd)
          .collect::<Vec<BorrowedFd>>();
-      send(channel, &reply.encode(), &borrowed)?;
+      send_message(channel, &reply.encode(), &borrowed)?;
    }
 }
 
@@ -528,8 +462,9 @@ impl Helper {
          .lock()
          .map_err(|_| report!("a thread died while talking to the monitor"))?;
 
-      send(&channel, &request.encode(), &[])?;
-      let (bytes, descriptors) = receive(&channel)?.context("the monitor exited")?;
+      send_message(&channel, &request.encode(), &[])?;
+      let (bytes, descriptors) =
+         receive_message(&channel, MAX_MESSAGE)?.context("the monitor exited")?;
 
       match Reply::decode(&bytes)? {
          Reply::Failed(text) => bail!("monitor: {text}"),

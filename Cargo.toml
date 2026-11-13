@@ -21,7 +21,17 @@ quinn-udp   = { version = "0.6.3", default-features = false }
 ring        = "0.17.14"
 rustix      = {
   version  = "1.1.6",
-  features = [ "event", "net", "process", "pty", "termios", "thread", "time" ]
+  features = [
+    "event",
+    "fs",
+    "net",
+    "process",
+    "pty",
+    "stdio",
+    "termios",
+    "thread",
+    "time",
+  ]
 }
 rustls      = { version = "0.23.46", default-features = false, features = [ "ring", "std" ] }
 zeroize     = "1.9.1"

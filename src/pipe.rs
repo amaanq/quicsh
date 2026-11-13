@@ -12,9 +12,12 @@ use std::{
    fs::File,
    io::{
       self,
+      IoSlice,
+      IoSliceMut,
       Read as _,
       Write,
    },
+   mem::MaybeUninit,
    os::fd::{
       AsFd,
       BorrowedFd,
@@ -37,6 +40,7 @@ use std::{
 
 use bytes::Bytes;
 use rustix::{
+   cmsg_space,
    event::{
       EventfdFlags,
       PollFd,
@@ -49,7 +53,15 @@ use rustix::{
       write,
    },
    net::{
+      RecvAncillaryBuffer,
+      RecvAncillaryMessage,
+      RecvFlags,
+      SendAncillaryBuffer,
+      SendAncillaryMessage,
+      SendFlags,
       Shutdown,
+      recvmsg,
+      sendmsg,
       shutdown,
    },
 };
@@ -141,7 +153,19 @@ pub fn reopen(descriptor: RawFd) -> io::Result<File> {
 /// Reads `source` until it ends. The channel closes at end of input, and a
 /// full channel pauses reading.
 #[must_use]
-pub fn reader(mut source: File, waker: Arc<Waker>) -> Receiver<Bytes> {
+pub fn reader(source: File, waker: Arc<Waker>) -> Receiver<Bytes> {
+   spawn_reader(source, None, waker)
+}
+
+/// Reads like [`reader`] and also ends once `stop` is woken. The thread then
+/// leaves `source` alone, as it must when another program reads it next.
+#[must_use]
+pub fn reader_until(source: File, stop: Arc<Waker>, waker: Arc<Waker>) -> Receiver<Bytes> {
+   spawn_reader(source, Some(stop), waker)
+}
+
+/// Starts the thread behind [`reader`] and [`reader_until`].
+fn spawn_reader(mut source: File, stop: Option<Arc<Waker>>, waker: Arc<Waker>) -> Receiver<Bytes> {
    let (chunks, receiver) = sync_channel(QUEUE);
 
    thread::spawn(move || {
@@ -150,6 +174,17 @@ pub fn reader(mut source: File, waker: Arc<Waker>) -> Receiver<Bytes> {
       // A terminal whose other side closed fails with EIO, which is its end
       // of input.
       loop {
+         if let Some(ref stopped) = stop {
+            let mut fds = [
+               PollFd::new(&source, PollFlags::IN),
+               PollFd::new(&**stopped, PollFlags::IN),
+            ];
+
+            if poll(&mut fds, None).is_ok() && !fds[1].revents().is_empty() {
+               break;
+            }
+         }
+
          let count = match source.read(&mut buffer) {
             Ok(count @ 1..) => count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -175,6 +210,77 @@ pub fn reader(mut source: File, waker: Arc<Waker>) -> Receiver<Bytes> {
    });
 
    receiver
+}
+
+/// Most descriptors one message carries.
+const MAX_DESCRIPTORS: usize = 4;
+
+/// Sends one message on a Unix socket, with descriptors for the receiver.
+///
+/// # Errors
+///
+/// Fails when the socket does, or with more descriptors than one message
+/// carries.
+pub fn send_message(
+   socket: &OwnedFd,
+   bytes: &[u8],
+   descriptors: &[BorrowedFd<'_>],
+) -> io::Result<()> {
+   let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(MAX_DESCRIPTORS))];
+   let mut ancillary = SendAncillaryBuffer::new(&mut space);
+
+   if !descriptors.is_empty() && !ancillary.push(SendAncillaryMessage::ScmRights(descriptors)) {
+      return Err(io::Error::other("too many descriptors for one message"));
+   }
+
+   sendmsg(
+      socket,
+      &[IoSlice::new(bytes)],
+      &mut ancillary,
+      SendFlags::NOSIGNAL,
+   )?;
+
+   Ok(())
+}
+
+/// The next message of at most `limit` bytes and its descriptors, or `None`
+/// once the other side is gone.
+///
+/// # Errors
+///
+/// Fails when the socket does.
+pub fn receive_message(
+   socket: &OwnedFd,
+   limit: usize,
+) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
+   let mut bytes = vec![0; limit];
+   let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(MAX_DESCRIPTORS))];
+   let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+
+   let received = recvmsg(
+      socket,
+      &mut [IoSliceMut::new(&mut bytes)],
+      &mut ancillary,
+      RecvFlags::CMSG_CLOEXEC,
+   )?;
+
+   if received.bytes == 0 {
+      return Ok(None);
+   }
+
+   let descriptors = ancillary
+      .drain()
+      .filter_map(|message| {
+         match message {
+            RecvAncillaryMessage::ScmRights(descriptors) => Some(descriptors),
+            _ => None,
+         }
+      })
+      .flatten()
+      .collect();
+
+   bytes.truncate(received.bytes);
+   Ok(Some((bytes, descriptors)))
 }
 
 /// Writes every chunk sent to it and closes `sink` once the sender is dropped.

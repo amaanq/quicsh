@@ -292,6 +292,11 @@ impl Server {
                   confirmed.release(taken, errors)?;
                }
             },
+            Message::Close { session } => {
+               if let Some(over) = peer.sessions.remove(&session) {
+                  over.close(connection);
+               }
+            },
             Message::Listen { listener, port } => {
                let Some(ref grant) = peer.grant else {
                   bail!("forward before login");
@@ -567,8 +572,9 @@ impl Server {
          return Ok(None);
       };
 
-      // A session that ended stays until the connection does, because its
-      // holder goes on only for a client that may still lack the last output.
+      // A session that ended stays until the client closes it or the
+      // connection, because its holder goes on only for a client that may
+      // still lack the last output.
       for (&session, running) in &mut peer.sessions {
          if let Some(status) = running.pump(connection)? {
             peer.outbox.push(&Message::Exit { session, status });

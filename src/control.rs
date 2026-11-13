@@ -69,6 +69,8 @@ const FAILED: u8 = 17;
 const ASSOCIATE: u8 = 18;
 /// Tag of [`Message::Taken`].
 const TAKEN: u8 = 19;
+/// Tag of [`Message::Close`].
+const CLOSE: u8 = 20;
 
 /// How long a session waits for a client whose connection died.
 pub const DETACH_LIMIT: Duration = Duration::from_hours(1);
@@ -189,6 +191,11 @@ pub enum Message {
       taken:   u64,
       errors:  u64,
    },
+   /// The client is done with a session, which it either saw to its end or
+   /// gave up on. The server ends its side of it.
+   Close {
+      session: u32,
+   },
 }
 
 /// Appends the tag and the fields of a message that names a host and a port.
@@ -207,6 +214,12 @@ fn put_counts(out: &mut Vec<u8>, tag: u8, session: u32, counts: [u64; 2]) {
    for count in counts {
       put_string(out, &count.to_be_bytes());
    }
+}
+
+/// Appends the tag and the one number of a message that carries no more.
+fn put_numbered(out: &mut Vec<u8>, tag: u8, number: u32) {
+   out.push(tag);
+   put_u32(out, number);
 }
 
 /// Appends a 32-bit number.
@@ -329,14 +342,8 @@ impl Message {
             put_u32(&mut payload, listener);
             put_u32(&mut payload, port.into());
          },
-         Self::Refused { listener } => {
-            payload.push(REFUSED);
-            put_u32(&mut payload, listener);
-         },
-         Self::Forwarded { listener } => {
-            payload.push(FORWARDED);
-            put_u32(&mut payload, listener);
-         },
+         Self::Refused { listener } => put_numbered(&mut payload, REFUSED, listener),
+         Self::Forwarded { listener } => put_numbered(&mut payload, FORWARDED, listener),
          Self::Agent => payload.push(AGENT),
          Self::Resume {
             ref token,
@@ -352,6 +359,7 @@ impl Message {
             taken,
             errors,
          } => put_counts(&mut payload, TAKEN, session, [taken, errors]),
+         Self::Close { session } => put_numbered(&mut payload, CLOSE, session),
          Self::Resumed { received, skipped } => {
             payload.push(RESUMED);
             put_string(&mut payload, &received.to_be_bytes());
@@ -473,6 +481,11 @@ impl Message {
          },
          AGENT => Self::Agent,
          tag @ (RESUME | TAKEN) => Self::counted(tag, &mut reader)?,
+         CLOSE => {
+            Self::Close {
+               session: reader.u32()?,
+            }
+         },
          RESUMED => {
             Self::Resumed {
                received: u64::from_be_bytes(reader.array()?),

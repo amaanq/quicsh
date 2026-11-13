@@ -1,9 +1,16 @@
+/// One session and its standard streams.
+mod channel;
 mod forward;
+/// The socket that shares a connection.
+mod mux;
 /// Command line options.
 mod options;
 
 use std::{
-   collections::HashMap,
+   collections::{
+      BTreeMap,
+      HashMap,
+   },
    env,
    fs::{
       self,
@@ -16,7 +23,6 @@ use std::{
       Read as _,
       Write as _,
    },
-   mem,
    net::{
       Ipv4Addr,
       SocketAddr,
@@ -54,10 +60,7 @@ use std::{
          channel,
       },
    },
-   thread::{
-      self,
-      JoinHandle,
-   },
+   thread,
    time::{
       Duration,
       Instant,
@@ -96,9 +99,7 @@ use quicsh::{
       Open,
       Outbox,
       Program,
-      Size,
       Terminal,
-      Token,
    },
    forward::{
       Forwards,
@@ -112,14 +113,9 @@ use quicsh::{
    },
    pipe::{
       Waker,
-      reader,
       reopen,
-      writer,
    },
-   relay::{
-      Relay,
-      Tail,
-   },
+   relay::Relay,
    tls,
    transport::{
       App,
@@ -156,24 +152,31 @@ use rustix::{
    process::{
       Signal,
       set_parent_process_death_signal,
+      setsid,
    },
-   termios::{
-      OptionalActions,
-      Termios,
-      isatty,
-      tcgetattr,
-      tcgetwinsize,
-      tcsetattr,
+   stdio::{
+      dup2_stderr,
+      dup2_stdin,
+      dup2_stdout,
    },
+   termios::isatty,
 };
 
 use crate::{
+   channel::{
+      Channel,
+      Owner,
+      Streams,
+      window,
+   },
    forward::{
       Inbound,
       Local,
       Remote,
    },
+   mux::Arrival,
    options::{
+      Control,
       Login,
       Options,
       Strict,
@@ -190,10 +193,9 @@ const ATTEMPT: Duration = Duration::from_secs(5);
 const REDIAL: Duration = Duration::from_secs(1);
 /// TLS server name, unused because the host key is checked instead.
 const SERVER_NAME: &str = "quicsh";
-/// How much more session output arrives before the server hears of it.
-const CONFIRM_STEP: u64 = 256 << 10;
-/// The number this client gives its one session.
-const SESSION: u32 = 1;
+/// How long a client that shares its connection waits for the first run
+/// to ask for a session.
+const FIRST_SESSION: Duration = Duration::from_secs(30);
 
 /// The user's home directory.
 fn home() -> Result<PathBuf> {
@@ -423,38 +425,6 @@ fn sign_with_file(file: &Path, message: &[u8]) -> Result<(PublicKey, Vec<u8>)> {
    Ok(armored(&signed?)?)
 }
 
-/// Puts the local terminal in raw mode and restores it when dropped.
-struct RawMode(Termios);
-
-impl RawMode {
-   /// Switches the terminal to raw mode and remembers the old settings.
-   fn enable() -> Result<Self> {
-      let saved = tcgetattr(io::stdin())?;
-
-      let mut raw = saved.clone();
-      raw.make_raw();
-      tcsetattr(io::stdin(), OptionalActions::Now, &raw)?;
-
-      Ok(Self(saved))
-   }
-}
-
-impl Drop for RawMode {
-   fn drop(&mut self) {
-      let _ = tcsetattr(io::stdin(), OptionalActions::Now, &self.0);
-   }
-}
-
-/// The current size of the local terminal.
-fn window() -> Result<Size> {
-   let size = tcgetwinsize(io::stdin())?;
-
-   Ok(Size {
-      columns: size.ws_col,
-      rows:    size.ws_row,
-   })
-}
-
 /// The UDP relay that `-W` asks for.
 struct Hop {
    /// Host the server sends the datagrams to.
@@ -468,12 +438,62 @@ struct Hop {
    ready: bool,
 }
 
-/// What the session runs.
-struct Shell {
-   /// The shell, a command or a subsystem.
-   program:  Program,
-   /// Run the command on a terminal, as `ssh -t` does.
-   terminal: bool,
+/// What a client needs to share its connection with later runs.
+struct Master {
+   /// What the later runs ask for.
+   arrivals: Receiver<Arrival>,
+   /// The session of each run that asked for one.
+   peers:    HashMap<u64, u32>,
+   /// How long to stay without a session, forever for `None`.
+   persist:  Option<Duration>,
+   /// Since when there is no session.
+   empty:    Option<Instant>,
+   /// Whether there ever was a session.
+   served:   bool,
+   /// Whether a run asked this one to exit.
+   stopped:  bool,
+   /// Tells the run that started this one that the server accepted the
+   /// login.
+   ready:    Option<File>,
+}
+
+impl Master {
+   /// Listens on the socket that `control` names.
+   fn listen(control: &Control, waker: &Arc<Waker>) -> Result<Self> {
+      Ok(Self {
+         arrivals: mux::accept(mux::listen(&control.path)?, waker),
+         peers:    HashMap::new(),
+         persist:  control.persist,
+         empty:    None,
+         served:   false,
+         stopped:  false,
+         ready:    Some(standard(io::stdout())?),
+      })
+   }
+
+   /// When to exit for want of sessions. `busy` says that there is one now.
+   fn deadline(&mut self, now: Instant, busy: bool) -> Option<Instant> {
+      if busy {
+         self.served = true;
+         self.empty = None;
+         return None;
+      }
+
+      let since = *self.empty.get_or_insert(now);
+
+      if self.stopped {
+         return Some(since);
+      }
+
+      // The run that started this one has yet to ask for its session.
+      let floor = if self.served {
+         Duration::ZERO
+      } else {
+         FIRST_SESSION
+      };
+
+      Some(since + self.persist?.max(floor))
+   }
 }
 
 /// Event loop state for one connection to a server.
@@ -482,8 +502,6 @@ struct Client {
    current:  Option<ConnectionHandle>,
    /// Who to log in as.
    login:    Login,
-   /// What the server takes to give the session to a new connection.
-   token:    Option<Token>,
    /// When the connection died, until the session is resumed.
    lost:     Option<Instant>,
    /// When the current attempt to reach the server began, until its
@@ -491,11 +509,12 @@ struct Client {
    dialed:   Option<Instant>,
    /// How many more addresses the host has to try if this attempt fails.
    spares:   usize,
-   /// The stream that asks for the session back, with the server's answer
-   /// so far and the request not yet sent.
-   resuming: Option<(StreamId, Deframer, Outbox)>,
-   /// The session to start after login.
-   shell:    Option<Shell>,
+   /// Every session, by the number the server knows it under.
+   channels: BTreeMap<u32, Channel>,
+   /// The last session number handed out.
+   issued:   u32,
+   /// The socket that later runs share this connection through.
+   master:   Option<Master>,
    /// Whether to forward the local SSH agent.
    agent:    bool,
    /// The `-R` forwards, indexed by listener number.
@@ -524,24 +543,10 @@ struct Client {
    attempts: Option<Receiver<Attempt>>,
    /// Asks the authentication thread for the next key.
    next:     Option<Sender<()>>,
-   /// The session stream.
-   session:  Option<Relay>,
-   /// The server's stderr stream, until its four byte session header arrived.
-   heading:  Option<(StreamId, Vec<u8>)>,
-   /// The session's standard error.
-   errors:   Option<Relay>,
-   /// Standard error whose stream died with its connection, until the
-   /// server opens a new one for it.
-   orphan:   Option<Relay>,
-   /// How much session output the server last heard that this side has.
-   told:     u64,
-   /// Threads still writing to standard output and error.
-   writers:  Vec<JoinHandle<()>>,
-   /// Restores the terminal when dropped.
-   raw:      Option<RawMode>,
-   /// The terminal size last sent to the server.
-   size:     Option<Size>,
-   /// Exit status of the remote command.
+   /// Stderr streams of the server, until their four byte session header
+   /// arrived.
+   headings: HashMap<StreamId, Vec<u8>>,
+   /// Exit status of the session this process started for itself.
    status:   Option<u32>,
    /// Whether the connection was closed.
    done:     bool,
@@ -553,87 +558,36 @@ fn standard(descriptor: impl AsFd) -> Result<File> {
 }
 
 impl Client {
-   /// Opens the session stream once the server accepted the login.
-   fn start(&mut self, shell: Shell, connection: &mut Connection) -> Result<()> {
-      let interactive =
-         (matches!(shell.program, Program::Shell) || shell.terminal) && isatty(io::stdin());
-
-      let terminal = if interactive {
-         let size = window()?;
-         self.size = Some(size);
-
-         Some(Terminal {
-            name: env::var("TERM").unwrap_or_else(|_| "xterm".to_owned()),
-            size,
-         })
-      } else {
-         None
-      };
-
-      let open = Open {
-         session: SESSION,
-         terminal,
-         program: shell.program,
-         agent: self.agent,
-      };
-
-      let stream = connection
-         .streams()
-         .open(Dir::Bi)
-         .context("no stream credit")?;
-
-      if interactive {
-         connection.send_stream(stream).set_priority(1)?;
-         self.raw = Some(RawMode::enable()?);
-      }
-
-      let input = reader(standard(io::stdin())?, Arc::clone(&self.waker));
-      let (output, handle) = writer(standard(io::stdout())?, Arc::clone(&self.waker));
-
-      let mut session = Relay::new(stream, Some(input), Some(output), Vec::new(), false);
-      session.prefix(Message::Open(open).encode());
-
-      // A terminal may lose input typed during an outage. Anything else
-      // must continue without a gap, so its input stays until the server
-      // confirms it.
-      session.remember(if interactive {
-         Tail::default()
-      } else {
-         Tail::exact()
-      });
-
-      self.writers.push(handle);
-      self.session = Some(session);
-      Ok(())
-   }
-
-   /// Whether there is no session and only ports are forwarded.
-   const fn sessionless(&self) -> bool {
-      self.shell.is_none() && self.session.is_none() && self.relay.is_none()
-   }
-
    /// Whether a new connection could take over. A session can, since the
-   /// server keeps it. So can a UDP relay and a client that only forwards
-   /// ports, which have no state on the server worth keeping.
-   const fn resumable(&self) -> bool {
+   /// server keeps it. So can a UDP relay, a client that only forwards
+   /// ports and one that shares its connection, which have no state on the
+   /// server worth keeping.
+   fn resumable(&self) -> bool {
+      let connected = self.accepted || self.lost.is_some();
+
       self.relay.is_some()
-         || self.sessionless() && (self.accepted || self.lost.is_some())
-         || self.token.is_some() && self.session.is_some() && self.status.is_none()
+         || (self.channels.is_empty() || self.master.is_some()) && connected
+         || self.channels.values().any(Channel::resumable)
    }
 
-   /// Gives up the dead connection. The terminal leaves raw mode so that
+   /// Gives up the dead connection. A terminal leaves raw mode so that
    /// Ctrl-C reaches this process while it has no server to send it to.
    fn suspend(&mut self, now: Instant) {
       self.current = None;
 
-      if self.lost.is_none() {
-         self.raw = None;
-         self.lost = Some(now);
+      if self.lost.is_some() {
+         return;
+      }
 
-         // The qsh that runs through a relay reports the outage itself.
-         if self.relay.is_none() {
-            eprintln!("\r\nqsh: connection lost, reconnecting. Ctrl-C gives up.");
-         }
+      self.lost = Some(now);
+
+      for channel in self.channels.values_mut() {
+         channel.suspend();
+      }
+
+      // The qsh that runs through a relay reports the outage itself.
+      if self.channels.is_empty() && self.relay.is_none() {
+         eprintln!("qsh: connection lost, reconnecting. Ctrl-C gives up.");
       }
    }
 
@@ -646,152 +600,112 @@ impl Client {
       self.outbox = Outbox::default();
       self.attempts = None;
       self.next = None;
-      self.resuming = None;
       self.opening.clear();
       self.forwards = Forwards::default();
-      self.heading = None;
-      self.orphan = self.errors.take().or_else(|| self.orphan.take());
+      self.headings.clear();
+
+      for channel in self.channels.values_mut() {
+         channel.detach();
+      }
    }
 
-   /// Asks the server for the session on a new stream.
-   fn rejoin(&mut self, connection: &mut Connection) -> Result<()> {
-      let token = self.token.context("no session to resume")?;
-      let session = self.session.as_ref().context("no session to resume")?;
-
-      let stream = connection
-         .streams()
-         .open(Dir::Bi)
-         .context("no stream credit")?;
-      connection.send_stream(stream).set_priority(1)?;
-
-      let mut outbox = Outbox::default();
-      outbox.push(&Message::Resume {
-         token,
-         session: SESSION,
-         received: session.taken(),
-         errors: self.orphan.as_ref().map_or(0, Relay::taken),
-      });
-
-      self.resuming = Some((stream, Deframer::default(), outbox));
-      Ok(())
-   }
-
-   /// Reads the server's answer to [`Client::rejoin`] and continues the
-   /// session on the new stream.
-   fn resumed(&mut self, connection: &mut Connection) -> Result<()> {
-      let Some((stream, ref mut deframer, _)) = self.resuming else {
+   /// Reads the header of a stderr stream, then hands the stream to the
+   /// session the header names.
+   fn heading(&mut self, connection: &mut Connection, stream: StreamId) -> Result<()> {
+      let Some(header) = self.headings.get_mut(&stream) else {
          return Ok(());
       };
 
-      let (chunks, finished) = drain(connection, stream)?;
-
-      for bytes in chunks {
-         deframer.push(&bytes);
-      }
-
-      let (received, skipped) = match deframer.pop()? {
-         Some(Message::Resumed { received, skipped }) => (received, skipped),
-         Some(Message::Gone) => bail!("the session ended while the connection was down"),
-         Some(_) => bail!("unexpected answer to a resume request"),
-         None if finished => bail!("the server gave no answer to a resume request"),
-         None => return Ok(()),
-      };
-
-      let rest = self
-         .resuming
-         .take()
-         .map_or_else(Vec::new, |(_, answer, _)| answer.into_rest());
-
-      let session = self.session.as_mut().context("no session to resume")?;
-      let lost = skipped + session.lacks(received);
-
-      if self.size.is_none() && lost > 0 {
-         bail!("the session cannot continue, {lost} bytes of it are gone");
-      }
-
-      session.skip(skipped);
-      session.resume(connection, stream, Vec::new(), received, (rest, finished));
-
-      self.lost = None;
-
-      if self.size.is_some() {
-         self.raw = Some(RawMode::enable()?);
-      }
-
-      if skipped == 0 {
-         eprint!("qsh: reconnected\r\n");
-      } else {
-         eprint!("qsh: reconnected, {skipped} bytes of output were not kept\r\n");
-      }
-
-      Ok(())
-   }
-
-   /// Tells the server how much session output arrived, once enough is new,
-   /// so that the server can forget it.
-   fn confirm(&mut self) {
-      let Some(ref session) = self.session else {
-         return;
-      };
-
-      let taken = session.taken();
-      let errors = self
-         .errors
-         .as_ref()
-         .or(self.orphan.as_ref())
-         .map_or(0, Relay::taken);
-
-      if taken + errors >= self.told + CONFIRM_STEP {
-         self.told = taken + errors;
-         self.outbox.push(&Message::Taken {
-            session: SESSION,
-            taken,
-            errors,
-         });
-      }
-   }
-
-   /// Reads the stderr stream's header, then relays the rest to stderr.
-   fn heading(&mut self, connection: &mut Connection) -> Result<()> {
-      let Some((ref mut stream, ref mut header)) = self.heading else {
-         return Ok(());
-      };
-
-      let (received, finished) = drain(connection, *stream)?;
+      let (received, finished) = drain(connection, stream)?;
 
       for bytes in received {
          header.extend_from_slice(&bytes);
       }
 
-      let Some((_session, rest)) = header.split_first_chunk::<4>() else {
+      let Some((&label, rest)) = header.split_first_chunk::<4>() else {
          return Ok(());
       };
 
-      if let Some(mut errors) = self.orphan.take() {
-         errors.resume(
-            connection,
-            *stream,
-            Vec::new(),
-            0,
-            (rest.to_vec(), finished),
-         );
-         self.errors = Some(errors);
-         self.heading = None;
+      let pending = (rest.to_vec(), finished);
+      self.headings.remove(&stream);
+
+      let Some(channel) = self.channels.get_mut(&u32::from_be_bytes(label)) else {
+         let _ = connection.recv_stream(stream).stop(VarInt::from_u32(0));
          return Ok(());
+      };
+
+      channel.errors(stream, pending, connection, &self.waker)
+   }
+
+   /// Takes what later runs ask of a client that shares its connection.
+   fn arrive(&mut self, connection: &mut Connection) -> Result<()> {
+      let Some(ref mut master) = self.master else {
+         return Ok(());
+      };
+
+      while let Ok(arrival) = master.arrivals.try_recv() {
+         match arrival {
+            Arrival::Open {
+               peer,
+               open,
+               stdio,
+               socket,
+            } => {
+               self.issued += 1;
+               self.agent |= open.agent;
+
+               let mut channel = Channel::new(open, stdio, Owner::Peer(socket))?;
+
+               if self.accepted {
+                  channel.start(self.issued, connection, &self.waker)?;
+               }
+
+               master.peers.insert(peer, self.issued);
+               self.channels.insert(self.issued, channel);
+            },
+            Arrival::Closed { peer } => {
+               let gone = master
+                  .peers
+                  .remove(&peer)
+                  .and_then(|label| Some((label, self.channels.remove(&label)?)));
+
+               if let Some((session, channel)) = gone {
+                  self.outbox.push(&Message::Close { session });
+                  channel.close(255, connection);
+               }
+            },
+            Arrival::Stop => master.stopped = true,
+         }
       }
 
-      let (output, handle) = writer(standard(io::stderr())?, Arc::clone(&self.waker));
-
-      self.writers.push(handle);
-      self.errors = Some(Relay::new(
-         *stream,
-         None,
-         Some(output),
-         rest.to_vec(),
-         finished,
-      ));
-      self.heading = None;
       Ok(())
+   }
+
+   /// Ends every session that is over and whose output is written, and
+   /// tells the server, which keeps a session until then.
+   fn settle(&mut self, connection: &mut Connection) {
+      if !self.headings.is_empty() {
+         return;
+      }
+
+      let over = self
+         .channels
+         .iter()
+         .filter_map(|(&label, channel)| Some((label, channel.finished()?)))
+         .collect::<Vec<(u32, u32)>>();
+
+      for (session, status) in over {
+         let Some(channel) = self.channels.remove(&session) else {
+            continue;
+         };
+
+         if channel.local() {
+            self.status = Some(status);
+         }
+
+         self.outbox.push(&Message::Close { session });
+         channel.close(status, connection);
+      }
    }
 
    /// Opens the UDP relay that `-W` asked for. The first time, one byte
@@ -939,33 +853,55 @@ impl Client {
                self.accepted = true;
                self.listen();
 
-               if self.sessionless() && self.lost.take().is_some() {
+               let back = self.lost.take().is_some();
+
+               if back && self.channels.is_empty() && self.relay.is_none() {
                   eprintln!("qsh: reconnected");
                }
 
                self.associate(connection)?;
 
-               if self.session.is_some() {
-                  self.rejoin(connection)?;
-               } else if let Some(shell) = self.shell.take() {
-                  self.start(shell, connection)?;
+               for (&label, channel) in &mut self.channels {
+                  if channel.resumable() {
+                     channel.rejoin(label, connection)?;
+                  } else if channel.started() {
+                     channel.fail("the session ended with its connection");
+                  } else {
+                     channel.start(label, connection, &self.waker)?;
+                  }
+               }
+
+               let ready = self.master.as_mut().and_then(|master| master.ready.take());
+
+               if let Some(mut starter) = ready {
+                  detach()?;
+                  let _ = starter.write_all(&[0]);
                }
             },
-            Message::Resumable { token, .. } => self.token = Some(token),
+            Message::Resumable { session, token } => {
+               if let Some(channel) = self.channels.get_mut(&session) {
+                  channel.keep(token);
+               }
+            },
             Message::Rejected => {
                if let Some(ref next) = self.next {
                   let _ = next.send(());
                }
             },
-            Message::Exit { status, .. } => self.status = Some(status),
-            Message::Taken { taken, .. } => {
-               if let Some(ref mut session) = self.session {
-                  session.release(taken);
+            Message::Exit { session, status } => {
+               if let Some(channel) = self.channels.get_mut(&session) {
+                  channel.exit(status);
                }
             },
-            Message::Failed { reason, .. } => {
-               eprintln!("qsh: the server did not start the session: {reason}\r");
-               self.status = Some(255);
+            Message::Taken { session, taken, .. } => {
+               if let Some(channel) = self.channels.get_mut(&session) {
+                  channel.release(taken);
+               }
+            },
+            Message::Failed { session, reason } => {
+               if let Some(channel) = self.channels.get_mut(&session) {
+                  channel.fail(&format!("the server did not start the session: {reason}"));
+               }
             },
             Message::Listening { listener, port } => {
                let chosen = usize::try_from(listener)
@@ -1053,25 +989,13 @@ impl App for Client {
                }
             });
          },
-         Event::Stream(StreamEvent::Readable { id })
-            if self
-               .resuming
-               .as_ref()
-               .is_some_and(|&(stream, ..)| stream == id) =>
-         {
-            self.resumed(connection)?;
-         },
          Event::Stream(StreamEvent::Readable { id }) if Some(id) == self.control => {
             self.control(connection, id)?;
          },
          Event::Stream(StreamEvent::Opened { dir: Dir::Uni }) => {
             while let Some(stream) = connection.streams().accept(Dir::Uni) {
-               if self.heading.is_some() || self.errors.is_some() {
-                  bail!("server opened a second stderr stream");
-               }
-
-               self.heading = Some((stream, Vec::new()));
-               self.heading(connection)?;
+               self.headings.insert(stream, Vec::new());
+               self.heading(connection, stream)?;
             }
          },
          Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
@@ -1083,7 +1007,21 @@ impl App for Client {
          Event::Stream(StreamEvent::Readable { id }) if self.opening.contains_key(&id) => {
             self.opened(connection, id)?;
          },
-         Event::Stream(StreamEvent::Readable { .. }) => self.heading(connection)?,
+         Event::Stream(StreamEvent::Readable { id }) => {
+            let resuming = self
+               .channels
+               .values_mut()
+               .find(|channel| channel.resuming(id));
+
+            match resuming {
+               Some(channel) => {
+                  if let Err(error) = channel.resumed(connection) {
+                     channel.fail(&format!("{error}"));
+                  }
+               },
+               None => self.heading(connection, id)?,
+            }
+         },
          Event::ConnectionLost { .. } if self.dialed.is_some() && self.spares > 0 => {
             self.current = None;
          },
@@ -1126,53 +1064,49 @@ impl App for Client {
          return Ok(None);
       }
 
+      self.arrive(connection)?;
       self.login(connection)?;
       self.connect(connection)?;
       self.forwards.pump(connection, &self.waker)?;
 
-      if let Some((stream, _, ref mut request)) = self.resuming {
-         request.flush(connection, stream)?;
-      } else if self.accepted {
-         for relay in self.session.iter_mut().chain(&mut self.errors) {
-            relay.pump(connection)?;
+      if self.accepted {
+         for (&label, channel) in &mut self.channels {
+            if let Err(error) = channel.pump(label, connection, &mut self.outbox) {
+               channel.fail(&format!("{error}"));
+            }
          }
 
-         self.confirm();
-      }
-
-      if let Some(last) = self.size {
-         let size = window()?;
-
-         if size != last {
-            let resize = Message::Resize {
-               session: SESSION,
-               size,
-            };
-            self.outbox.push(&resize);
-            self.size = Some(size);
-         }
+         self.settle(connection);
       }
 
       if let Some(control) = self.control {
          self.outbox.flush(connection, control)?;
       }
 
-      let flushed = self.session.as_ref().is_some_and(Relay::received_all)
-         && self.heading.is_none()
-         && self.orphan.is_none()
-         && self.errors.as_ref().is_none_or(Relay::received_all);
+      let busy = !self.channels.is_empty();
+      let expiry = self
+         .master
+         .as_mut()
+         .and_then(|master| master.deadline(now, busy));
 
-      if (shutdown_requested() || self.status.is_some() && flushed) && !self.done {
+      let over = if self.master.is_some() {
+         expiry.is_some_and(|at| now >= at)
+      } else {
+         self.status.is_some()
+      };
+
+      if (shutdown_requested() || over) && !self.done {
          connection.close(now, VarInt::from_u32(0), Bytes::new());
          self.done = true;
       }
 
-      // No handler reports a changed window, so a resize is noticed by
-      // polling the terminal size.
+      let resizing = self.channels.values().any(Channel::interactive);
+
       Ok([
          limit,
+         expiry,
          self.attempts.is_some().then_some(now + WORKER_POLL),
-         self.size.is_some().then_some(now + RESIZE_POLL),
+         resizing.then_some(now + RESIZE_POLL),
       ]
       .into_iter()
       .flatten()
@@ -1319,9 +1253,200 @@ fn jump(hops: &str, login: &Login) -> Result<(Child, OwnedFd)> {
    Ok((child, link))
 }
 
+/// What the options ask the server to run, on a terminal when this
+/// process has one and the options want it.
+fn request(options: &Options) -> Result<Open> {
+   let program = match (options.command.is_empty(), options.subsystem) {
+      (true, _) => Program::Shell,
+      (false, false) => Program::Command(options.command.join(" ")),
+      (false, true) => Program::Subsystem(options.command.join(" ")),
+   };
+
+   let interactive = (matches!(program, Program::Shell) || options.terminal) && isatty(io::stdin());
+
+   let terminal = if interactive {
+      Some(Terminal {
+         name: env::var("TERM").unwrap_or_else(|_| "xterm".to_owned()),
+         size: window(&standard(io::stdin())?)?,
+      })
+   } else {
+      None
+   };
+
+   Ok(Open {
+      session: 0,
+      terminal,
+      program,
+      agent: options.agent,
+   })
+}
+
+/// Leaves the terminal that started this process, which then goes on in
+/// the background.
+fn detach() -> Result<()> {
+   let null = OpenOptions::new()
+      .read(true)
+      .write(true)
+      .open("/dev/null")?;
+
+   setsid()?;
+   dup2_stdin(&null)?;
+   dup2_stdout(&null)?;
+   dup2_stderr(&null)?;
+
+   Ok(())
+}
+
+/// Connects to the `qsh` that shares its connection, and starts one when
+/// none runs and the configuration says so. `None` means that this run
+/// makes a connection of its own.
+fn shared(control: &Control, options: &Options) -> Result<Option<OwnedFd>> {
+   if let Ok(socket) = mux::connect(&control.path) {
+      return Ok(Some(socket));
+   }
+
+   if !control.create {
+      return Ok(None);
+   }
+
+   let mut command = Command::new(env::current_exe()?);
+   command
+      .arg("--master")
+      .arg("--congestion")
+      .arg(options.congestion.to_string());
+
+   for line in &options.option {
+      command.arg("-o").arg(line);
+   }
+
+   if let Some(port) = options.port {
+      command.arg("-p").arg(port.to_string());
+   }
+
+   for (flag, value) in [
+      ("-l", options.login.as_deref()),
+      ("-J", options.jump.as_deref()),
+      ("-S", options.control.as_deref()),
+   ] {
+      if let Some(text) = value {
+         command.arg(flag).arg(text);
+      }
+   }
+
+   if let Some(ref file) = options.identity {
+      command.arg("-i").arg(file);
+   }
+
+   // The new process asks for a key's PIN or about an unknown host on this
+   // terminal, and writes one byte to the pipe once the server let it in.
+   let (mut ready, report) = io::pipe()?;
+
+   let mut holder = command
+      .arg("--")
+      .arg(&options.target)
+      .stdout(report)
+      .spawn()
+      .context("starting qsh for the shared connection")?;
+
+   drop(command);
+
+   if ready.read(&mut [0; 1]).is_ok_and(|count| count == 1) {
+      return Ok(Some(mux::connect(&control.path)?));
+   }
+
+   // Another run may have started one at the same moment.
+   let _ = holder.wait();
+
+   match mux::connect(&control.path) {
+      Ok(socket) => Ok(Some(socket)),
+      Err(_) => bail!("the shared connection did not start"),
+   }
+}
+
+/// Runs what the options ask for through the `qsh` behind `socket` and
+/// returns its exit status.
+fn share(socket: &OwnedFd, options: &Options) -> Result<u32> {
+   let signals = SignalPipe::install()?;
+   let signalled = reopen(signals.read_fd())?;
+
+   let open = request(options)?;
+   let interactive = open.terminal.is_some();
+
+   mux::open(socket, open)?;
+   mux::wait(socket, &signalled, interactive)
+}
+
+/// Handles a run that needs no connection of its own and returns its exit
+/// status. That is a question or an order for the `qsh` that shares its
+/// connection, or a session through that `qsh`.
+fn divert(login: &Login, options: &Options, plain: bool) -> Result<Option<u32>> {
+   let Some(ref control) = login.control else {
+      ensure!(
+         options.order.is_none() && !options.master,
+         "no ControlPath names the socket of a shared connection"
+      );
+
+      return Ok(None);
+   };
+
+   match options.order.as_deref() {
+      Some("check") => println!("Master running (pid={})", mux::check(&control.path)?),
+      Some("exit" | "stop") => {
+         mux::stop(&control.path)?;
+         println!("Exit request sent.");
+      },
+      Some(other) => bail!("-O takes check, exit or stop, not {other}"),
+      None => {
+         let socket = if plain {
+            shared(control, options)?
+         } else {
+            None
+         };
+
+         return socket.map(|holder| share(&holder, options)).transpose();
+      },
+   }
+
+   Ok(Some(0))
+}
+
+/// The session this process runs for itself, when it runs one.
+fn first(options: &Options, relaying: bool) -> Result<BTreeMap<u32, Channel>> {
+   let mut channels = BTreeMap::new();
+
+   if !options.forward && !options.master && !relaying {
+      let stdio = Streams {
+         input:  standard(io::stdin())?,
+         output: standard(io::stdout())?,
+         errors: standard(io::stderr())?,
+      };
+
+      channels.insert(
+         1,
+         Channel::new(request(options)?, stdio, Owner::Process(None))?,
+      );
+   }
+
+   Ok(channels)
+}
+
 fn main() -> Result<()> {
    let mut options = Options::parse();
+
+   // Forwards from the configuration belong to the process that holds a
+   // shared connection, so only the command line counts here.
+   let plain = options.local.is_empty()
+      && options.remote.is_empty()
+      && options.dynamic.is_empty()
+      && options.relay.is_none()
+      && !options.forward
+      && !options.master;
+
    let login = options.login()?;
+
+   if let Some(status) = divert(&login, &options, plain)? {
+      process::exit(i32::try_from(status).unwrap_or(255));
+   }
 
    let relay = match options.relay.as_deref().map(endpoint) {
       Some((host, Some(port))) => {
@@ -1358,6 +1483,13 @@ fn main() -> Result<()> {
 
    let waker = Arc::new(Waker::new()?);
 
+   let master = match login.control {
+      Some(ref control) if options.master => Some(Master::listen(control, &waker)?),
+      Some(_) | None => None,
+   };
+
+   let channels = first(&options, relay.is_some())?;
+
    let signals = SignalPipe::install()?;
    let mut signalled = reopen(signals.read_fd())?;
    let interrupted = Arc::clone(&waker);
@@ -1383,19 +1515,12 @@ fn main() -> Result<()> {
    let mut client = Client {
       current: None,
       login,
-      token: None,
       lost: None,
       dialed: None,
       spares: 0,
-      resuming: None,
-      shell: (!options.forward && relay.is_none()).then_some(Shell {
-         program:  match (options.command.is_empty(), options.subsystem) {
-            (true, _) => Program::Shell,
-            (false, false) => Program::Command(options.command.join(" ")),
-            (false, true) => Program::Subsystem(options.command.join(" ")),
-         },
-         terminal: options.terminal,
-      }),
+      channels,
+      issued: 1,
+      master,
       agent: options.agent,
       remotes: options.remote,
       relay,
@@ -1410,27 +1535,26 @@ fn main() -> Result<()> {
       outbox: Outbox::default(),
       attempts: None,
       next: None,
-      session: None,
-      heading: None,
-      errors: None,
-      orphan: None,
-      told: 0,
-      writers: Vec::new(),
-      raw: None,
-      size: None,
+      headings: HashMap::new(),
       status: None,
       done: false,
    };
 
-   drive(&mut transport, &mut client, &addresses)?;
+   let ended = drive(&mut transport, &mut client, &addresses);
 
-   let status = client.status.unwrap_or(255);
-   let writers = mem::take(&mut client.writers);
+   let status = match client.master {
+      Some(_) => {
+         if let Some(ref control) = client.login.control {
+            let _ = fs::remove_file(&control.path);
+         }
+
+         0
+      },
+      None => client.status.unwrap_or(255),
+   };
+
    drop(client);
-
-   for handle in writers {
-      let _ = handle.join();
-   }
+   ended?;
 
    process::exit(i32::try_from(status).unwrap_or(255))
 }
