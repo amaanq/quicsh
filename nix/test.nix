@@ -52,6 +52,13 @@ testers.runNixOSTest {
         client.succeed("rsync -e qsh /tmp/file alice@server:synced")
         server.succeed("grep data /home/alice/copied /home/alice/synced")
 
+    with subtest("an accepted environment variable reaches the session"):
+        assert "LC_PROBE=sent" in client.succeed("qsh -o 'SetEnv LC_PROBE=sent' alice@server env")
+
+    with subtest("a forwarded Unix socket belongs to the account"):
+        client.succeed("(qsh -N -R /home/alice/forward.sock:localhost:1 alice@server >/dev/null 2>&1 &)")
+        server.wait_until_succeeds("test \"$(stat -c %U /home/alice/forward.sock)\" = alice", timeout=30)
+
     with subtest("a terminal session survives a restart of the service"):
         client.succeed(
             "(sleep 600 | script -qfc \"qsh -t alice@server 'sleep 20; echo survived > after'\""
