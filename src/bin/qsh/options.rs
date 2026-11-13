@@ -17,6 +17,7 @@ use misstep::{
 use quicsh::{
    DEFAULT_PORT,
    key::PublicKey,
+   transport::Congestion,
 };
 
 use crate::forward::{
@@ -44,33 +45,37 @@ pub struct Login {
 pub struct Options {
    /// Forward the local SSH agent to the session.
    #[pound(short = 'A')]
-   pub agent:    bool,
+   pub agent:      bool,
    /// Start no session and only forward ports.
    #[pound(short = 'N')]
-   pub forward:  bool,
+   pub forward:    bool,
    /// Run COMMAND on a terminal.
    #[pound(short = 't')]
-   pub terminal: bool,
+   pub terminal:   bool,
    /// The server's UDP port, 22 when not given.
    #[pound(short = 'p', value_name = "PORT")]
-   pub port:     Option<u16>,
+   pub port:       Option<u16>,
    /// The account to log in to, the local user name when not given.
    #[pound(short = 'l', value_name = "USER")]
-   pub login:    Option<String>,
+   pub login:      Option<String>,
    /// Offer only the agent key whose public half is in FILE.
    #[pound(short = 'i', value_name = "FILE")]
-   pub identity: Option<PathBuf>,
+   pub identity:   Option<PathBuf>,
    /// Listen locally and connect each connection to HOST:HOSTPORT from the
    /// server.
    #[pound(short = 'L', value_name = "[BIND:]PORT:HOST:HOSTPORT")]
-   pub local:    Vec<Fixed>,
+   pub local:      Vec<Fixed>,
    /// Listen on the server's loopback and connect each connection to
    /// HOST:HOSTPORT from here.
    #[pound(short = 'R', value_name = "PORT:HOST:HOSTPORT")]
-   pub remote:   Vec<Remote>,
+   pub remote:     Vec<Remote>,
    /// Listen locally as a SOCKS5 proxy that connects from the server.
    #[pound(short = 'D', value_name = "[BIND:]PORT")]
-   pub dynamic:  Vec<Socks>,
+   pub dynamic:    Vec<Socks>,
+   /// Congestion controller for what this side sends, bbr or cubic. Cubic is
+   /// faster on a clean local network and collapses on a lossy one.
+   #[pound(long, value_name = "NAME", default = "bbr")]
+   pub congestion: Congestion,
 
    /// The server, with an optional account name.
    #[pound(value_name = "[USER@]HOST")]

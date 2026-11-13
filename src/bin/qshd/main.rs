@@ -34,9 +34,10 @@ fn main() -> Result<()> {
             host_key:        options.host_key,
             authorized_keys: options.authorized_keys,
             user:            options.user,
+            congestion:      options.congestion,
          })
       },
-      Some(Stage::Network) => network::run(),
+      Some(Stage::Network) => network::run(options.congestion),
       Some(Stage::Session {
          user,
          term,

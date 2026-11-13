@@ -96,7 +96,6 @@ use quicsh::{
       App,
       INTERACTIVE_WINDOW,
       Transport,
-      Tuning,
       drain,
    },
 };
@@ -914,7 +913,7 @@ fn main() -> Result<()> {
       local.listen(&accepted, &waker)?;
    }
 
-   let mut transport = Transport::new(Tuning::default())?;
+   let mut transport = Transport::new(options.congestion)?;
 
    let dial = |endpoint: &mut Transport| -> Result<ConnectionHandle> {
       let handle = endpoint.connect(

@@ -47,8 +47,8 @@ use quicsh::{
    tls,
    transport::{
       App,
+      Congestion,
       Transport,
-      Tuning,
       drain,
    },
 };
@@ -714,7 +714,7 @@ impl App for Server {
 
 /// Serves clients on the socket the monitor hands over, and stops with the
 /// monitor, since a second server could otherwise share the port with it.
-pub fn run() -> Result<()> {
+pub fn run(congestion: Congestion) -> Result<()> {
    set_no_new_privs(true)?;
    set_parent_process_death_signal(Some(Signal::TERM))?;
 
@@ -740,5 +740,5 @@ pub fn run() -> Result<()> {
       waker: Arc::new(Waker::new()?),
    };
 
-   Transport::adopt(socket, listen, crypto, Tuning::default(), opener)?.run(&mut server)
+   Transport::adopt(socket, listen, crypto, congestion, opener)?.run(&mut server)
 }

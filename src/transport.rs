@@ -10,6 +10,11 @@
 
 use std::{
    collections::BTreeMap,
+   fmt::{
+      self,
+      Display,
+      Formatter,
+   },
    io::{
       self,
       IoSliceMut,
@@ -151,19 +156,20 @@ impl FromStr for Congestion {
    }
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Tuning {
-   pub congestion: Congestion,
-   /// Largest UDP payload MTU discovery may try. `None` takes it from the
-   /// route to the peer.
-   pub mtu_bound:  Option<u16>,
+impl Display for Congestion {
+   fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+      formatter.write_str(match *self {
+         Self::Bbr => "bbr",
+         Self::Cubic => "cubic",
+      })
+   }
 }
 
-impl Tuning {
+impl Congestion {
    /// The QUIC transport settings for a path with this payload bound.
    fn transport(self, route_bound: u16) -> Arc<TransportConfig> {
       let mut discovery = MtuDiscoveryConfig::default();
-      discovery.upper_bound(self.mtu_bound.unwrap_or(route_bound));
+      discovery.upper_bound(route_bound);
 
       let mut transport = TransportConfig::default();
 
@@ -175,11 +181,9 @@ impl Tuning {
          .keep_alive_interval(Some(KEEP_ALIVE))
          .mtu_discovery_config(Some(discovery));
 
-      match self.congestion {
-         Congestion::Bbr => transport.congestion_controller_factory(Arc::new(BbrConfig::default())),
-         Congestion::Cubic => {
-            transport.congestion_controller_factory(Arc::new(CubicConfig::default()))
-         },
+      match self {
+         Self::Bbr => transport.congestion_controller_factory(Arc::new(BbrConfig::default())),
+         Self::Cubic => transport.congestion_controller_factory(Arc::new(CubicConfig::default())),
       };
 
       Arc::new(transport)
@@ -636,20 +640,20 @@ enum Source {
 
 pub struct Transport {
    /// Routes datagrams to connections.
-   endpoint: Endpoint,
+   endpoint:   Endpoint,
    /// Present when the transport accepts connections.
-   listener: Option<Listener>,
+   listener:   Option<Listener>,
    /// Every live connection.
-   sessions: BTreeMap<ConnectionHandle, Session>,
+   sessions:   BTreeMap<ConnectionHandle, Session>,
    /// Settings for new connections.
-   tuning:   Tuning,
+   congestion: Congestion,
    /// Turns readable when a local address or route changes. Present once the
    /// transport has dialed a connection.
-   changes:  Option<OwnedFd>,
+   changes:    Option<OwnedFd>,
    /// Receive buffer.
-   recv:     Vec<u8>,
+   recv:       Vec<u8>,
    /// Send buffer.
-   send:     Vec<u8>,
+   send:       Vec<u8>,
 }
 
 impl Transport {
@@ -658,8 +662,8 @@ impl Transport {
    /// # Errors
    ///
    /// Fails when the endpoint rejects its configuration.
-   pub fn new(tuning: Tuning) -> Result<Self, Error> {
-      Self::build(None, tuning)
+   pub fn new(congestion: Congestion) -> Result<Self, Error> {
+      Self::build(None, congestion)
    }
 
    /// A transport that accepts connections on `socket`, which is bound to
@@ -672,7 +676,7 @@ impl Transport {
       socket: OwnedFd,
       local: SocketAddr,
       crypto: Arc<QuicServerConfig>,
-      tuning: Tuning,
+      congestion: Congestion,
       opener: Opener,
    ) -> Result<Self, Error> {
       let listener = Listener {
@@ -682,11 +686,11 @@ impl Transport {
          opener,
       };
 
-      Self::build(Some(listener), tuning)
+      Self::build(Some(listener), congestion)
    }
 
    /// Builds the endpoint around an optional listener.
-   fn build(listener: Option<Listener>, tuning: Tuning) -> Result<Self, Error> {
+   fn build(listener: Option<Listener>, congestion: Congestion) -> Result<Self, Error> {
       let mut config = EndpointConfig::default();
       config
          .max_udp_payload_size(MAX_UDP_PAYLOAD)
@@ -700,7 +704,7 @@ impl Transport {
          endpoint: Endpoint::new(Arc::new(config), server, true, None),
          listener,
          sessions: BTreeMap::new(),
-         tuning,
+         congestion,
          changes: None,
          recv: vec![0; RECV_LEN * BATCH_SIZE],
          send: Vec::with_capacity(RECV_LEN),
@@ -728,7 +732,7 @@ impl Transport {
       let socket = Socket::dial(remote)?;
 
       let mut config = ClientConfig::new(crypto);
-      config.transport_config(self.tuning.transport(socket.payload_bound(remote)?));
+      config.transport_config(self.congestion.transport(socket.payload_bound(remote)?));
 
       let (handle, connection) = self
          .endpoint
@@ -979,7 +983,7 @@ impl Transport {
       };
 
       let mut config = listener.config.clone();
-      config.transport_config(self.tuning.transport(socket.payload_bound(remote)?));
+      config.transport_config(self.congestion.transport(socket.payload_bound(remote)?));
 
       match self
          .endpoint

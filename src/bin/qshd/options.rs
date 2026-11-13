@@ -9,6 +9,8 @@ use std::{
    path::PathBuf,
 };
 
+use quicsh::transport::Congestion;
+
 /// SSH over QUIC server.
 #[derive(pound::Parse)]
 #[pound(name = "qshd", version = env!("CARGO_PKG_VERSION"))]
@@ -26,6 +28,10 @@ pub struct Options {
    /// The account the network process runs as when the server is root.
    #[pound(long, value_name = "NAME", default = "sshd")]
    pub user:            String,
+   /// Congestion controller for what this side sends, bbr or cubic. Cubic is
+   /// faster on a clean local network and collapses on a lossy one.
+   #[pound(long, value_name = "NAME", default = "bbr")]
+   pub congestion:      Congestion,
 
    /// The internal process to run, absent when started by an operator.
    #[pound(subcommand)]

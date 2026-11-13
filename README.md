@@ -110,6 +110,8 @@ switch. I'd like to close that gap, but it isn't closed.
 - Accounts that only exist in LDAP or another NSS source. Lookups read
   `/etc/passwd`.
 - A post-quantum key exchange. This is planned.
+- Sessions that outlive the server. Restarting `qshd` ends every session,
+  so don't upgrade it from inside one.
 - Anything but Linux.
 
 ## Building

@@ -60,7 +60,10 @@ use quicsh::{
    key::private_from_openssh,
    pipe::reopen,
    tls,
-   transport::udp_socket,
+   transport::{
+      Congestion,
+      udp_socket,
+   },
 };
 use ring::rand::{
    SecureRandom as _,
@@ -121,6 +124,8 @@ pub struct Settings {
    pub authorized_keys: Option<PathBuf>,
    /// The account the network process runs as when the monitor is root.
    pub user:            String,
+   /// Congestion controller the network process uses.
+   pub congestion:      Congestion,
 }
 
 /// The directory and socket that reach a client's SSH agent. Dropping it
@@ -416,7 +421,12 @@ pub fn run(settings: Settings) -> Result<()> {
    )?;
 
    let mut network = Command::new(env::current_exe()?);
-   network.arg("network").stdin(remote).env_clear();
+   network
+      .arg("--congestion")
+      .arg(settings.congestion.to_string())
+      .arg("network")
+      .stdin(remote)
+      .env_clear();
 
    if geteuid().is_root() {
       let Some(account) = Account::lookup(&settings.user)? else {
