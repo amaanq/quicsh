@@ -28,8 +28,7 @@ afford to lose :)
   connection, and `qsh` picks it up again. The server keeps the last 256 KiB
   of output for that, and `qsh` says so when more was produced
 - `ed25519` keys, signed through `ssh-agent`
-- `ed25519-sk` keys in the same way, though I haven't tried one against real
-  hardware yet
+- `ed25519-sk` keys in the same way, with the PIN and the touch
 
 ## Usage
 
