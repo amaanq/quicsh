@@ -24,6 +24,7 @@ use quicsh::{
    DEFAULT_PORT,
    config::{
       Host,
+      Target,
       expand,
    },
    key::PublicKey,
@@ -390,13 +391,21 @@ impl Options {
       };
 
       let mut host = Host::default();
-      host.options(&self.option, alias);
+      let local = env::var("USER").unwrap_or_default();
+
+      let target = Target {
+         host:  alias,
+         user:  named.or(self.login.as_deref()),
+         local: &local,
+      };
+
+      host.options(&self.option, target);
 
       if let Some(home) = env::var_os("HOME") {
-         host.read(&Path::new(&home).join(".ssh/config"), alias);
+         host.read(&Path::new(&home).join(".ssh/config"), target);
       }
 
-      host.read(Path::new("/etc/ssh/ssh_config"), alias);
+      host.read(Path::new("/etc/ssh/ssh_config"), target);
 
       let chosen = self.option.iter().find_map(|option| {
          let (name, value) = option.split_once(['=', ' '])?;

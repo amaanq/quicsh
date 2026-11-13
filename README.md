@@ -197,14 +197,16 @@ batch into real packets there, and I haven't measured it between two machines.
 
 - Passwords and PAM. Keys only.
 - X11 forwarding.
-- Most of `ssh_config`. Only `Host`, `Match all`, `Include`, `HostName`,
+- Most of `ssh_config`. Only `Host`, `Match`, `Include`, `HostName`,
   `User`, `IdentityFile`, `IdentityAgent`, `ProxyJump`, `ForwardAgent`,
   `LocalForward`, `RemoteForward`, `DynamicForward`, `ClearAllForwardings`,
   `RequestTTY`, `RemoteCommand`, `StrictHostKeyChecking`, `HostKeyAlias`,
   `ControlMaster`, `ControlPath`, `ControlPersist` and `QshPort` are read.
   `ControlPath` takes `%h`, `%n`, `%p`, `%r`, `%u`, `%i` and `%C`, and `%C`
   is not the hash `ssh` computes. `StrictHostKeyChecking no` behaves like
-  `accept-new`, so a changed host key is always refused.
+  `accept-new`, so a changed host key is always refused. `Match` checks
+  `all`, `host`, `originalhost`, `user` and `localuser`, and a block with
+  `exec` or any other condition is skipped.
 - RSA keys under 2048 bits and RSA signatures over SHA-1.
   `ecdsa-sk` keys are accepted but nobody has tried one.
 - RSA and P-521 host keys. `qshd` takes an `ed25519`, P-256 or P-384 key.

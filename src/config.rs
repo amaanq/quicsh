@@ -1,8 +1,9 @@
 //! The part of OpenSSH's `ssh_config` that names a server and a login.
 //!
-//! - `Host` blocks with `*`, `?` and `!` patterns, `Match all`, and `Include`.
-//!   Any other `Match` block is skipped, since its conditions are not
-//!   evaluated.
+//! - `Host` blocks with `*`, `?` and `!` patterns, and `Include`.
+//! - `Match` blocks with `all`, `host`, `originalhost`, `user` and `localuser`.
+//!   A block with any other condition is skipped, since nothing here runs a
+//!   command or reads the file twice.
 //! - `HostName`, `User`, `IdentityFile`, `IdentityAgent`, `ProxyJump`,
 //!   `ForwardAgent`, the three forward keywords, `ClearAllForwardings`,
 //!   `RequestTTY`, `RemoteCommand`, `StrictHostKeyChecking`, `HostKeyAlias`,
@@ -77,6 +78,17 @@ pub fn expand(path: &str) -> PathBuf {
    }
 }
 
+/// Who a configuration is read for.
+#[derive(Clone, Copy)]
+pub struct Target<'name> {
+   /// The host as the command line names it.
+   pub host:  &'name str,
+   /// The account the command line names, when it names one.
+   pub user:  Option<&'name str>,
+   /// The local account.
+   pub local: &'name str,
+}
+
 /// Whether a `Host` line's patterns cover `name`.
 fn covers<'pattern>(patterns: impl Iterator<Item = &'pattern str>, name: &str) -> bool {
    let mut matched = false;
@@ -93,28 +105,79 @@ fn covers<'pattern>(patterns: impl Iterator<Item = &'pattern str>, name: &str) -
 }
 
 impl Host {
-   /// Adds what the file at `path` says about `name`. A file that cannot be
-   /// read adds nothing.
-   pub fn read(&mut self, path: &Path, name: &str) {
-      self.include(path, name, true, 0);
+   /// Adds what the file at `path` says about `target`. A file that cannot
+   /// be read adds nothing.
+   pub fn read(&mut self, path: &Path, target: Target<'_>) {
+      self.include(path, target, true, 0);
    }
 
    /// Adds what command line options say, each in the form of one line of
    /// the file. They cannot include other files.
-   pub fn options(&mut self, lines: &[String], name: &str) {
-      self.apply(&lines.join("\n"), Path::new(""), name, true, MAX_DEPTH);
+   pub fn options(&mut self, lines: &[String], target: Target<'_>) {
+      self.apply(&lines.join("\n"), Path::new(""), target, true, MAX_DEPTH);
    }
 
    /// Reads one file, which applies from its first line when `active`.
-   fn include(&mut self, path: &Path, name: &str, active: bool, depth: usize) {
+   fn include(&mut self, path: &Path, target: Target<'_>, active: bool, depth: usize) {
       if let Ok(text) = fs::read_to_string(path) {
-         self.apply(&text, path.parent().unwrap_or(path), name, active, depth);
+         self.apply(&text, path.parent().unwrap_or(path), target, active, depth);
       }
    }
 
-   /// Adds what `text` says about `name`. Relative `Include` paths start at
-   /// `base`.
-   fn apply(&mut self, text: &str, base: &Path, name: &str, mut active: bool, depth: usize) {
+   /// Whether every condition of a `Match` line holds, given what was read
+   /// so far. A condition this parser cannot check, such as `exec`, holds
+   /// for nobody, and so does one that needs a second pass over the file.
+   fn matched(&self, conditions: &str, target: Target<'_>) -> bool {
+      let mut words = conditions.split_whitespace().peekable();
+
+      if words.peek().is_none() {
+         return false;
+      }
+
+      while let Some(word) = words.next() {
+         let (negated, keyword) = word
+            .strip_prefix('!')
+            .map_or((false, word), |rest| (true, rest));
+
+         let holds = match keyword.to_ascii_lowercase().as_str() {
+            "all" => true,
+            checked => {
+               let subject = match checked {
+                  "host" => self.hostname.as_deref().unwrap_or(target.host),
+                  "originalhost" => target.host,
+                  "user" => target.user.or(self.user.as_deref()).unwrap_or(target.local),
+                  "localuser" => target.local,
+                  _ => return false,
+               };
+
+               let Some(patterns) = words.next() else {
+                  return false;
+               };
+
+               covers(patterns.trim_matches('"').split(','), subject)
+            },
+         };
+
+         if holds == negated {
+            return false;
+         }
+      }
+
+      true
+   }
+
+   /// Adds what `text` says about `target`. Relative `Include` paths start
+   /// at `base`.
+   fn apply(
+      &mut self,
+      text: &str,
+      base: &Path,
+      target: Target<'_>,
+      mut active: bool,
+      depth: usize,
+   ) {
+      let name = target.host;
+
       for line in text.lines().map(str::trim) {
          if line.is_empty() || line.starts_with('#') {
             continue;
@@ -156,7 +219,7 @@ impl Host {
 
          match lowered.as_str() {
             "host" => active = covers(value.split_whitespace(), name),
-            "match" => active = value.eq_ignore_ascii_case("all"),
+            "match" => active = self.matched(value, target),
             _ if !active || value.is_empty() => {},
             "hostname" if self.hostname.is_none() => {
                self.hostname = Some(value.replace("%h", name));
@@ -168,7 +231,7 @@ impl Host {
             "include" if depth < MAX_DEPTH => {
                for pattern in value.split_whitespace() {
                   for path in matching(&base.join(expand(pattern))) {
-                     self.include(&path, name, active, depth + 1);
+                     self.include(&path, target, active, depth + 1);
                   }
                }
             },
@@ -210,13 +273,28 @@ mod tests {
       PathBuf,
    };
 
-   use crate::config::Host;
+   use crate::config::{
+      Host,
+      Target,
+   };
+
+   /// What `text` says about `name` for the local account `me`, who names
+   /// the remote account `user`.
+   fn lookup_as(text: &str, name: &str, user: Option<&str>) -> Host {
+      let target = Target {
+         host: name,
+         user,
+         local: "me",
+      };
+
+      let mut host = Host::default();
+      host.apply(text, Path::new("/nonexistent"), target, true, 0);
+      host
+   }
 
    /// What `text` says about `name`.
    fn lookup(text: &str, name: &str) -> Host {
-      let mut host = Host::default();
-      host.apply(text, Path::new("/nonexistent"), name, true, 0);
-      host
+      lookup_as(text, name, None)
    }
 
    const CONFIG: &str = "
@@ -257,8 +335,51 @@ mod tests {
       );
    }
 
+   /// `Match` conditions are checked against what is known when the line
+   /// is read, and all of them must hold.
+   #[test]
+   fn match_conditions() {
+      let text = "
+         Match user build
+            QshPort 1
+         Match host *.example.com !localuser root
+            QshPort 2
+         Host box
+            HostName box.example.com
+         Match host *.example.com originalhost box
+            QshPort 3
+         Match exec true
+            QshPort 4
+         Match all
+            QshPort 5
+      ";
+
+      let port = |name, user| lookup_as(text, name, user).port;
+
+      assert_eq!(
+         port("box", Some("build")).as_deref(),
+         Some("1"),
+         "the named account"
+      );
+      assert_eq!(
+         port("box", None).as_deref(),
+         Some("3"),
+         "the name from HostName"
+      );
+      assert_eq!(
+         port("a.example.com", None).as_deref(),
+         Some("2"),
+         "both conditions"
+      );
+      assert_eq!(
+         port("other", None).as_deref(),
+         Some("5"),
+         "exec holds for nobody"
+      );
+   }
+
    /// A negated pattern keeps a host out of a block, and a `Match` block
-   /// with conditions applies to nobody.
+   /// applies only to whom it names.
    #[test]
    fn negation_and_match() {
       let host = lookup(&CONFIG.replacen("User fallback", "", 1), "bad.lan");
