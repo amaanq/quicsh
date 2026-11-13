@@ -23,3 +23,6 @@
 
 !vendor/
 !vendor/**
+
+vendor/**/target/
+vendor/**/Cargo.lock

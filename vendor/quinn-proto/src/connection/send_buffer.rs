@@ -143,6 +143,23 @@ impl SendBuffer {
     pub(super) fn get(&self, offsets: Range<u64>) -> &[u8] {
         let base_offset = self.offset - self.unacked_len as u64;
 
+        // New data sits at the back, behind everything that awaits an ACK.
+        if offsets.start >= base_offset + self.unacked_len as u64 / 2 {
+            let mut segment_end = self.offset;
+            for segment in self.unacked_segments.iter().rev() {
+                let segment_offset = segment_end - segment.len() as u64;
+                if offsets.start >= segment_offset && offsets.start < segment_end {
+                    let start = (offsets.start - segment_offset) as usize;
+                    let end = (offsets.end - segment_offset) as usize;
+
+                    return &segment[start..end.min(segment.len())];
+                }
+                segment_end = segment_offset;
+            }
+
+            return &[];
+        }
+
         let mut segment_offset = base_offset;
         for segment in self.unacked_segments.iter() {
             if offsets.start >= segment_offset
