@@ -72,6 +72,19 @@ pub enum Stage {
       #[pound(long, allow_hyphen_values)]
       original_command: Option<String>,
    },
+   /// Connects to a Unix socket or listens on one as an account, and passes
+   /// the result to standard input.
+   #[pound(hidden)]
+   Reach {
+      /// Account that reaches the socket.
+      user:   String,
+      /// Where the socket is.
+      #[pound(long, allow_hyphen_values)]
+      path:   PathBuf,
+      /// Listen at the path.
+      #[pound(long)]
+      listen: bool,
+   },
    /// One session, run as its account.
    #[pound(hidden)]
    Session {

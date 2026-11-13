@@ -71,6 +71,10 @@ const ASSOCIATE: u8 = 18;
 const TAKEN: u8 = 19;
 /// Tag of [`Message::Close`].
 const CLOSE: u8 = 20;
+/// Tag of [`Message::Reach`].
+const REACH: u8 = 21;
+/// Tag of [`Message::Bind`].
+const BIND: u8 = 22;
 
 /// How long a session waits for a client whose connection died.
 pub const DETACH_LIMIT: Duration = Duration::from_hours(1);
@@ -135,11 +139,22 @@ pub enum Message {
       host: String,
       port: u16,
    },
+   /// Opens a client stream that the server joins to a Unix socket, which
+   /// it connects to as the account.
+   Reach {
+      path: String,
+   },
    /// Asks the server to listen on a loopback port. Port 0 lets it choose.
    Listen {
       listener: u32,
       port:     u16,
    },
+   /// Asks the server to listen on a Unix socket that the account owns.
+   Bind {
+      listener: u32,
+      path:     String,
+   },
+   /// The port is zero for a Unix socket.
    Listening {
       listener: u32,
       port:     u16,
@@ -214,6 +229,14 @@ fn put_counts(out: &mut Vec<u8>, tag: u8, session: u32, counts: [u64; 2]) {
    for count in counts {
       put_string(out, &count.to_be_bytes());
    }
+}
+
+/// Appends the tag and the fields of a message that names a listener and
+/// its port.
+fn put_listener(out: &mut Vec<u8>, tag: u8, listener: u32, port: u16) {
+   out.push(tag);
+   put_u32(out, listener);
+   put_u32(out, port.into());
 }
 
 /// Appends the tag and the one number of a message that carries no more.
@@ -332,15 +355,17 @@ impl Message {
          },
          Self::Connect { ref host, port } => put_target(&mut payload, CONNECT, host, port),
          Self::Associate { ref host, port } => put_target(&mut payload, ASSOCIATE, host, port),
-         Self::Listen { listener, port } => {
-            payload.push(LISTEN);
-            put_u32(&mut payload, listener);
-            put_u32(&mut payload, port.into());
+         Self::Reach { ref path } => {
+            payload.push(REACH);
+            put_string(&mut payload, path.as_bytes());
          },
+         Self::Bind { listener, ref path } => {
+            put_numbered(&mut payload, BIND, listener);
+            put_string(&mut payload, path.as_bytes());
+         },
+         Self::Listen { listener, port } => put_listener(&mut payload, LISTEN, listener, port),
          Self::Listening { listener, port } => {
-            payload.push(LISTENING);
-            put_u32(&mut payload, listener);
-            put_u32(&mut payload, port.into());
+            put_listener(&mut payload, LISTENING, listener, port);
          },
          Self::Refused { listener } => put_numbered(&mut payload, REFUSED, listener),
          Self::Forwarded { listener } => put_numbered(&mut payload, FORWARDED, listener),
@@ -408,6 +433,18 @@ impl Message {
       })
    }
 
+   /// Reads the rest of a message that [`put_listener`] started.
+   fn listener(tag: u8, reader: &mut Reader<'_>) -> Result<Self, Error> {
+      let listener = reader.u32()?;
+      let port = port(reader)?;
+
+      Ok(if tag == LISTEN {
+         Self::Listen { listener, port }
+      } else {
+         Self::Listening { listener, port }
+      })
+   }
+
    /// Reads the payload of one frame, which is the frame without its length.
    ///
    /// # Errors
@@ -457,18 +494,18 @@ impl Message {
                port: port(&mut reader)?,
             }
          },
-         LISTEN => {
-            Self::Listen {
-               listener: reader.u32()?,
-               port:     port(&mut reader)?,
+         REACH => {
+            Self::Reach {
+               path: text(&mut reader)?,
             }
          },
-         LISTENING => {
-            Self::Listening {
+         BIND => {
+            Self::Bind {
                listener: reader.u32()?,
-               port:     port(&mut reader)?,
+               path:     text(&mut reader)?,
             }
          },
+         tag @ (LISTEN | LISTENING) => Self::listener(tag, &mut reader)?,
          REFUSED => {
             Self::Refused {
                listener: reader.u32()?,

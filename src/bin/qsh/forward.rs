@@ -15,6 +15,7 @@ use std::{
       TcpStream,
    },
    os::fd::OwnedFd,
+   path::PathBuf,
    str::FromStr,
    sync::{
       Arc,
@@ -30,7 +31,11 @@ use misstep::{
    ResultExt as _,
    bail,
 };
-use quicsh::pipe::Waker;
+use quicsh::{
+   config::expand,
+   forward::Bound,
+   pipe::Waker,
+};
 
 /// SOCKS protocol version this proxy speaks.
 const SOCKS_VERSION: u8 = 5;
@@ -41,48 +46,71 @@ const SOCKS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Pause after a failed accept.
 const ACCEPT_RETRY: Duration = Duration::from_millis(50);
 
-/// A connection a local listener accepted, with the address the server should
+/// Where a forwarded connection ends up.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Destination {
+   /// A TCP port, connected to from the other side.
+   Tcp {
+      /// Host to connect to.
+      host: String,
+      /// Port to connect to.
+      port: u16,
+   },
+   /// A Unix socket on the other side.
+   Unix(String),
+}
+
+/// A connection a local listener accepted, with where the server should
 /// connect it to.
 pub struct Inbound {
    /// The accepted connection.
-   pub socket: OwnedFd,
-   /// Host the server should connect to.
-   pub host:   String,
-   /// Port the server should connect to.
-   pub port:   u16,
+   pub socket:      OwnedFd,
+   /// What the server connects to.
+   pub destination: Destination,
 }
 
 /// Where a local listener sends its connections.
 #[derive(Clone)]
 pub enum Target {
-   /// `-L`, always the same remote address.
-   Fixed {
-      /// Host the server connects to.
-      host: String,
-      /// Port the server connects to.
-      port: u16,
-   },
+   /// `-L`, always the same place.
+   Fixed(Destination),
    /// `-D`, whatever each connection asks for over SOCKS5.
    Socks,
 }
 
+/// Where a local listener sits.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Place {
+   /// A TCP address.
+   Tcp(SocketAddr),
+   /// A Unix socket.
+   Unix(PathBuf),
+}
+
 /// A local listener and where its connections go.
 pub struct Local {
-   /// Address the listener binds.
-   pub bind:   SocketAddr,
+   /// Where the listener sits.
+   pub bind:   Place,
    /// Where accepted connections are sent.
    pub target: Target,
 }
 
-/// `-R`: the server listens on `port` and connections go to `host:target`
-/// as seen from the client.
+/// Where the server listens for `-R`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Entry {
+   /// A loopback port, 0 to let the server choose.
+   Port(u16),
+   /// A Unix socket, from the account's home when relative.
+   Path(String),
+}
+
+/// `-R`: the server listens and connections go to `target` as seen from
+/// the client.
 pub struct Remote {
-   /// Port the server listens on, 0 to let it choose.
-   pub port:   u16,
-   /// Host the client connects to.
-   pub host:   String,
-   /// Port the client connects to.
-   pub target: u16,
+   /// Where the server listens.
+   pub listen: Entry,
+   /// What the client connects to.
+   pub target: Destination,
 }
 
 /// Parses a bind address and port, with loopback as the default address.
@@ -98,27 +126,52 @@ fn bind(address: Option<&str>, port: &str) -> Result<SocketAddr> {
    ))
 }
 
-/// `-L [bind:]port:host:hostport`.
+/// Splits a forward into the fields that say where to listen and the
+/// destination. As in OpenSSH, a field with a slash is a Unix socket.
+fn split(spec: &str) -> Result<(Vec<&str>, Destination)> {
+   let mut fields = spec.split(':').collect::<Vec<&str>>();
+
+   let destination = match *fields.as_slice() {
+      [.., path] if path.contains('/') => {
+         fields.truncate(fields.len() - 1);
+         Destination::Unix(path.to_owned())
+      },
+      [.., host, port] => {
+         let parsed = port.parse::<u16>().context("bad target port")?;
+         let named = host.to_owned();
+
+         fields.truncate(fields.len() - 2);
+         Destination::Tcp {
+            host: named,
+            port: parsed,
+         }
+      },
+      _ => bail!("no destination in {spec}"),
+   };
+
+   Ok((fields, destination))
+}
+
+/// `-L [bind:]port:host:hostport`, where a path may stand for either half.
 pub struct Fixed(Local);
 
 impl FromStr for Fixed {
    type Err = Report;
 
    fn from_str(spec: &str) -> Result<Self> {
-      let fields = spec.split(':').collect::<Vec<&str>>();
+      let (fields, destination) = split(spec)?;
 
-      let (bind, host, port) = match *fields.as_slice() {
-         [port, host, target] => (bind(None, port)?, host, target),
-         [address, port, host, target] => (bind(Some(address), port)?, host, target),
+      let place = match *fields.as_slice() {
+         [path] if path.contains('/') => Place::Unix(expand(path)),
+         [port] => Place::Tcp(bind(None, port)?),
+         [address, port] => Place::Tcp(bind(Some(address), port)?),
          _ => bail!("expected [bind:]port:host:hostport, got {spec}"),
       };
 
-      let target = Target::Fixed {
-         host: host.to_owned(),
-         port: port.parse::<u16>().context("bad target port")?,
-      };
-
-      Ok(Self(Local { bind, target }))
+      Ok(Self(Local {
+         bind:   place,
+         target: Target::Fixed(destination),
+      }))
    }
 }
 
@@ -129,13 +182,13 @@ impl FromStr for Socks {
    type Err = Report;
 
    fn from_str(spec: &str) -> Result<Self> {
-      let bind = match spec.split_once(':') {
+      let place = match spec.split_once(':') {
          Some((address, port)) => bind(Some(address), port)?,
          None => bind(None, spec)?,
       };
 
       Ok(Self(Local {
-         bind,
+         bind:   Place::Tcp(place),
          target: Target::Socks,
       }))
    }
@@ -155,12 +208,46 @@ impl From<Socks> for Local {
 
 impl Local {
    /// Binds now, so a taken port fails before the connection starts, then
-   /// accepts on a thread.
-   pub fn listen(self, inbound: &Sender<Inbound>, waker: &Arc<Waker>) -> Result<()> {
-      let listener =
-         TcpListener::bind(self.bind).with_context(|| format!("listening on {}", self.bind))?;
+   /// accepts on a thread. A Unix socket's file lasts as long as what this
+   /// returns.
+   pub fn listen(self, inbound: &Sender<Inbound>, waker: &Arc<Waker>) -> Result<Option<Bound>> {
       let sender = inbound.clone();
       let notifier = Arc::clone(waker);
+
+      let address = match self.bind {
+         Place::Tcp(address) => address,
+         Place::Unix(path) => {
+            let Target::Fixed(destination) = self.target else {
+               bail!("a SOCKS proxy listens on a port");
+            };
+
+            let (bound, listener) =
+               Bound::listen(&path).with_context(|| format!("listening on {}", path.display()))?;
+
+            thread::spawn(move || -> ! {
+               loop {
+                  let Ok((stream, _)) = listener.accept() else {
+                     thread::sleep(ACCEPT_RETRY);
+                     continue;
+                  };
+
+                  let accepted = Inbound {
+                     socket:      stream.into(),
+                     destination: destination.clone(),
+                  };
+
+                  if sender.send(accepted).is_ok() {
+                     notifier.wake();
+                  }
+               }
+            });
+
+            return Ok(Some(bound));
+         },
+      };
+
+      let listener =
+         TcpListener::bind(address).with_context(|| format!("listening on {address}"))?;
 
       thread::spawn(move || -> ! {
          loop {
@@ -176,53 +263,55 @@ impl Local {
             // A SOCKS client may be slow to state its target, so each
             // connection negotiates on its own thread.
             thread::spawn(move || {
-               let Ok((host, port)) = resolve(&stream, target) else {
+               let Ok(destination) = resolve(&stream, target) else {
                   return;
                };
 
-               let socket = OwnedFd::from(stream);
+               let accepted = Inbound {
+                  socket: stream.into(),
+                  destination,
+               };
 
-               if forward.send(Inbound { socket, host, port }).is_ok() {
+               if forward.send(accepted).is_ok() {
                   notify.wake();
                }
             });
          }
       });
 
-      Ok(())
+      Ok(None)
    }
 }
 
 impl FromStr for Remote {
    type Err = Report;
 
-   /// Parses `-R port:host:hostport`.
+   /// Parses `-R port:host:hostport`, where a path may stand for either
+   /// half.
    fn from_str(spec: &str) -> Result<Self> {
-      let fields = spec.split(':').collect::<Vec<&str>>();
+      let (fields, target) = split(spec)?;
 
-      let [port, host, target] = *fields.as_slice() else {
-         bail!("expected port:host:hostport, got {spec}");
+      let listen = match *fields.as_slice() {
+         [path] if path.contains('/') => Entry::Path(path.to_owned()),
+         [port] => Entry::Port(port.parse::<u16>().context("bad port")?),
+         _ => bail!("expected port:host:hostport, got {spec}"),
       };
 
-      Ok(Self {
-         port:   port.parse::<u16>().context("bad port")?,
-         host:   host.to_owned(),
-         target: target.parse::<u16>().context("bad target port")?,
-      })
+      Ok(Self { listen, target })
    }
 }
 
 /// Finds the address a new connection should reach.
-fn resolve(stream: &TcpStream, target: Target) -> io::Result<(String, u16)> {
+fn resolve(stream: &TcpStream, target: Target) -> io::Result<Destination> {
    stream.set_nodelay(true)?;
 
    match target {
-      Target::Fixed { host, port } => Ok((host, port)),
+      Target::Fixed(destination) => Ok(destination),
       Target::Socks => {
          stream.set_read_timeout(Some(SOCKS_TIMEOUT))?;
-         let address = socks(stream)?;
+         let (host, port) = socks(stream)?;
          stream.set_read_timeout(None)?;
-         Ok(address)
+         Ok(Destination::Tcp { host, port })
       },
    }
 }
@@ -285,11 +374,26 @@ fn socks(mut stream: &TcpStream) -> io::Result<(String, u16)> {
 
 #[cfg(test)]
 mod tests {
+   use std::path::PathBuf;
+
    use crate::forward::{
+      Destination,
+      Entry,
       Fixed,
+      Place,
       Remote,
       Target,
    };
+
+   /// The destination of a `-L` spec.
+   fn destination(spec: &str) -> Destination {
+      let Fixed(local) = spec.parse::<Fixed>().unwrap();
+
+      match local.target {
+         Target::Fixed(destination) => destination,
+         Target::Socks => panic!("{spec} is no SOCKS proxy"),
+      }
+   }
 
    /// `-L` binds loopback unless the spec names an address.
    #[test]
@@ -297,11 +401,59 @@ mod tests {
       let Fixed(short) = "8080:example.com:80".parse::<Fixed>().unwrap();
       let Fixed(long) = "0.0.0.0:8080:example.com:80".parse::<Fixed>().unwrap();
 
-      assert_eq!(short.bind.to_string(), "127.0.0.1:8080", "default address");
-      assert_eq!(long.bind.to_string(), "0.0.0.0:8080", "named address");
-      assert!(
-         matches!(short.target, Target::Fixed { ref host, port: 80 } if host == "example.com"),
+      assert_eq!(
+         short.bind,
+         Place::Tcp("127.0.0.1:8080".parse().unwrap()),
+         "default address"
+      );
+      assert_eq!(
+         long.bind,
+         Place::Tcp("0.0.0.0:8080".parse().unwrap()),
+         "named address"
+      );
+      assert_eq!(
+         destination("8080:example.com:80"),
+         Destination::Tcp {
+            host: "example.com".to_owned(),
+            port: 80,
+         },
          "target"
+      );
+   }
+
+   /// A field with a slash is a Unix socket, on either side.
+   #[test]
+   fn socket_specs() {
+      let Fixed(both) = "/tmp/near.sock:/run/far.sock".parse::<Fixed>().unwrap();
+      let Fixed(mixed) = "/tmp/near.sock:example.com:80".parse::<Fixed>().unwrap();
+      let remote = "/run/far.sock:localhost:22".parse::<Remote>().unwrap();
+      let ported = "0:/tmp/near.sock".parse::<Remote>().unwrap();
+
+      assert_eq!(
+         both.bind,
+         Place::Unix(PathBuf::from("/tmp/near.sock")),
+         "local socket"
+      );
+      assert_eq!(
+         destination("9000:/run/far.sock"),
+         Destination::Unix("/run/far.sock".to_owned()),
+         "port to socket"
+      );
+      assert_eq!(
+         mixed.bind,
+         Place::Unix(PathBuf::from("/tmp/near.sock")),
+         "socket to port"
+      );
+      assert_eq!(
+         remote.listen,
+         Entry::Path("/run/far.sock".to_owned()),
+         "remote socket"
+      );
+      assert_eq!(ported.listen, Entry::Port(0), "remote port");
+      assert_eq!(
+         ported.target,
+         Destination::Unix("/tmp/near.sock".to_owned()),
+         "socket on this side"
       );
    }
 
@@ -316,6 +468,12 @@ mod tests {
       assert!(
          "70000:example.com:80".parse::<Remote>().is_err(),
          "port out of range"
+      );
+      assert!(
+         "1.2.3.4:/tmp/near.sock:/run/far.sock"
+            .parse::<Fixed>()
+            .is_err(),
+         "address before a socket"
       );
    }
 }

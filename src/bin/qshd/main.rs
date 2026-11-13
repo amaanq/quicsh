@@ -22,7 +22,10 @@ use quicsh::{
 };
 
 use crate::{
-   child::Launch,
+   child::{
+      Launch,
+      Reach,
+   },
    hold::Hold,
    monitor::Settings,
    options::{
@@ -72,6 +75,7 @@ fn main() -> Result<()> {
 
          hold.run()
       },
+      Some(Stage::Reach { user, path, listen }) => Reach { user, path, listen }.run(),
       Some(Stage::Session {
          user,
          term,

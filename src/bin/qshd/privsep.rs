@@ -74,6 +74,8 @@ const SPAWN: u8 = 6;
 const LOGOUT: u8 = 8;
 /// Tag of [`Request::Attach`].
 const ATTACH: u8 = 9;
+/// Tag of [`Request::Reach`].
+const REACH: u8 = 10;
 
 /// Tag of [`Reply::Signature`].
 const SIGNATURE: u8 = 2;
@@ -128,6 +130,17 @@ pub enum Request {
       grant: u64,
       /// What the client showed for it.
       token: Token,
+   },
+   /// Asks for a process that opens a Unix socket as the login's account.
+   /// The answer is a socket pair on which that process passes the socket.
+   /// It removes a listener's file when the pair closes.
+   Reach {
+      /// The login that forwards the socket.
+      grant:  u64,
+      /// Where the socket is.
+      path:   String,
+      /// Whether to listen there, and connect otherwise.
+      listen: bool,
    },
 }
 
@@ -250,6 +263,16 @@ impl Request {
             put_u64(&mut out, grant);
             put_string(&mut out, &token);
          },
+         Self::Reach {
+            grant,
+            path,
+            listen,
+         } => {
+            out.push(REACH);
+            put_u64(&mut out, grant);
+            put_string(&mut out, path.as_bytes());
+            out.push(u8::from(listen));
+         },
       }
 
       out
@@ -300,6 +323,15 @@ impl Request {
             Self::Attach {
                grant: u64_from(&mut reader)?,
                token: reader.array()?,
+            }
+         },
+         REACH => {
+            Self::Reach {
+               grant:  u64_from(&mut reader)?,
+               path:   str::from_utf8(reader.string()?)
+                  .map_err(|_| Error::Frame)?
+                  .to_owned(),
+               listen: reader.byte()? != 0,
             }
          },
          _ => return Err(Error::Frame),
@@ -547,6 +579,17 @@ impl Helper {
          },
          _ => bail!("unexpected reply from the monitor"),
       }
+   }
+
+   /// Asks for a process that connects to the Unix socket at `path` as the
+   /// login's account, or listens there. The socket arrives on what this
+   /// returns.
+   pub fn reach(&self, grant: u64, path: String, listen: bool) -> Result<OwnedFd> {
+      self.descriptor(Request::Reach {
+         grant,
+         path,
+         listen,
+      })
    }
 
    /// Asks for the holder of the session `token` names, which is `None` when

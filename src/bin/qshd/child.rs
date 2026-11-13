@@ -8,9 +8,12 @@ use std::{
    convert::Infallible,
    env,
    io,
-   os::unix::process::{
-      CommandExt as _,
-      ExitStatusExt as _,
+   os::{
+      fd::AsFd as _,
+      unix::process::{
+         CommandExt as _,
+         ExitStatusExt as _,
+      },
    },
    path::{
       Path,
@@ -20,6 +23,7 @@ use std::{
       Command,
       ExitStatus,
    },
+   time::Duration,
 };
 
 use misstep::{
@@ -28,8 +32,26 @@ use misstep::{
    ResultExt as _,
    bail,
 };
-use quicsh::auth::Account;
+use quicsh::{
+   auth::Account,
+   forward::Bound,
+   pipe::send_message,
+};
 use rustix::{
+   net::{
+      AddressFamily,
+      RecvFlags,
+      SocketAddrUnix,
+      SocketFlags,
+      SocketType,
+      connect,
+      recv,
+      socket_with,
+      sockopt::{
+         Timeout,
+         set_socket_timeout,
+      },
+   },
    process::{
       Gid,
       Signal,
@@ -81,6 +103,64 @@ pub fn exit_code(status: ExitStatus) -> u32 {
       .or_else(|| status.signal().map(|signal| 128 + signal))
       .and_then(|code| u32::try_from(code).ok())
       .unwrap_or(255)
+}
+
+/// How long a connection to a forwarded Unix socket may take. Without a
+/// limit, a socket that never accepts would hold a process for good.
+const REACH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A Unix socket to forward, which only the account can open.
+pub struct Reach {
+   /// Account that reaches the socket.
+   pub user:   String,
+   /// Where the socket is, from the account's home when relative.
+   pub path:   PathBuf,
+   /// Whether to listen there.
+   pub listen: bool,
+}
+
+impl Reach {
+   /// Becomes the account, opens the socket and passes it to the network
+   /// process on standard input. A listener's file is removed once the
+   /// network process closes its side.
+   pub fn run(&self) -> Result<()> {
+      let account = Account::lookup(&self.user)?.context("account vanished after login")?;
+      let link = io::stdin().as_fd().try_clone_to_owned()?;
+
+      become_account(&account)?;
+
+      if self.path.is_relative() {
+         env::set_current_dir(&account.home)
+            .with_context(|| format!("entering {}", account.home.display()))?;
+      }
+
+      if self.listen {
+         let (bound, listener) = Bound::listen(&self.path)
+            .with_context(|| format!("listening on {}", self.path.display()))?;
+
+         send_message(&link, &[0], &[listener.as_fd()])?;
+         drop(listener);
+
+         let _ = recv(&link, &mut [0_u8; 1], RecvFlags::empty());
+         drop(bound);
+      } else {
+         let socket = socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+         )?;
+
+         set_socket_timeout(&socket, Timeout::Send, Some(REACH_TIMEOUT))?;
+         connect(&socket, &SocketAddrUnix::new(&self.path)?)
+            .with_context(|| format!("connecting to {}", self.path.display()))?;
+         set_socket_timeout(&socket, Timeout::Send, None)?;
+
+         send_message(&link, &[0], &[socket.as_fd()])?;
+      }
+
+      Ok(())
+   }
 }
 
 /// What one session process runs.

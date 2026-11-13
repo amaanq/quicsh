@@ -7,6 +7,10 @@
 //! which is what carries a connection to a server behind a jump host.
 
 use std::{
+   fs::{
+      self,
+      Permissions,
+   },
    io::{
       self,
       Read as _,
@@ -24,10 +28,21 @@ use std::{
    },
    os::{
       fd::OwnedFd,
-      unix::net::{
-         UnixListener,
-         UnixStream,
+      unix::{
+         fs::{
+            FileTypeExt as _,
+            MetadataExt as _,
+            PermissionsExt as _,
+         },
+         net::{
+            UnixListener,
+            UnixStream,
+         },
       },
+   },
+   path::{
+      Path,
+      PathBuf,
    },
    sync::{
       Arc,
@@ -58,12 +73,19 @@ use rustix::{
    },
    io::Errno,
    net::{
+      AddressFamily,
       RecvFlags,
       SendFlags,
       Shutdown,
+      SocketAddrUnix,
+      SocketFlags,
+      SocketType,
+      bind,
+      listen,
       recv,
       send,
       shutdown,
+      socket_with,
    },
    time::Timespec,
 };
@@ -71,12 +93,17 @@ use rustix::{
 use crate::{
    control::Message,
    error::Error,
-   pipe::Waker,
+   pipe::{
+      Waker,
+      receive_message,
+   },
    relay::Relay,
 };
 
 /// Pause after a failed accept.
 const ACCEPT_RETRY: Duration = Duration::from_millis(50);
+/// Connections a forwarded Unix socket holds before one is accepted.
+const UNIX_BACKLOG: i32 = 128;
 
 /// A listening socket whose accepted connections arrive on a channel.
 /// Dropping it stops the listener.
@@ -171,6 +198,96 @@ impl Drop for Acceptor {
       self.closed.store(true, Ordering::Relaxed);
       let _ = shutdown(&self.listener, Shutdown::Both);
    }
+}
+
+/// A Unix socket file that is removed with this value.
+pub struct Bound {
+   /// Where the socket is.
+   path:  PathBuf,
+   /// Device and inode of the socket file. A file that took its place
+   /// stays.
+   named: (u64, u64),
+}
+
+impl Bound {
+   /// Listens at `path`, which only the owner may connect to. A socket file
+   /// that nobody listens on any more is replaced.
+   ///
+   /// # Errors
+   ///
+   /// Fails when the path is taken or cannot be written.
+   pub fn listen(path: &Path) -> io::Result<(Self, UnixListener)> {
+      let address = SocketAddrUnix::new(path)?;
+      let socket = socket_with(
+         AddressFamily::UNIX,
+         SocketType::STREAM,
+         SocketFlags::CLOEXEC,
+         None,
+      )?;
+
+      if bind(&socket, &address) == Err(Errno::ADDRINUSE) {
+         let stale = fs::symlink_metadata(path)?.file_type().is_socket()
+            && UnixStream::connect(path)
+               .is_err_and(|error| error.kind() == io::ErrorKind::ConnectionRefused);
+
+         if !stale {
+            return Err(Errno::ADDRINUSE.into());
+         }
+
+         fs::remove_file(path)?;
+         bind(&socket, &address)?;
+      }
+
+      let file = fs::symlink_metadata(path)?;
+
+      let bound = Self {
+         path:  path.to_owned(),
+         named: (file.dev(), file.ino()),
+      };
+
+      // Nobody can connect before the socket listens, so the mode is in
+      // place in time without a change of the process's file mode mask.
+      fs::set_permissions(path, Permissions::from_mode(0o600))?;
+      listen(&socket, UNIX_BACKLOG)?;
+
+      Ok((bound, socket.into()))
+   }
+}
+
+impl Drop for Bound {
+   fn drop(&mut self) {
+      let unchanged =
+         fs::symlink_metadata(&self.path).is_ok_and(|file| (file.dev(), file.ino()) == self.named);
+
+      if unchanged {
+         let _ = fs::remove_file(&self.path);
+      }
+   }
+}
+
+/// Waits on a thread for the socket that the other side of `link` passes
+/// as a descriptor. The receiver yields the result once.
+///
+/// # Errors
+///
+/// Fails when the process is out of file descriptors.
+pub fn handed(link: &OwnedFd, waker: &Arc<Waker>) -> io::Result<Receiver<io::Result<OwnedFd>>> {
+   let (result, receiver) = channel();
+   let source = link.try_clone()?;
+   let notifier = Arc::clone(waker);
+
+   thread::spawn(move || {
+      let passed = receive_message(&source, 1).and_then(|message| {
+         message
+            .and_then(|(_, descriptors)| descriptors.into_iter().next())
+            .ok_or_else(|| io::ErrorKind::ConnectionRefused.into())
+      });
+
+      let _ = result.send(passed);
+      notifier.wake();
+   });
+
+   Ok(receiver)
 }
 
 /// Largest datagram a relay carries, which is what two length bytes count.
@@ -370,6 +487,30 @@ impl Forwards {
          buffered,
          finished,
       });
+   }
+
+   /// Joins `stream` to the socket that arrives on `link`, as [`handed`]
+   /// describes. `buffered` and `finished` describe data already read from
+   /// `stream`.
+   ///
+   /// # Errors
+   ///
+   /// Fails when the process is out of file descriptors.
+   pub fn handed(
+      &mut self,
+      stream: StreamId,
+      link: &OwnedFd,
+      (buffered, finished): (Vec<u8>, bool),
+      waker: &Arc<Waker>,
+   ) -> Result<(), Error> {
+      self.dials.push(Dial {
+         stream,
+         pending: handed(link, waker).map_err(Error::Forward)?,
+         buffered,
+         finished,
+      });
+
+      Ok(())
    }
 
    /// Joins `stream` to an already connected socket.

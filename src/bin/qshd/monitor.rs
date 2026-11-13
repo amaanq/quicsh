@@ -13,7 +13,6 @@ use std::{
       self,
       Write as _,
    },
-   mem,
    net::{
       IpAddr,
       SocketAddr,
@@ -229,14 +228,15 @@ impl Monitor {
             .map_or(u64::MAX, |since| since.as_secs()),
       };
 
-      let Some(mut permit) = account.authorizes(&login.key, keys_file, &attempt)? else {
+      let Some(permit) = account.authorizes(&login.key, keys_file, &attempt)? else {
          return Ok(Reply::Denied);
       };
 
-      // The network process is the one that opens and accepts forwards.
+      // The network process opens and accepts forwards on ports. The ones
+      // on Unix sockets are checked here.
       let reply = Reply::Granted {
          grant:      self.issue(),
-         forwarding: mem::take(&mut permit.forwarding),
+         forwarding: permit.forwarding.clone(),
       };
 
       if let Reply::Granted { grant, .. } = reply {
@@ -382,6 +382,49 @@ impl Monitor {
       Ok((Reply::Held { token }, vec![link]))
    }
 
+   /// Starts a process that opens a Unix socket as the grant's account, and
+   /// answers with the socket pair it passes the socket on.
+   fn reach(&self, id: u64, path: &str, listening: bool) -> Result<(Reply, Vec<OwnedFd>)> {
+      let grant = self.grants.get(&id).context("unknown grant")?;
+      let forwarding = &grant.permit.forwarding;
+
+      let permitted = if listening {
+         forwarding.permits_bind()
+      } else {
+         forwarding.permits_reach()
+      };
+
+      ensure!(permitted, "this key may not forward that socket");
+
+      let (near, far) = socketpair(
+         AddressFamily::UNIX,
+         SocketType::SEQPACKET,
+         SocketFlags::CLOEXEC,
+         None,
+      )?;
+
+      let mut command = Command::new(env::current_exe()?);
+      command
+         .arg("reach")
+         .arg(&grant.account.name)
+         .arg(format!("--path={path}"));
+
+      if listening {
+         command.arg("--listen");
+      }
+
+      let mut child = command
+         .stdin(far)
+         .spawn()
+         .context("starting the socket process")?;
+
+      thread::spawn(move || {
+         let _ = child.wait();
+      });
+
+      Ok((Reply::Done, vec![near]))
+   }
+
    /// Reads the restart secret, making one when this boot has none yet.
    fn secret(&self) -> Result<Vec<u8>> {
       let path = self.holders.join(RESTART_SECRET);
@@ -465,6 +508,11 @@ impl Monitor {
             plain(Reply::Done)
          },
          Request::Attach { grant, token } => self.attach(grant, token),
+         Request::Reach {
+            grant,
+            path,
+            listen,
+         } => self.reach(grant, &path, listen),
       }
    }
 }

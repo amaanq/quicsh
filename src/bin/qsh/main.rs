@@ -170,6 +170,8 @@ use crate::{
       window,
    },
    forward::{
+      Destination,
+      Entry,
       Inbound,
       Local,
       Remote,
@@ -740,9 +742,14 @@ impl Client {
    /// Asks the server for the `-R` listeners.
    fn listen(&mut self) {
       for (listener, remote) in (0..).zip(&self.remotes) {
-         self.outbox.push(&Message::Listen {
-            listener,
-            port: remote.port,
+         self.outbox.push(&match remote.listen {
+            Entry::Port(port) => Message::Listen { listener, port },
+            Entry::Path(ref path) => {
+               Message::Bind {
+                  listener,
+                  path: path.clone(),
+               }
+            },
          });
       }
    }
@@ -792,13 +799,28 @@ impl Client {
                .and_then(|index| self.remotes.get(index));
 
             if let Some(remote) = target {
-               self.forwards.dial(
-                  stream,
-                  (remote.host.clone(), remote.target),
-                  (rest, finished),
-                  &self.waker,
-               );
-               return Ok(());
+               match remote.target {
+                  Destination::Tcp { ref host, port } => {
+                     self.forwards.dial(
+                        stream,
+                        (host.clone(), port),
+                        (rest, finished),
+                        &self.waker,
+                     );
+                     return Ok(());
+                  },
+                  Destination::Unix(ref path) => {
+                     if let Ok(socket) = UnixStream::connect(path) {
+                        self.forwards.attach(
+                           stream,
+                           socket.into(),
+                           (rest, finished),
+                           &self.waker,
+                        )?;
+                        return Ok(());
+                     }
+                  },
+               }
             }
          },
          Message::Agent if self.agent => {
@@ -826,9 +848,9 @@ impl Client {
             continue;
          };
 
-         let connect = Message::Connect {
-            host: inbound.host,
-            port: inbound.port,
+         let connect = match inbound.destination {
+            Destination::Tcp { host, port } => Message::Connect { host, port },
+            Destination::Unix(path) => Message::Reach { path },
          };
 
          self
@@ -907,18 +929,29 @@ impl Client {
                let chosen = usize::try_from(listener)
                   .ok()
                   .and_then(|index| self.remotes.get(index))
-                  .is_some_and(|remote| remote.port == 0);
+                  .is_some_and(|remote| remote.listen == Entry::Port(0));
 
                if chosen {
                   eprintln!("Allocated port {port} for remote forward\r");
                }
             },
             Message::Refused { listener } => {
-               let port = usize::try_from(listener)
+               let wanted = usize::try_from(listener)
                   .ok()
-                  .and_then(|index| self.remotes.get(index))
-                  .map_or(0, |remote| remote.port);
-               eprintln!("Warning: remote port forwarding failed for listen port {port}\r");
+                  .and_then(|index| self.remotes.get(index));
+
+               if let Some(remote) = wanted {
+                  match remote.listen {
+                     Entry::Path(ref path) => {
+                        eprintln!("Warning: remote forwarding failed for listen path {path}\r");
+                     },
+                     Entry::Port(port) => {
+                        eprintln!(
+                           "Warning: remote port forwarding failed for listen port {port}\r"
+                        );
+                     },
+                  }
+               }
             },
             _ => bail!("unexpected control message from the server"),
          }
@@ -1500,6 +1533,7 @@ fn main() -> Result<()> {
    });
 
    let (accepted, inbound) = channel();
+   let mut sockets = Vec::new();
 
    for local in options
       .local
@@ -1507,7 +1541,7 @@ fn main() -> Result<()> {
       .map(Local::from)
       .chain(options.dynamic.into_iter().map(Local::from))
    {
-      local.listen(&accepted, &waker)?;
+      sockets.extend(local.listen(&accepted, &waker)?);
    }
 
    let mut transport = Transport::new(options.congestion)?;
@@ -1554,6 +1588,7 @@ fn main() -> Result<()> {
    };
 
    drop(client);
+   drop(sockets);
    ended?;
 
    process::exit(i32::try_from(status).unwrap_or(255))

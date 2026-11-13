@@ -7,12 +7,22 @@ use std::{
       HashMap,
    },
    io,
+   mem,
    net::{
       Ipv4Addr,
       SocketAddr,
    },
-   os::fd::AsFd as _,
-   sync::Arc,
+   os::fd::{
+      AsFd as _,
+      OwnedFd,
+   },
+   sync::{
+      Arc,
+      mpsc::{
+         Receiver,
+         TryRecvError,
+      },
+   },
    time::{
       Duration,
       Instant,
@@ -39,6 +49,7 @@ use quicsh::{
    forward::{
       Acceptor,
       Forwards,
+      handed,
    },
    key::PublicKey,
    pipe::Waker,
@@ -205,8 +216,108 @@ struct Peer {
    sessions:  BTreeMap<u32, Session>,
    /// Every forwarded connection in progress.
    forwards:  Forwards,
-   /// Remote listeners by the client's number for them.
-   listeners: BTreeMap<u32, Acceptor>,
+   /// Remote listeners by the client's number for them. One on a Unix
+   /// socket comes with the link to the process that made it, which
+   /// removes the socket's file when the link closes.
+   listeners: BTreeMap<u32, (Acceptor, Option<OwnedFd>)>,
+   /// Unix sockets that a process is still making for a listener.
+   binding:   Vec<Binding>,
+}
+
+impl Peer {
+   /// Asks for a listener on the Unix socket at `path`, or tells the client
+   /// that there will be none.
+   fn listen(&mut self, listener: u32, path: String, waker: &Arc<Waker>) -> Result<()> {
+      let Some(ref grant) = self.grant else {
+         bail!("forward before login");
+      };
+
+      let allowed = grant.forwarding.permits_bind()
+         && self.listeners.len() + self.binding.len() < MAX_LISTENERS
+         && !self.listeners.contains_key(&listener)
+         && self.binding.iter().all(|other| other.listener != listener);
+
+      let started = allowed
+         .then(|| grant.helper.reach(grant.id, path, true).ok())
+         .flatten()
+         .and_then(|link| Some((handed(&link, waker).ok()?, link)));
+
+      match started {
+         Some((pending, link)) => {
+            self.binding.push(Binding {
+               listener,
+               link,
+               pending,
+            });
+         },
+         None => self.outbox.push(&Message::Refused { listener }),
+      }
+
+      Ok(())
+   }
+
+   /// Joins `stream` to the Unix socket at `path`, which a process of the
+   /// account connects to. `pending` is what was already read from `stream`.
+   fn reach(
+      &mut self,
+      connection: &mut Connection,
+      stream: StreamId,
+      path: String,
+      pending: (Vec<u8>, bool),
+      waker: &Arc<Waker>,
+   ) -> Result<()> {
+      let link = self
+         .grant
+         .as_ref()
+         .filter(|login| login.forwarding.permits_reach() && self.forwards.len() < MAX_FORWARDS)
+         .and_then(|login| login.helper.reach(login.id, path, false).ok());
+
+      match link {
+         Some(socket) => self.forwards.handed(stream, &socket, pending, waker)?,
+         None => Relay::abort(connection, stream),
+      }
+
+      Ok(())
+   }
+
+   /// Starts the listeners whose Unix socket arrived and tells the client
+   /// about each, and about each that got none.
+   fn bind(&mut self, waker: &Arc<Waker>) {
+      for binding in mem::take(&mut self.binding) {
+         let listener = binding.listener;
+
+         let made = match binding.pending.try_recv() {
+            Err(TryRecvError::Empty) => {
+               self.binding.push(binding);
+               continue;
+            },
+            Ok(Ok(socket)) => Acceptor::unix(socket.into(), waker).ok(),
+            Ok(Err(_)) | Err(TryRecvError::Disconnected) => None,
+         };
+
+         let reply = match made {
+            Some(acceptor) => {
+               self
+                  .listeners
+                  .insert(listener, (acceptor, Some(binding.link)));
+               Message::Listening { listener, port: 0 }
+            },
+            None => Message::Refused { listener },
+         };
+
+         self.outbox.push(&reply);
+      }
+   }
+}
+
+/// A remote listener on a Unix socket that does not exist yet.
+struct Binding {
+   /// The client's number for the listener.
+   listener: u32,
+   /// Reaches the process that makes the socket.
+   link:     OwnedFd,
+   /// Yields the listening socket or the reason there is none.
+   pending:  Receiver<io::Result<OwnedFd>>,
 }
 
 /// State of the network process.
@@ -314,7 +425,7 @@ impl Server {
 
                let reply = match bound {
                   Some((acceptor, chosen)) => {
-                     peer.listeners.insert(listener, acceptor);
+                     peer.listeners.insert(listener, (acceptor, None));
                      Message::Listening {
                         listener,
                         port: chosen,
@@ -325,6 +436,7 @@ impl Server {
 
                peer.outbox.push(&reply);
             },
+            Message::Bind { listener, path } => peer.listen(listener, path, &self.waker)?,
             _ => bail!("unexpected control message"),
          }
       }
@@ -466,6 +578,9 @@ impl Server {
                .forwards
                .associate(stream, (host, port), (buffered, finished), &self.waker);
          },
+         Message::Reach { path } => {
+            peer.reach(connection, stream, path, (buffered, finished), &self.waker)?;
+         },
          Message::Connect { host, port } => {
             let permitted = peer
                .grant
@@ -508,6 +623,7 @@ impl Server {
                sessions:  BTreeMap::new(),
                forwards:  Forwards::default(),
                listeners: BTreeMap::new(),
+               binding:   Vec::new(),
             });
          },
          Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
@@ -589,14 +705,16 @@ impl Server {
          }
       }
 
+      peer.bind(&self.waker);
+
       if let Some(control) = peer.control {
          peer.outbox.flush(connection, control)?;
       }
 
       let mut accepted = Vec::new();
 
-      for (&listener, acceptor) in &peer.listeners {
-         while let Some(socket) = acceptor.poll() {
+      for (&listener, entry) in &peer.listeners {
+         while let Some(socket) = entry.0.poll() {
             accepted.push((Message::Forwarded { listener }, socket));
          }
       }

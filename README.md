@@ -21,6 +21,8 @@ afford to lose :)
 
 - Login shells and remote commands, with a terminal or with pipes
 - `-L`, `-R` and `-D` (SOCKS5) forwarding
+- Unix sockets on either side of `-L` and `-R`. The server opens them as
+  your account, and it removes the ones it made when the forward ends
 - Agent forwarding with `-A`, which keeps working after a reattach
 - `rsync -e qsh`, and `scp` and `sftp` with `-S qsh`
 - Jump hosts with `-J` or `ProxyJump`, as many as you chain. A jump host
@@ -74,6 +76,7 @@ qsh user@host uname -a
 qsh -t host htop
 qsh -A host
 qsh -N -L 8080:localhost:80 -D 1080 host
+qsh -N -L /tmp/docker.sock:/run/docker.sock host
 qsh -J bastion host
 ```
 
@@ -135,6 +138,10 @@ checked by the root half against the client address the other half reports,
 and `no-port-forwarding`, `permitopen=` and `permitlisten=` are enforced where
 forwarded connections are opened. Someone who took over the network process
 could get around those, though they'd still need the private key to log in.
+Unix sockets are the exception. The network process can't open a socket in
+your home, so the root half starts a small process as your account for each
+one and checks the key's options itself. A key with `permitopen=` or
+`permitlisten=` can't forward sockets at all, same as in OpenSSH.
 
 Each session gets a third process that runs as the account, owns the terminal
 or the pipes and keeps the output the client may not have yet. The server

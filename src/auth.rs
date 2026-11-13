@@ -309,7 +309,7 @@ pub struct Attempt {
 }
 
 /// Which ports a key may forward.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Forwarding {
    /// Whether the key may forward at all.
    pub allowed: bool,
@@ -332,6 +332,20 @@ impl Forwarding {
                .targets
                .iter()
                .any(|pattern| glob(pattern.as_bytes(), target.as_bytes())))
+   }
+
+   /// Whether the server may connect to a Unix socket for the client. As
+   /// in OpenSSH, a key with `permitopen` may reach only what that lists,
+   /// and it cannot list a socket.
+   #[must_use]
+   pub const fn permits_reach(&self) -> bool {
+      self.allowed && self.targets.is_empty()
+   }
+
+   /// Whether the server may listen on a Unix socket for the client.
+   #[must_use]
+   pub const fn permits_bind(&self) -> bool {
+      self.allowed && self.ports.is_empty()
    }
 
    /// Whether the server may listen on `port` for the client.
