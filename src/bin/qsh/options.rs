@@ -87,7 +87,8 @@ pub struct Options {
    /// Run COMMAND on a terminal.
    #[pound(short = 't')]
    pub terminal:   bool,
-   /// The server's UDP port, 22 when not given.
+   /// The server's UDP port. Without it, the OpenSSH client configuration
+   /// may name one, and 22 is the default.
    #[pound(short = 'p', value_name = "PORT")]
    pub port:       Option<u16>,
    /// The account to log in to, the local user name when not given.
@@ -139,6 +140,16 @@ impl Options {
 
       host.read(Path::new("/etc/ssh/ssh_config"), alias);
 
+      let port = match (self.port, host.port) {
+         (Some(port), _) => port,
+         (None, Some(text)) => {
+            text
+               .parse::<u16>()
+               .with_context(|| format!("bad QshPort {text} for {alias}"))?
+         },
+         (None, None) => DEFAULT_PORT,
+      };
+
       // A key named on the command line must be usable. A configured one is
       // skipped when it is of a type this program cannot use.
       let keys = match self.identity {
@@ -165,7 +176,7 @@ impl Options {
       Ok(Login {
          user,
          host: host.hostname.unwrap_or_else(|| alias.to_owned()),
-         port: self.port.unwrap_or(DEFAULT_PORT),
+         port,
          keys,
       })
    }

@@ -60,6 +60,14 @@ with security keys since every wrong one costs you a touch.
 `qsh` reads `~/.ssh/config` and `/etc/ssh/ssh_config` for `HostName`, `User`
 and `IdentityFile`, so the names you already use with `ssh` work. `Port` is
 ignored, because that's sshd's TCP port and `qshd` may sit on another one.
+`QshPort` sets the UDP port, and `IgnoreUnknown` makes `ssh` skip it.
+
+```
+IgnoreUnknown QshPort
+
+Host box
+   QshPort 4222
+```
 
 Host keys are checked against `~/.ssh/known_hosts` first. Keys you accept at
 the prompt are written to `~/.ssh/known_hosts_quicsh`, and your OpenSSH file is
@@ -110,7 +118,7 @@ switch. I'd like to close that gap, but it isn't closed.
 - Passwords and PAM. Keys only.
 - X11 forwarding and the `sftp` subsystem.
 - Most of `ssh_config`. Only `Host`, `Match all`, `Include`, `HostName`,
-  `User` and `IdentityFile` are read.
+  `User`, `IdentityFile` and `QshPort` are read.
 - Key types other than `ed25519` and `ed25519-sk`.
 - `authorized_keys` options. A line with `command=` or `from=` is skipped
   instead of being honored without its restriction.

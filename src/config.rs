@@ -5,6 +5,8 @@
 //!   evaluated.
 //! - `HostName`, `User` and `IdentityFile`. `Port` is ignored, because it names
 //!   sshd's TCP port and says nothing about the UDP port.
+//! - `QshPort` for the UDP port, which OpenSSH skips once the file says
+//!   `IgnoreUnknown QshPort`.
 //! - As in OpenSSH, the first value found for a keyword wins and identity files
 //!   add up.
 
@@ -29,6 +31,8 @@ pub struct Host {
    pub hostname:       Option<String>,
    /// The account to log in to.
    pub user:           Option<String>,
+   /// The UDP port as written, which the caller parses.
+   pub port:           Option<String>,
    /// Private key files to log in with, in order.
    pub identity_files: Vec<PathBuf>,
 }
@@ -93,6 +97,7 @@ impl Host {
                self.hostname = Some(value.replace("%h", name));
             },
             "user" if self.user.is_none() => self.user = Some(value.to_owned()),
+            "qshport" if self.port.is_none() => self.port = Some(value.to_owned()),
             "identityfile" => self.identity_files.push(expand(value)),
             "include" if depth < MAX_DEPTH => {
                for pattern in value.split_whitespace() {
@@ -161,6 +166,7 @@ mod tests {
          User everyone
          IdentityFile /keys/second
          Port 2222
+         QshPort 4222
    ";
 
    /// The first value wins, identity files add up and unknown keywords pass.
@@ -192,6 +198,7 @@ mod tests {
       let host = lookup(&CONFIG.replacen("User fallback", "", 1), "bad.lan");
 
       assert_eq!(host.hostname, None, "negated in the first block");
+      assert_eq!(host.port.as_deref(), Some("4222"), "not the TCP port");
       assert_eq!(
          host.user.as_deref(),
          Some("everyone"),
