@@ -4,6 +4,9 @@
 //! without changing it for every other process that shares it, so a thread
 //! per direction does the blocking calls and a [`Waker`] tells the loop when
 //! there is something to do.
+//!
+//! A descriptor may still arrive in non-blocking mode, as the socket pair
+//! `rsync` hands its transport does. The threads then wait in `poll`.
 
 use std::{
    fs::File,
@@ -36,7 +39,10 @@ use bytes::Bytes;
 use rustix::{
    event::{
       EventfdFlags,
+      PollFd,
+      PollFlags,
       eventfd,
+      poll,
    },
    io::{
       read,
@@ -90,6 +96,11 @@ impl AsFd for Waker {
    }
 }
 
+/// Sleeps until `descriptor` is ready for `interest`.
+fn ready(descriptor: &impl AsFd, interest: PollFlags) {
+   let _ = poll(&mut [PollFd::new(descriptor, interest)], None);
+}
+
 /// The sending side of a socket. Dropping it tells the peer that no more data
 /// follows, while the receiving side stays open.
 pub struct SendHalf(pub OwnedFd);
@@ -101,6 +112,12 @@ impl Write for SendHalf {
 
    fn flush(&mut self) -> io::Result<()> {
       Ok(())
+   }
+}
+
+impl AsFd for SendHalf {
+   fn as_fd(&self) -> BorrowedFd<'_> {
+      self.0.as_fd()
    }
 }
 
@@ -136,6 +153,10 @@ pub fn reader(mut source: File, waker: Arc<Waker>) -> Receiver<Bytes> {
          let count = match source.read(&mut buffer) {
             Ok(count @ 1..) => count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+               ready(&source, PollFlags::IN);
+               continue;
+            },
             Ok(0) | Err(_) => break,
          };
 
@@ -161,14 +182,23 @@ pub fn reader(mut source: File, waker: Arc<Waker>) -> Receiver<Bytes> {
 #[must_use]
 pub fn writer<Sink>(mut sink: Sink, waker: Arc<Waker>) -> (SyncSender<Bytes>, JoinHandle<()>)
 where
-   Sink: Write + Send + 'static,
+   Sink: Write + AsFd + Send + 'static,
 {
    let (sender, chunks) = sync_channel::<Bytes>(QUEUE);
 
    let handle = thread::spawn(move || {
-      for chunk in chunks {
-         if sink.write_all(&chunk).is_err() {
-            break;
+      'chunks: for chunk in chunks {
+         let mut rest = &*chunk;
+
+         while !rest.is_empty() {
+            match sink.write(rest) {
+               Ok(count @ 1..) => rest = &rest[count..],
+               Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
+               Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                  ready(&sink, PollFlags::OUT);
+               },
+               Ok(0) | Err(_) => break 'chunks,
+            }
          }
 
          waker.wake();

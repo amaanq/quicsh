@@ -4,7 +4,11 @@ use std::{
       self,
       Write,
    },
-   os::fd::OwnedFd,
+   os::fd::{
+      AsFd,
+      BorrowedFd,
+      OwnedFd,
+   },
    sync::{
       Arc,
       mpsc::{
@@ -94,6 +98,12 @@ impl Write for Input {
 
    fn flush(&mut self) -> io::Result<()> {
       Ok(())
+   }
+}
+
+impl AsFd for Input {
+   fn as_fd(&self) -> BorrowedFd<'_> {
+      self.0.as_fd()
    }
 }
 
