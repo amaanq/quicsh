@@ -13,6 +13,7 @@ use std::{
    },
    io::{
       self,
+      IoSliceMut,
       Read as _,
       Write as _,
    },
@@ -65,7 +66,10 @@ use quinn_proto::{
    Dir,
    StreamId,
 };
-use quinn_udp::UdpSocketState;
+use quinn_udp::{
+   RecvMeta,
+   UdpSocketState,
+};
 use rustix::{
    event::{
       PollFd,
@@ -303,6 +307,8 @@ pub fn handed(link: &OwnedFd, waker: &Arc<Waker>) -> io::Result<Receiver<io::Res
 
 /// Largest datagram a relay carries, which is what two length bytes count.
 const DATAGRAM_LIMIT: usize = 0xFFFF;
+/// Most datagrams the kernel joins into one batch.
+const BATCH_LIMIT: usize = 64;
 /// How often an idle datagram relay checks whether its stream is gone.
 const RELAY_POLL: Timespec = Timespec {
    tv_sec:  1,
@@ -320,7 +326,7 @@ const RELAY_POLL: Timespec = Timespec {
 ///
 /// Fails when the process is out of file descriptors.
 pub fn datagrams(socket: OwnedFd) -> io::Result<OwnedFd> {
-   let (mut near, far) = UnixStream::pair()?;
+   let (near, far) = UnixStream::pair()?;
    let mut framed = near.try_clone()?;
    let inbound = socket.try_clone()?;
 
@@ -357,24 +363,99 @@ pub fn datagrams(socket: OwnedFd) -> io::Result<OwnedFd> {
       }
    });
 
-   thread::spawn(move || {
-      let mut header = [0; 2];
-      let mut buffer = vec![0; DATAGRAM_LIMIT];
+   thread::spawn(move || unframe(near, &socket, &closed));
 
-      while near.read_exact(&mut header).is_ok() {
-         let length = usize::from(u16::from_be_bytes(header));
+   Ok(far.into())
+}
 
-         if near.read_exact(&mut buffer[..length]).is_err() {
-            break;
-         }
+/// Sends each length-prefixed datagram that `framed` yields on `socket`, and
+/// sets `closed` once the stream ends.
+fn unframe(mut framed: UnixStream, socket: &OwnedFd, closed: &AtomicBool) {
+   let mut header = [0; 2];
+   let mut buffer = vec![0; DATAGRAM_LIMIT];
 
-         // A datagram that is too big for the path is lost alone, as it
-         // would be on any network.
-         let _ = send(&socket, &buffer[..length], SendFlags::NOSIGNAL);
+   while framed.read_exact(&mut header).is_ok() {
+      let length = usize::from(u16::from_be_bytes(header));
+
+      if framed.read_exact(&mut buffer[..length]).is_err() {
+         break;
       }
 
-      closed.store(true, Ordering::Relaxed);
+      // A datagram that is too big for the path is lost alone, as it would
+      // be on any network.
+      let _ = send(socket, &buffer[..length], SendFlags::NOSIGNAL);
+   }
+
+   closed.store(true, Ordering::Relaxed);
+}
+
+/// Joins a connected UDP socket to a byte stream as [`datagrams`] does. The
+/// kernel may hand over several datagrams of one size as one batch, which
+/// costs a busy relay far fewer system calls, and each still gets a frame
+/// of its own.
+fn batches(socket: UdpSocket) -> io::Result<OwnedFd> {
+   // This also forbids fragments, which lets the connection inside find
+   // the real path MTU, and makes the socket non-blocking, which the
+   // sending thread does not want.
+   let state = UdpSocketState::new((&socket).into())?;
+   socket.set_nonblocking(false)?;
+
+   let (near, far) = UnixStream::pair()?;
+   let mut framed = near.try_clone()?;
+   let inbound = socket.try_clone()?;
+   let outbound = OwnedFd::from(socket);
+
+   let closed = Arc::new(AtomicBool::new(false));
+   let gone = Arc::clone(&closed);
+
+   thread::spawn(move || {
+      let mut buffer = vec![0; DATAGRAM_LIMIT + 1];
+      let mut batch = Vec::with_capacity(buffer.len() + 2 * BATCH_LIMIT);
+
+      while !gone.load(Ordering::Relaxed) {
+         // The wait ends once a second so that the loop sees `gone`, and
+         // the socket is only read when that cannot block.
+         let ready = poll(
+            &mut [PollFd::new(&inbound, PollFlags::IN)],
+            Some(&RELAY_POLL),
+         );
+
+         if !matches!(ready, Ok(1..)) {
+            continue;
+         }
+
+         let mut meta = [RecvMeta::default()];
+         let received = state.recv(
+            (&inbound).into(),
+            &mut [IoSliceMut::new(&mut buffer)],
+            &mut meta,
+         );
+
+         match received {
+            Ok(1..) => {},
+            // A refused datagram says nothing about the next one.
+            Ok(0) => continue,
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => continue,
+            Err(_) => break,
+         }
+
+         batch.clear();
+
+         for datagram in buffer[..meta[0].len].chunks(meta[0].stride.max(1)) {
+            // A chunk of a buffer of 64 KiB fits in two bytes.
+            let length = u16::try_from(datagram.len()).unwrap_or(u16::MAX);
+
+            batch.extend_from_slice(&length.to_be_bytes());
+            batch.extend_from_slice(datagram);
+         }
+
+         if framed.write_all(&batch).is_err() {
+            break;
+         }
+      }
    });
+
+   thread::spawn(move || unframe(near, &outbound, &closed));
 
    Ok(far.into())
 }
@@ -399,13 +480,7 @@ fn associate(host: String, port: u16, waker: &Arc<Waker>) -> Receiver<io::Result
             let socket = UdpSocket::bind(local)?;
             socket.connect(remote)?;
 
-            // This sets the option that forbids fragments, which lets the
-            // connection inside find the real path MTU. It also makes the
-            // socket non-blocking, which the relay threads do not want.
-            UdpSocketState::new((&socket).into())?;
-            socket.set_nonblocking(false)?;
-
-            datagrams(socket.into())
+            batches(socket)
          });
 
       let _ = result.send(joined);
