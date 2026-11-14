@@ -400,7 +400,8 @@ impl Relay {
 
             let (chunks, finished) = drain(connection, self.stream)?;
             self.finished = finished;
-            self.taken += chunks.iter().map(|chunk| chunk.len() as u64).sum::<u64>();
+            let mut pending = chunks.iter().map(Bytes::len).sum::<usize>();
+            self.taken += pending as u64;
 
             if chunks.is_empty() && !finished {
                return Ok(());
@@ -408,13 +409,18 @@ impl Relay {
 
             // The stream yields about one packet's payload per chunk, and the
             // sink's thread does one write and one wake for each chunk.
-            let mut merged = BytesMut::new();
+            let mut merged = BytesMut::with_capacity(pending.min(MERGE_LIMIT));
 
             for chunk in chunks {
                if merged.len() + chunk.len() > MERGE_LIMIT {
-                  self.unwritten.push_back(mem::take(&mut merged).freeze());
+                  let full = mem::replace(
+                     &mut merged,
+                     BytesMut::with_capacity(pending.min(MERGE_LIMIT)),
+                  );
+                  self.unwritten.push_back(full.freeze());
                }
 
+               pending -= chunk.len();
                merged.extend_from_slice(&chunk);
             }
 
