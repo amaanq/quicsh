@@ -102,11 +102,13 @@ use quicsh::{
    control::{
       DETACH_LIMIT,
       Deframer,
+      Handle,
       Message,
       Open,
       Outbox,
       Program,
       Terminal,
+      Token,
    },
    forward::{
       Forwards,
@@ -649,7 +651,7 @@ impl Client {
       self.attempts = None;
       self.next = None;
       self.opening.clear();
-      self.forwards = Forwards::default();
+      self.forwards.detach();
       self.headings.clear();
 
       for channel in self.channels.values_mut() {
@@ -774,7 +776,9 @@ impl Client {
       };
 
       let socket = datagrams(hop.link.try_clone()?)?;
-      self.forwards.open(stream, &opening, socket, &self.waker)?;
+      self
+         .forwards
+         .open((stream, None), &opening, socket, &self.waker)?;
       self.lost = None;
 
       if !hop.ready {
@@ -839,7 +843,7 @@ impl Client {
       };
 
       match message {
-         Message::Forwarded { listener } => {
+         Message::Forwarded { listener, kept } => {
             let target = usize::try_from(listener)
                .ok()
                .and_then(|index| self.remotes.get(index));
@@ -848,7 +852,7 @@ impl Client {
                match remote.target {
                   Destination::Tcp { ref host, port } => {
                      self.forwards.dial(
-                        stream,
+                        (stream, kept),
                         (host.clone(), port),
                         (rest, finished),
                         &self.waker,
@@ -858,7 +862,7 @@ impl Client {
                   Destination::Unix(ref path) => {
                      if let Ok(socket) = UnixStream::connect(path) {
                         self.forwards.attach(
-                           stream,
+                           (stream, Some(kept)),
                            socket.into(),
                            (rest, finished),
                            &self.waker,
@@ -873,7 +877,7 @@ impl Client {
             if let Some(socket) = agent() {
                self
                   .forwards
-                  .attach(stream, socket, (rest, finished), &self.waker)?;
+                  .attach((stream, None), socket, (rest, finished), &self.waker)?;
                return Ok(());
             }
          },
@@ -894,14 +898,25 @@ impl Client {
             continue;
          };
 
+         self.issued += 1;
+
+         let mut kept = Handle {
+            label: self.issued,
+            token: Token::default(),
+         };
+
+         SystemRandom::new()
+            .fill(&mut kept.token)
+            .map_err(|_| report!("system random source failed"))?;
+
          let connect = match inbound.destination {
-            Destination::Tcp { host, port } => Message::Connect { host, port },
-            Destination::Unix(path) => Message::Reach { path },
+            Destination::Tcp { host, port } => Message::Connect { host, port, kept },
+            Destination::Unix(path) => Message::Reach { path, kept },
          };
 
          self
             .forwards
-            .open(stream, &connect, inbound.socket, &self.waker)?;
+            .open((stream, Some(kept)), &connect, inbound.socket, &self.waker)?;
       }
 
       Ok(())
@@ -928,6 +943,7 @@ impl Client {
                }
 
                self.associate(connection)?;
+               self.forwards.rejoin(connection);
 
                for (&label, channel) in &mut self.channels {
                   if channel.resumable() {
@@ -962,8 +978,9 @@ impl Client {
                }
             },
             Message::Taken { session, taken, .. } => {
-               if let Some(channel) = self.channels.get_mut(&session) {
-                  channel.release(taken);
+               match self.channels.get_mut(&session) {
+                  Some(channel) => channel.release(taken),
+                  None => self.forwards.release(session, taken),
                }
             },
             Message::HostCertificate(blob) => self.vouched(connection, &blob)?,
@@ -1236,6 +1253,8 @@ impl App for Client {
       if !lead {
          self.forwards.pump(connection, &self.waker)?;
       }
+
+      self.forwards.report(&mut self.outbox);
 
       if let Some(control) = self.control {
          self.outbox.flush(connection, control)?;

@@ -41,7 +41,8 @@ afford to lose :)
   own, and `qsh` reattaches with the next packet it sends, a keystroke, data
   or the keep-alive that goes out every 15 seconds
 - `qsh -N` reconnects after an outage or a restart too, and its `-L`, `-R` and
-  `-D` listeners work again
+  `-D` listeners work again. Connections that were open through them carry
+  on after an outage without a missing or repeated byte, for up to an hour
 - Connection sharing with `ControlMaster`, `ControlPath` and `ControlPersist`,
   or `-S`. The first `qsh` leaves one in the background that holds the
   connection, and later runs, `rsync`, `scp` and `sftp` included, go through
@@ -281,8 +282,9 @@ nu bench.nu host --identity ~/.ssh/id_bench
   `from=` matches addresses and networks and never host names. An
   `expiry-time=` without a `Z` ends up to a day early, since `qshd` doesn't
   know your time zone.
-- Forwarded connections across a restart. The listeners come back, and the
-  connections that were open are closed.
+- Forwarded connections across a restart of `qshd`. The listeners come back,
+  and the connections that were open are closed. They do survive a lost
+  connection.
 - Anything but Linux.
 
 ## Building

@@ -8,6 +8,9 @@
 //!   with [`Message::Resumed`] or [`Message::Gone`]. Both sides say with
 //!   [`Message::Taken`] how much of a session's data they have, so that the
 //!   other may forget it.
+//! - A forwarded connection continues the same way. The side that opens its
+//!   stream names it with a [`Handle`], and the client shows that handle's
+//!   token in a [`Message::Resume`] on its next connection.
 
 use std::time::Duration;
 
@@ -92,6 +95,19 @@ pub const DETACH_LIMIT: Duration = Duration::from_hours(1);
 /// session back on a new connection.
 pub type Token = [u8; 16];
 
+/// Set in the label of a forwarded connection whose stream the server
+/// opened, so that its labels never meet the ones a client hands out.
+pub const SERVER_LABEL: u32 = 1 << 31;
+
+/// What names a forwarded connection to both sides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Handle {
+   /// The number [`Message::Taken`] counts the forward's data under.
+   pub label: u32,
+   /// The secret that continues the forward on a new connection.
+   pub token: Token,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Size {
    pub columns: u16,
@@ -143,6 +159,7 @@ pub enum Message {
    Connect {
       host: String,
       port: u16,
+      kept: Handle,
    },
    /// Opens a client stream that the server joins to a UDP socket. Each
    /// datagram travels behind two bytes that hold its length.
@@ -154,6 +171,7 @@ pub enum Message {
    /// it connects to as the account.
    Reach {
       path: String,
+      kept: Handle,
    },
    /// Asks the server to listen on a loopback port. Port 0 lets it choose.
    Listen {
@@ -176,6 +194,7 @@ pub enum Message {
    /// Opens a server stream for a connection that `listener` accepted.
    Forwarded {
       listener: u32,
+      kept:     Handle,
    },
    /// Opens a server stream for a program that wants the client's SSH agent.
    Agent,
@@ -266,6 +285,33 @@ fn put_listener(out: &mut Vec<u8>, tag: u8, listener: u32, port: u16) {
    out.push(tag);
    put_u32(out, listener);
    put_u32(out, port.into());
+}
+
+/// Writes a message that opens a forwarded connection, with its handle last.
+fn put_forward(out: &mut Vec<u8>, message: &Message) {
+   let kept = match *message {
+      Message::Connect {
+         ref host,
+         port,
+         kept,
+      } => {
+         put_target(out, CONNECT, host, port);
+         kept
+      },
+      Message::Reach { ref path, kept } => {
+         out.push(REACH);
+         put_string(out, path.as_bytes());
+         kept
+      },
+      Message::Forwarded { listener, kept } => {
+         put_numbered(out, FORWARDED, listener);
+         kept
+      },
+      _ => return,
+   };
+
+   put_u32(out, kept.label);
+   put_string(out, &kept.token);
 }
 
 /// Appends the tag and the one number of a message that carries no more.
@@ -423,12 +469,10 @@ impl Message {
             put_u32(&mut payload, session);
             put_u32(&mut payload, status);
          },
-         Self::Connect { ref host, port } => put_target(&mut payload, CONNECT, host, port),
-         Self::Associate { ref host, port } => put_target(&mut payload, ASSOCIATE, host, port),
-         Self::Reach { ref path } => {
-            payload.push(REACH);
-            put_string(&mut payload, path.as_bytes());
+         Self::Connect { .. } | Self::Reach { .. } | Self::Forwarded { .. } => {
+            put_forward(&mut payload, self);
          },
+         Self::Associate { ref host, port } => put_target(&mut payload, ASSOCIATE, host, port),
          Self::Bind { listener, ref path } => {
             put_numbered(&mut payload, BIND, listener);
             put_string(&mut payload, path.as_bytes());
@@ -438,7 +482,6 @@ impl Message {
             put_listener(&mut payload, LISTENING, listener, port);
          },
          Self::Refused { listener } => put_numbered(&mut payload, REFUSED, listener),
-         Self::Forwarded { listener } => put_numbered(&mut payload, FORWARDED, listener),
          Self::Agent => payload.push(AGENT),
          Self::Resume {
             ref token,
@@ -521,6 +564,38 @@ impl Message {
       })
    }
 
+   /// Reads the rest of a message that [`put_forward`] started.
+   fn forward(tag: u8, reader: &mut Reader<'_>) -> Result<Self, Error> {
+      let handle = |source: &mut Reader<'_>| {
+         Ok::<Handle, Error>(Handle {
+            label: source.u32()?,
+            token: source.array()?,
+         })
+      };
+
+      Ok(match tag {
+         CONNECT => {
+            Self::Connect {
+               host: text(reader)?,
+               port: port(reader)?,
+               kept: handle(reader)?,
+            }
+         },
+         REACH => {
+            Self::Reach {
+               path: text(reader)?,
+               kept: handle(reader)?,
+            }
+         },
+         _ => {
+            Self::Forwarded {
+               listener: reader.u32()?,
+               kept:     handle(reader)?,
+            }
+         },
+      })
+   }
+
    /// Reads the payload of one frame, which is the frame without its length.
    ///
    /// # Errors
@@ -546,21 +621,11 @@ impl Message {
                status:  reader.u32()?,
             }
          },
-         CONNECT => {
-            Self::Connect {
-               host: text(&mut reader)?,
-               port: port(&mut reader)?,
-            }
-         },
+         tag @ (CONNECT | REACH | FORWARDED) => Self::forward(tag, &mut reader)?,
          ASSOCIATE => {
             Self::Associate {
                host: text(&mut reader)?,
                port: port(&mut reader)?,
-            }
-         },
-         REACH => {
-            Self::Reach {
-               path: text(&mut reader)?,
             }
          },
          BIND => {
@@ -572,11 +637,6 @@ impl Message {
          tag @ (LISTEN | LISTENING) => Self::listener(tag, &mut reader)?,
          REFUSED => {
             Self::Refused {
-               listener: reader.u32()?,
-            }
-         },
-         FORWARDED => {
-            Self::Forwarded {
                listener: reader.u32()?,
             }
          },

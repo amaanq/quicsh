@@ -34,6 +34,7 @@ use misstep::{
    OptionExt as _,
    Result,
    bail,
+   report,
 };
 use quicsh::{
    auth::{
@@ -41,14 +42,19 @@ use quicsh::{
       exporter,
    },
    control::{
+      DETACH_LIMIT,
       Deframer,
+      Handle,
       Message,
       Open,
       Outbox,
+      SERVER_LABEL,
+      Token,
    },
    forward::{
       Acceptor,
       Forwards,
+      Parked,
       handed,
    },
    key::PublicKey,
@@ -74,6 +80,10 @@ use quinn_proto::{
    StreamEvent,
    StreamId,
    VarInt,
+};
+use ring::rand::{
+   SecureRandom as _,
+   SystemRandom,
 };
 use rustix::{
    process::{
@@ -221,6 +231,8 @@ struct Peer {
    turn:      u32,
    /// Every forwarded connection in progress.
    forwards:  Forwards,
+   /// How many forwards this side named.
+   named:     u32,
    /// Remote listeners by the client's number for them. One on a Unix
    /// socket comes with the link to the process that made it, which
    /// removes the socket's file when the link closes.
@@ -266,7 +278,7 @@ impl Peer {
    fn reach(
       &mut self,
       connection: &mut Connection,
-      stream: StreamId,
+      forward: (StreamId, Handle),
       path: String,
       pending: (Vec<u8>, bool),
       waker: &Arc<Waker>,
@@ -278,11 +290,27 @@ impl Peer {
          .and_then(|login| login.helper.reach(login.id, path, false).ok());
 
       match link {
-         Some(socket) => self.forwards.handed(stream, &socket, pending, waker)?,
-         None => Relay::abort(connection, stream),
+         Some(socket) => self.forwards.handed(forward, &socket, pending, waker)?,
+         None => Relay::abort(connection, forward.0),
       }
 
       Ok(())
+   }
+
+   /// A name for a forwarded connection whose stream this side opens.
+   fn name(&mut self) -> Result<Handle> {
+      self.named = self.named.wrapping_add(1);
+
+      let mut kept = Handle {
+         label: SERVER_LABEL | self.named,
+         token: Token::default(),
+      };
+
+      SystemRandom::new()
+         .fill(&mut kept.token)
+         .map_err(|_| report!("system random source failed"))?;
+
+      Ok(kept)
    }
 
    /// Starts the listeners whose Unix socket arrived and tells the client
@@ -335,9 +363,25 @@ struct Server {
    certificate: Vec<u8>,
    /// Wakes the loop from I/O threads.
    waker:       Arc<Waker>,
+   /// Forwarded connections of clients that went silent, each with the
+   /// instant it is closed at unless a client continues it.
+   parked:      Vec<(Instant, Parked)>,
 }
 
 impl Server {
+   /// Keeps the forwards of a client that went silent. The oldest ones end
+   /// when there are more than one connection may have.
+   fn park(&mut self, now: Instant, forwards: Vec<Parked>) {
+      let limit = now + DETACH_LIMIT;
+
+      self
+         .parked
+         .extend(forwards.into_iter().map(|forward| (limit, forward)));
+
+      let surplus = self.parked.len().saturating_sub(MAX_FORWARDS);
+      self.parked.drain(..surplus);
+   }
+
    /// Handles what arrived on the control stream.
    fn control(
       &mut self,
@@ -406,8 +450,9 @@ impl Server {
                taken,
                errors,
             } => {
-               if let Some(confirmed) = peer.sessions.get(&session) {
-                  confirmed.release(taken, errors)?;
+               match peer.sessions.get(&session) {
+                  Some(confirmed) => confirmed.release(taken, errors)?,
+                  None => peer.forwards.release(session, taken),
                }
             },
             Message::Close { session } => {
@@ -499,6 +544,75 @@ impl Server {
       Ok(())
    }
 
+   /// Continues what `token` names on `stream`, a forward this process
+   /// kept or else a session in its holder. `label` is the client's number
+   /// for it, `had` is what the client has of it and `pending` is what was
+   /// already read from `stream`.
+   fn resume(
+      &mut self,
+      handle: ConnectionHandle,
+      connection: &mut Connection,
+      stream: StreamId,
+      (token, label): (Token, u32),
+      had: Had,
+      pending: (Vec<u8>, bool),
+   ) -> Result<()> {
+      let peer = self
+         .peers
+         .get_mut(&handle)
+         .context("stream on an unknown connection")?;
+      let grant = peer.grant.as_ref().context("stream before login")?.id;
+
+      let parked = self
+         .parked
+         .iter()
+         .position(|entry| entry.1.token() == Some(token));
+
+      if let Some(index) = parked {
+         let forward = self.parked.swap_remove(index).1;
+
+         peer
+            .forwards
+            .adopt(forward, connection, stream, had.received, pending);
+         return Ok(());
+      }
+
+      let link = self
+         .helper
+         .attach(grant, token)?
+         .filter(|_| !peer.sessions.contains_key(&label));
+
+      // A holder that an older server started may speak a format this one
+      // does not, and its session then stays out of reach.
+      let answer = match link {
+         Some(holder) => {
+            let attached = Session::attach(
+               holder,
+               label,
+               Some(had),
+               stream,
+               pending,
+               connection,
+               &self.waker,
+            )?;
+
+            match attached {
+               Some(session) => {
+                  peer.sessions.insert(label, session);
+                  return Ok(());
+               },
+               None => Message::Upgraded,
+            }
+         },
+         None => Message::Gone,
+      };
+
+      let _ = connection.send_stream(stream).write(&answer.encode());
+      let _ = connection.send_stream(stream).finish();
+
+      Ok(())
+   }
+
    /// Reads a new client stream until its opening frame is complete, then
    /// starts what the frame asks for.
    fn opening(
@@ -511,8 +625,10 @@ impl Server {
          .peers
          .get_mut(&handle)
          .context("stream on an unknown connection")?;
-      let granted = peer.grant.as_ref().context("stream before login")?;
-      let grant = granted.id;
+
+      if peer.grant.is_none() {
+         bail!("stream before login");
+      }
 
       let Some(deframer) = peer.opening.get_mut(&stream) else {
          return Ok(());
@@ -551,39 +667,10 @@ impl Server {
             received,
             errors,
          } => {
-            let link = self
-               .helper
-               .attach(grant, token)?
-               .filter(|_| !peer.sessions.contains_key(&label));
-
+            let had = Had { received, errors };
             let pending = (buffered, finished);
-            let had = Some(Had { received, errors });
 
-            // A holder that an older server started may speak a format
-            // this one does not, and its session then stays out of reach.
-            let answer = match link {
-               Some(holder) => {
-                  match Session::attach(
-                     holder,
-                     label,
-                     had,
-                     stream,
-                     pending,
-                     connection,
-                     &self.waker,
-                  )? {
-                     Some(session) => {
-                        peer.sessions.insert(label, session);
-                        return Ok(());
-                     },
-                     None => Message::Upgraded,
-                  }
-               },
-               None => Message::Gone,
-            };
-
-            let _ = connection.send_stream(stream).write(&answer.encode());
-            let _ = connection.send_stream(stream).finish();
+            self.resume(handle, connection, stream, (token, label), had, pending)?;
          },
          Message::Associate { host, port } => {
             let permitted = peer
@@ -600,10 +687,11 @@ impl Server {
                .forwards
                .associate(stream, (host, port), (buffered, finished), &self.waker);
          },
-         Message::Reach { path } => {
-            peer.reach(connection, stream, path, (buffered, finished), &self.waker)?;
+         Message::Reach { path, kept } => {
+            let forward = (stream, kept);
+            peer.reach(connection, forward, path, (buffered, finished), &self.waker)?;
          },
-         Message::Connect { host, port } => {
+         Message::Connect { host, port, kept } => {
             let permitted = peer
                .grant
                .as_ref()
@@ -614,9 +702,12 @@ impl Server {
                return Ok(());
             }
 
-            peer
-               .forwards
-               .dial(stream, (host, port), (buffered, finished), &self.waker);
+            peer.forwards.dial(
+               (stream, kept),
+               (host, port),
+               (buffered, finished),
+               &self.waker,
+            );
          },
          _ => bail!("stream did not start with an opening frame"),
       }
@@ -645,6 +736,7 @@ impl Server {
                sessions:  BTreeMap::new(),
                turn:      0,
                forwards:  Forwards::default(),
+               named:     0,
                listeners: BTreeMap::new(),
                binding:   Vec::new(),
             });
@@ -689,6 +781,8 @@ impl Server {
                for session in peer.sessions.values_mut() {
                   session.keep();
                }
+
+               self.park(now, peer.forwards.park());
             }
          },
          Event::ConnectionLost { .. } => {
@@ -741,6 +835,7 @@ impl Server {
       peer.turn = following(&peer.sessions, peer.turn);
 
       peer.bind(&self.waker);
+      peer.forwards.report(&mut peer.outbox);
 
       if let Some(control) = peer.control {
          peer.outbox.flush(connection, control)?;
@@ -750,17 +845,17 @@ impl Server {
 
       for (&listener, entry) in &peer.listeners {
          while let Some(socket) = entry.0.poll() {
-            accepted.push((Message::Forwarded { listener }, socket));
+            accepted.push((Some(listener), socket));
          }
       }
 
       for session in peer.sessions.values() {
          while let Some(socket) = session.agent() {
-            accepted.push((Message::Agent, socket));
+            accepted.push((None, socket));
          }
       }
 
-      for (opening, socket) in accepted {
+      for (listener, socket) in accepted {
          if peer.forwards.len() >= MAX_FORWARDS {
             break;
          }
@@ -769,7 +864,18 @@ impl Server {
             break;
          };
 
-         peer.forwards.open(stream, &opening, socket, &self.waker)?;
+         let kept = listener.map(|_| peer.name()).transpose()?;
+
+         let opening = listener.zip(kept).map_or(Message::Agent, |named| {
+            Message::Forwarded {
+               listener: named.0,
+               kept:     named.1,
+            }
+         });
+
+         peer
+            .forwards
+            .open((stream, kept), &opening, socket, &self.waker)?;
       }
 
       peer.forwards.pump(connection, &self.waker)?;
@@ -802,6 +908,12 @@ impl App for Server {
       }
 
       Ok(())
+   }
+
+   fn idle(&mut self, now: Instant) -> Result<Option<Instant>> {
+      self.parked.retain(|entry| now < entry.0);
+
+      Ok(self.parked.iter().map(|entry| entry.0).min())
    }
 
    fn tick(
@@ -881,6 +993,7 @@ pub fn run(congestion: Congestion) -> Result<()> {
       helper,
       certificate,
       waker: Arc::new(Waker::new()?),
+      parked: Vec::new(),
    };
 
    Transport::adopt(socket, listen, crypto, congestion, opener, &secret)?.run(&mut server)

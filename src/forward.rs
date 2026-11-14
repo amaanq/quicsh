@@ -62,6 +62,7 @@ use std::{
 
 use quinn_proto::{
    Connection,
+   Dir,
    StreamId,
 };
 use quinn_udp::UdpSocketState;
@@ -91,13 +92,23 @@ use rustix::{
 };
 
 use crate::{
-   control::Message,
+   control::{
+      Deframer,
+      Handle,
+      Message,
+      Outbox,
+      Token,
+   },
    error::Error,
    pipe::{
       Waker,
       receive_message,
    },
-   relay::Relay,
+   relay::{
+      Relay,
+      Tail,
+   },
+   transport::drain,
 };
 
 /// Pause after a failed accept.
@@ -422,10 +433,15 @@ fn dial(host: String, port: u16, waker: &Arc<Waker>) -> Receiver<io::Result<Owne
    receiver
 }
 
+/// How much more stream data a forward takes before the peer hears of it.
+const REPORT_STEP: u64 = 256 << 10;
+
 /// A stream waiting for its socket.
 struct Dial {
    /// The stream to join.
    stream:   StreamId,
+   /// What names the forward, for one that can outlive its connection.
+   kept:     Option<Handle>,
    /// Yields the connection or the reason it failed.
    pending:  Receiver<io::Result<OwnedFd>>,
    /// Stream data read before the connection existed.
@@ -434,13 +450,113 @@ struct Dial {
    finished: bool,
 }
 
+/// Where a forward stands with the QUIC connection.
+enum Link {
+   /// Its stream is open.
+   Live,
+   /// Its connection died, and it waits to continue on the next one.
+   Adrift,
+   /// It asked the server to continue and waits for the answer.
+   Asking {
+      /// The stream of the new connection.
+      stream:  StreamId,
+      /// What is left to send of the request.
+      request: Outbox,
+      /// What arrived of the answer.
+      answer:  Deframer,
+   },
+}
+
+/// A stream joined to a socket.
+struct Joined {
+   /// Moves the data.
+   relay: Relay,
+   /// What names the forward, for one that can outlive its connection.
+   kept:  Option<Handle>,
+   /// The count of taken stream bytes the peer last heard.
+   told:  u64,
+   /// Where the forward stands with the connection.
+   link:  Link,
+}
+
+impl Joined {
+   /// A forward on an open stream. One with a name keeps what it sent until
+   /// the peer has it.
+   fn live(mut relay: Relay, kept: Option<Handle>) -> Self {
+      if kept.is_some() {
+         relay.remember(Tail::exact());
+      }
+
+      Self {
+         relay,
+         kept,
+         told: 0,
+         link: Link::Live,
+      }
+   }
+
+   /// Reads the server's answer to a request to continue and moves the
+   /// relay to the new stream. `false` means the forward is over.
+   fn answered(&mut self, connection: &mut Connection) -> Result<bool, Error> {
+      let Link::Asking {
+         stream,
+         ref mut request,
+         ref mut answer,
+      } = self.link
+      else {
+         return Ok(true);
+      };
+
+      request.flush(connection, stream)?;
+
+      let (chunks, finished) = drain(connection, stream)?;
+
+      for bytes in chunks {
+         answer.push(&bytes);
+      }
+
+      let received = match answer.pop()? {
+         Some(Message::Resumed { received, .. }) => received,
+         Some(_) => return Ok(false),
+         None => return Ok(!finished),
+      };
+
+      let Link::Asking { answer: rest, .. } = mem::replace(&mut self.link, Link::Live) else {
+         return Ok(true);
+      };
+
+      self.told = self.relay.taken();
+      self.relay.resume(
+         connection,
+         stream,
+         Vec::new(),
+         received,
+         (rest.into_rest(), finished),
+      );
+
+      Ok(true)
+   }
+}
+
+/// A forward whose connection died, which the server keeps for a client
+/// that shows its token.
+pub struct Parked(Joined);
+
+impl Parked {
+   /// The secret that continues the forward.
+   #[must_use]
+   pub fn token(&self) -> Option<Token> {
+      self.0.kept.map(|kept| kept.token)
+   }
+}
+
 /// Every forwarded connection on one QUIC connection.
 #[derive(Default)]
 pub struct Forwards {
    /// Streams waiting for a TCP connection.
    dials:  Vec<Dial>,
    /// Streams joined to a socket.
-   relays: Vec<Relay>,
+   joined: Vec<Joined>,
    /// Whether forwards went before sessions on the last turn.
    led:    bool,
 }
@@ -448,7 +564,7 @@ pub struct Forwards {
 impl Forwards {
    #[must_use]
    pub const fn len(&self) -> usize {
-      self.dials.len() + self.relays.len()
+      self.dials.len() + self.joined.len()
    }
 
    /// Whether forwards move their data before sessions on this turn. The two
@@ -467,13 +583,14 @@ impl Forwards {
    /// `buffered` and `finished` describe data already read from `stream`.
    pub fn dial(
       &mut self,
-      stream: StreamId,
+      (stream, kept): (StreamId, Handle),
       (host, port): (String, u16),
       (buffered, finished): (Vec<u8>, bool),
       waker: &Arc<Waker>,
    ) {
       self.dials.push(Dial {
          stream,
+         kept: Some(kept),
          pending: dial(host, port, waker),
          buffered,
          finished,
@@ -492,6 +609,7 @@ impl Forwards {
    ) {
       self.dials.push(Dial {
          stream,
+         kept: None,
          pending: associate(host, port, waker),
          buffered,
          finished,
@@ -507,13 +625,14 @@ impl Forwards {
    /// Fails when the process is out of file descriptors.
    pub fn handed(
       &mut self,
-      stream: StreamId,
+      (stream, kept): (StreamId, Handle),
       link: &OwnedFd,
       (buffered, finished): (Vec<u8>, bool),
       waker: &Arc<Waker>,
    ) -> Result<(), Error> {
       self.dials.push(Dial {
          stream,
+         kept: Some(kept),
          pending: handed(link, waker).map_err(Error::Forward)?,
          buffered,
          finished,
@@ -529,26 +648,27 @@ impl Forwards {
    /// Fails when the process is out of file descriptors.
    pub fn attach(
       &mut self,
-      stream: StreamId,
+      (stream, kept): (StreamId, Option<Handle>),
       socket: OwnedFd,
       (buffered, finished): (Vec<u8>, bool),
       waker: &Arc<Waker>,
    ) -> Result<(), Error> {
-      self
-         .relays
-         .push(Relay::socket(stream, socket, waker, buffered, finished)?);
+      let relay = Relay::socket(stream, socket, waker, buffered, finished)?;
+
+      self.joined.push(Joined::live(relay, kept));
       Ok(())
    }
 
    /// Joins a stream this side just opened to `socket`, with `opening` as
-   /// the stream's first frame.
+   /// the stream's first frame and `kept` as the name that frame gives the
+   /// forward, if it gives one.
    ///
    /// # Errors
    ///
    /// Fails when the process is out of file descriptors.
    pub fn open(
       &mut self,
-      stream: StreamId,
+      (stream, kept): (StreamId, Option<Handle>),
       opening: &Message,
       socket: OwnedFd,
       waker: &Arc<Waker>,
@@ -556,8 +676,119 @@ impl Forwards {
       let mut relay = Relay::socket(stream, socket, waker, Vec::new(), false)?;
       relay.prefix(opening.encode());
 
-      self.relays.push(relay);
+      self.joined.push(Joined::live(relay, kept));
       Ok(())
+   }
+
+   /// Queues a [`Message::Taken`] for every forward that took enough stream
+   /// data since the peer last heard, so that the peer may forget it.
+   pub fn report(&mut self, outbox: &mut Outbox) {
+      for forward in &mut self.joined {
+         let taken = forward.relay.taken();
+
+         if let Some(kept) = forward.kept
+            && matches!(forward.link, Link::Live)
+            && taken >= forward.told + REPORT_STEP
+         {
+            forward.told = taken;
+            outbox.push(&Message::Taken {
+               session: kept.label,
+               taken,
+               errors: 0,
+            });
+         }
+      }
+   }
+
+   /// Forgets what the forward `label` names sent within its first `taken`
+   /// bytes, which the peer has.
+   pub fn release(&mut self, label: u32, taken: u64) {
+      let named = self
+         .joined
+         .iter_mut()
+         .find(|forward| forward.kept.is_some_and(|kept| kept.label == label));
+
+      if let Some(forward) = named {
+         forward.relay.release(taken);
+      }
+   }
+
+   /// Cuts every forward loose from a dead connection. The ones without a
+   /// name end here, and so do the ones that still waited for a socket.
+   pub fn detach(&mut self) {
+      self.dials.clear();
+      self.joined.retain(|forward| forward.kept.is_some());
+
+      for forward in &mut self.joined {
+         forward.link = Link::Adrift;
+      }
+   }
+
+   /// Asks the server on a new connection for every forward that was cut
+   /// loose. One that gets no stream ends.
+   pub fn rejoin(&mut self, connection: &mut Connection) {
+      self.joined.retain_mut(|forward| {
+         let Some(kept) = forward
+            .kept
+            .filter(|_| matches!(forward.link, Link::Adrift))
+         else {
+            return true;
+         };
+
+         let Some(stream) = connection.streams().open(Dir::Bi) else {
+            return false;
+         };
+
+         let mut request = Outbox::default();
+         request.push(&Message::Resume {
+            token:    kept.token,
+            session:  kept.label,
+            received: forward.relay.taken(),
+            errors:   0,
+         });
+
+         forward.link = Link::Asking {
+            stream,
+            request,
+            answer: Deframer::default(),
+         };
+
+         true
+      });
+   }
+
+   /// Takes the forwards of a dead connection that a client may continue.
+   pub fn park(&mut self) -> Vec<Parked> {
+      self.detach();
+      mem::take(&mut self.joined)
+         .into_iter()
+         .map(Parked)
+         .collect()
+   }
+
+   /// Continues `parked` on `stream` for a client that has the first
+   /// `received` bytes this side sent. `buffered` and `finished` describe
+   /// data already read from `stream`.
+   pub fn adopt(
+      &mut self,
+      Parked(mut forward): Parked,
+      connection: &mut Connection,
+      stream: StreamId,
+      received: u64,
+      pending: (Vec<u8>, bool),
+   ) {
+      let answer = Message::Resumed {
+         received: forward.relay.taken(),
+         skipped:  0,
+      };
+
+      forward.told = forward.relay.taken();
+      forward.link = Link::Live;
+      forward
+         .relay
+         .resume(connection, stream, answer.encode(), received, pending);
+
+      self.joined.push(forward);
    }
 
    /// Moves data on every forward and drops the ones that ended. A forward
@@ -570,24 +801,40 @@ impl Forwards {
       for dial in mem::take(&mut self.dials) {
          match dial.pending.try_recv() {
             Ok(Ok(socket)) => {
-               self.attach(dial.stream, socket, (dial.buffered, dial.finished), waker)?;
+               let pending = (dial.buffered, dial.finished);
+               self.attach((dial.stream, dial.kept), socket, pending, waker)?;
             },
             Ok(Err(_)) | Err(TryRecvError::Disconnected) => Relay::abort(connection, dial.stream),
             Err(TryRecvError::Empty) => self.dials.push(dial),
          }
       }
 
-      self.relays.retain_mut(|relay| {
-         if relay.pump(connection).is_err() {
-            Relay::abort(connection, relay.stream());
+      self.joined.retain_mut(|forward| {
+         match forward.link {
+            Link::Adrift => return true,
+            Link::Asking { stream, .. } => {
+               if !forward.answered(connection).unwrap_or(false) {
+                  Relay::abort(connection, stream);
+                  return false;
+               }
+
+               if !matches!(forward.link, Link::Live) {
+                  return true;
+               }
+            },
+            Link::Live => {},
+         }
+
+         if forward.relay.pump(connection).is_err() {
+            Relay::abort(connection, forward.relay.stream());
             return false;
          }
 
-         !relay.is_done()
+         !forward.relay.is_done()
       });
 
-      if !self.relays.is_empty() {
-         self.relays.rotate_left(1);
+      if !self.joined.is_empty() {
+         self.joined.rotate_left(1);
       }
 
       Ok(())
