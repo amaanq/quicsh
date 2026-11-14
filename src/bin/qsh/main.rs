@@ -20,6 +20,8 @@ use std::{
    },
    io::{
       self,
+      BufRead as _,
+      BufReader,
       Read as _,
       Write as _,
    },
@@ -286,8 +288,13 @@ fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
             login.port
          );
 
+         // Standard input may be a pipe with the session's data in it.
          let mut answer = String::new();
-         io::stdin().read_line(&mut answer)?;
+
+         match File::open("/dev/tty") {
+            Ok(terminal) => BufReader::new(terminal).read_line(&mut answer)?,
+            Err(_) => io::stdin().read_line(&mut answer)?,
+         };
 
          if answer.trim() != "yes" {
             bail!("host key not accepted");
@@ -561,6 +568,9 @@ struct Client {
    issued:   u32,
    /// The socket that later runs share this connection through.
    master:   Option<Master>,
+   /// The run that waits for the login before it leaves this one in the
+   /// background.
+   starter:  Option<File>,
    /// Whether to forward the local SSH agent.
    agent:    bool,
    /// The `-R` forwards, indexed by listener number.
@@ -954,6 +964,8 @@ impl Client {
                      channel.start(label, connection, &self.waker)?;
                   }
                }
+
+               release(self.starter.take())?;
 
                let ready = self.master.as_mut().and_then(|master| master.ready.take());
 
@@ -1439,7 +1451,8 @@ fn request(options: &Options, login: &Login) -> Result<Open> {
       (false, true) => Program::Subsystem(options.command.join(" ")),
    };
 
-   let interactive = (matches!(program, Program::Shell) || options.terminal) && isatty(io::stdin());
+   let wanted = (matches!(program, Program::Shell) || options.terminal) && !options.piped;
+   let interactive = wanted && isatty(io::stdin());
 
    // A `TERM` from `SetEnv` names the terminal, as it does in OpenSSH.
    let (terminals, environment) = login
@@ -1482,6 +1495,55 @@ fn detach() -> Result<()> {
    dup2_stdin(&null)?;
    dup2_stdout(&null)?;
    dup2_stderr(&null)?;
+
+   Ok(())
+}
+
+/// Starts this run again as a process that outlives it, and returns the
+/// status to exit with once the server let that process in or it gave up.
+/// Its standard input is the pipe that reports the login, since it reads
+/// no input and prompts on the terminal itself.
+fn background() -> Result<i32> {
+   let (mut ready, report) = io::pipe()?;
+
+   let mut command = Command::new(env::current_exe()?);
+   let mut child = command
+      .arg("--detached")
+      .args(env::args_os().skip(1))
+      .stdin(report)
+      .spawn()
+      .context("starting qsh for the background")?;
+
+   drop(command);
+
+   if ready.read(&mut [0; 1]).is_ok_and(|count| count == 1) {
+      return Ok(0);
+   }
+
+   Ok(child.wait()?.code().unwrap_or(255))
+}
+
+/// Takes the pipe to the run that waits in [`background`] and leaves the
+/// session without input, for `-f` and `-n`.
+fn silence(options: &Options) -> Result<Option<File>> {
+   let starter = options
+      .detached
+      .then(|| standard(io::stdin()))
+      .transpose()?;
+
+   if options.null || options.detached {
+      dup2_stdin(File::open("/dev/null")?)?;
+   }
+
+   Ok(starter)
+}
+
+/// Tells the run that waits in [`background`] that it may exit.
+fn release(starter: Option<File>) -> Result<()> {
+   if let Some(mut waiting) = starter {
+      setsid()?;
+      let _ = waiting.write_all(&[0]);
+   }
 
    Ok(())
 }
@@ -1554,7 +1616,7 @@ fn shared(control: &Control, options: &Options) -> Result<Option<OwnedFd>> {
 
 /// Runs what the options ask for through the `qsh` behind `socket` and
 /// returns its exit status.
-fn share(socket: &OwnedFd, options: &Options, login: &Login) -> Result<u32> {
+fn share(socket: &OwnedFd, options: &Options, login: &Login, starter: Option<File>) -> Result<u32> {
    let signals = SignalPipe::install()?;
    let signalled = reopen(signals.read_fd())?;
 
@@ -1562,13 +1624,19 @@ fn share(socket: &OwnedFd, options: &Options, login: &Login) -> Result<u32> {
    let interactive = open.terminal.is_some();
 
    mux::open(socket, open)?;
+   release(starter)?;
    mux::wait(socket, &signalled, interactive)
 }
 
 /// Handles a run that needs no connection of its own and returns its exit
 /// status. That is a question or an order for the `qsh` that shares its
 /// connection, or a session through that `qsh`.
-fn divert(login: &Login, options: &Options, plain: bool) -> Result<Option<u32>> {
+fn divert(
+   login: &Login,
+   options: &Options,
+   plain: bool,
+   starter: &mut Option<File>,
+) -> Result<Option<u32>> {
    let Some(ref control) = login.control else {
       ensure!(
          options.order.is_none() && !options.master,
@@ -1593,7 +1661,7 @@ fn divert(login: &Login, options: &Options, plain: bool) -> Result<Option<u32>> 
          };
 
          return socket
-            .map(|holder| share(&holder, options, login))
+            .map(|holder| share(&holder, options, login, starter.take()))
             .transpose();
       },
    }
@@ -1639,18 +1707,16 @@ fn resolve(login: &Login) -> Result<Vec<SocketAddr>> {
 fn main() -> Result<()> {
    let mut options = Options::parse();
 
-   // Forwards from the configuration belong to the process that holds a
-   // shared connection, so only the command line counts here.
-   let plain = options.local.is_empty()
-      && options.remote.is_empty()
-      && options.dynamic.is_empty()
-      && options.relay.is_none()
-      && !options.forward
-      && !options.master;
-
+   let plain = options.plain();
    let login = options.login()?;
 
-   if let Some(status) = divert(&login, &options, plain)? {
+   if options.background && !options.detached {
+      process::exit(background()?);
+   }
+
+   let mut starter = silence(&options)?;
+
+   if let Some(status) = divert(&login, &options, plain, &mut starter)? {
       process::exit(i32::try_from(status).unwrap_or(255));
    }
 
@@ -1724,6 +1790,7 @@ fn main() -> Result<()> {
       channels,
       issued: 1,
       master,
+      starter,
       agent: options.agent,
       remotes: options.remote,
       relay,

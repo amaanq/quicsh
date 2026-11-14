@@ -160,6 +160,15 @@ pub struct Options {
    /// Run COMMAND on a terminal.
    #[pound(short = 't')]
    pub terminal:   bool,
+   /// Run COMMAND without a terminal, whatever the configuration says.
+   #[pound(short = 'T')]
+   pub piped:      bool,
+   /// Give the session no input.
+   #[pound(short = 'n')]
+   pub null:       bool,
+   /// Go to the background once the server let this run in, with no input.
+   #[pound(short = 'f')]
+   pub background: bool,
    /// Ask for the subsystem COMMAND names, as sftp and scp do.
    #[pound(short = 's')]
    pub subsystem:  bool,
@@ -221,6 +230,10 @@ pub struct Options {
    /// Ask the qsh that shares its connection to check or to exit.
    #[pound(short = 'O', value_name = "COMMAND")]
    pub order:      Option<String>,
+   /// Marks the process that -f started, whose input is the pipe to the
+   /// run that waits for the login.
+   #[pound(long, hidden)]
+   pub detached:   bool,
    /// Hold the connection for other runs and start no session.
    #[pound(long, hidden)]
    pub master:     bool,
@@ -420,6 +433,18 @@ impl Options {
       }))
    }
 
+   /// Whether the run could be a session through a shared connection.
+   /// Forwards from the configuration belong to the process that holds the
+   /// connection, so only the command line counts here.
+   pub const fn plain(&self) -> bool {
+      self.local.is_empty()
+         && self.remote.is_empty()
+         && self.dynamic.is_empty()
+         && self.relay.is_none()
+         && !self.forward
+         && !self.master
+   }
+
    /// Takes the forwards, the command, the terminal and the agent switch from
    /// the OpenSSH client configuration where the command line left them open.
    fn adopt(&mut self, host: &Host) -> Result<()> {
@@ -433,6 +458,7 @@ impl Options {
       self.terminal |= host.terminal.as_deref().is_some_and(|text| {
          text.eq_ignore_ascii_case("yes") || text.eq_ignore_ascii_case("force")
       });
+      self.terminal &= !self.piped;
 
       // A relay for another qsh must not claim the ports a host's forwards
       // name, and neither must scp or sftp, which say so with this option.

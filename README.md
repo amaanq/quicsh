@@ -21,6 +21,7 @@ afford to lose :)
 
 - Login shells and remote commands, with a terminal or with pipes
 - `-L`, `-R` and `-D` (SOCKS5) forwarding
+- `-f` to go to the background after the login, `-n` and `-T`
 - Unix sockets on either side of `-L` and `-R`. The server opens them as
   your account, and it removes the ones it made when the forward ends
 - Agent forwarding with `-A`, which keeps working after a reattach
