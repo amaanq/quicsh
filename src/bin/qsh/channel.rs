@@ -6,6 +6,7 @@ use std::{
       self,
       Write as _,
    },
+   mem::take,
    os::fd::OwnedFd,
    sync::{
       Arc,
@@ -221,6 +222,11 @@ pub struct Channel {
    escape:   Option<u8>,
    /// Yields what the user asks for with escape sequences.
    orders:   Option<Receiver<Order>>,
+   /// Whether the user asked for the session by name.
+   named:    bool,
+   /// Whether the server has yet to hear that the session goes on without
+   /// this client.
+   untold:   bool,
 }
 
 impl Drop for Channel {
@@ -233,6 +239,8 @@ impl Channel {
    /// A session that starts once the server accepted the login.
    pub fn new(open: Open, stdio: Streams, owner: Owner, escape: Option<u8>) -> Result<Self> {
       Ok(Self {
+         named: open.name.is_some(),
+         untold: false,
          open: Some(open),
          stdio,
          owner,
@@ -279,6 +287,7 @@ impl Channel {
    /// input by then, and `skipped` bytes of its output are gone.
    pub fn keep(&mut self, token: Token, name: &str, (input, skipped): (u64, u64)) {
       self.token = Some(token);
+      self.untold = self.named;
 
       if let Some(ref mut relay) = self.relay {
          relay.precede(input);
@@ -534,6 +543,7 @@ impl Channel {
 
       relay.skip(skipped);
       relay.resume(connection, stream, Vec::new(), received, (rest, finished));
+      self.untold = self.named;
 
       self.raw(true)?;
 
@@ -603,6 +613,10 @@ impl Channel {
       let Some(ref mut relay) = self.relay else {
          return Ok(());
       };
+
+      if take(&mut self.untold) {
+         outbox.push(&Message::Stay { session: label });
+      }
 
       relay.pump(connection)?;
 

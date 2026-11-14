@@ -93,6 +93,8 @@ const SESSIONS: u8 = 26;
 const LISTING: u8 = 27;
 /// Tag of [`Message::End`].
 const END: u8 = 28;
+/// Tag of [`Message::Stay`].
+const STAY: u8 = 29;
 
 /// Most names one [`Message::Listing`] carries.
 const MAX_NAMES: u32 = 1024;
@@ -278,6 +280,12 @@ pub enum Message {
    /// The client is done with a session, which it either saw to its end or
    /// gave up on. The server ends its side of it.
    Close {
+      session: u32,
+   },
+   /// The client may come back for a session that it leaves before the
+   /// program in it ended. The server then lets the session go on when the
+   /// client closes it or the connection.
+   Stay {
       session: u32,
    },
    /// Asks the server, before the login, what a certificate authority says
@@ -573,6 +581,7 @@ impl Message {
             errors,
          } => put_counts(&mut payload, TAKEN, session, [taken, errors]),
          Self::Close { session } => put_numbered(&mut payload, CLOSE, session),
+         Self::Stay { session } => put_numbered(&mut payload, STAY, session),
          Self::Certify => payload.push(CERTIFY),
          Self::HostCertificate(ref blob) => {
             payload.push(HOST_CERTIFICATE);
@@ -749,6 +758,11 @@ impl Message {
          tag @ (RESUME | TAKEN) => Self::counted(tag, &mut reader)?,
          CLOSE => {
             Self::Close {
+               session: reader.u32()?,
+            }
+         },
+         STAY => {
+            Self::Stay {
                session: reader.u32()?,
             }
          },

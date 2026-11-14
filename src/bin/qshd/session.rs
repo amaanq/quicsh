@@ -188,6 +188,8 @@ pub struct Session {
    before:   (u64, u64),
    /// Whether the session goes on when this side lets go of it.
    keep:     bool,
+   /// Whether the client may come back after it left the session.
+   stay:     bool,
    /// Tells the input writer that its end is not the end of input.
    released: Arc<AtomicBool>,
    /// How far the session got with its input.
@@ -325,6 +327,7 @@ impl Session {
          link,
          before: (taken, skipped),
          keep: false,
+         stay: false,
          released,
          credit,
          told: 0,
@@ -386,6 +389,17 @@ impl Session {
    /// may come back for it.
    pub const fn keep(&mut self) {
       self.keep = true;
+   }
+
+   /// Notes that the client may come back after it left the session.
+   pub const fn stay(&mut self) {
+      self.stay = true;
+   }
+
+   /// Lets the session go on for a client that left it on purpose, said it
+   /// may come back and did not see the program end.
+   pub const fn leave(&mut self) {
+      self.keep |= self.stay && !self.reported;
    }
 
    /// Moves data and returns the exit status once, when the session is over

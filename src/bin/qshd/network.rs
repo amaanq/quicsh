@@ -460,10 +460,12 @@ impl Server {
                }
             },
             Message::Close { session } => {
-               if let Some(over) = peer.sessions.remove(&session) {
+               if let Some(mut over) = peer.sessions.remove(&session) {
+                  over.leave();
                   over.close(connection);
                }
             },
+            Message::Stay { session } => peer.sessions.get_mut(&session).map_or((), Session::stay),
             Message::Listen { listener, port } => {
                let Some(ref grant) = peer.grant else {
                   bail!("forward before login");
@@ -855,7 +857,9 @@ impl Server {
             }
          },
          Event::ConnectionLost { .. } => {
-            self.peers.remove(&handle);
+            if let Some(mut peer) = self.peers.remove(&handle) {
+               peer.sessions.values_mut().for_each(Session::leave);
+            }
          },
          _ => {},
       }

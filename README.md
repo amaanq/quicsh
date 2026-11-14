@@ -47,9 +47,11 @@ afford to lose :)
   keeps up with passes through byte for byte
 - Sessions that any of your machines can join. Every session on a terminal
   has a name, the one `--attach NAME` gives it or else a number, and runs
-  until its shell exits, its `qsh` exits or `--end NAME` ends it. `--list`
-  prints the names, and `--attach NAME` from another machine takes the
-  session over. The session finds its name in `QSH_SESSION`
+  until its shell exits, its `qsh` exits or `--end NAME` ends it. A session
+  from `--attach NAME` outlives its `qsh` too, so a closed terminal window
+  leaves it running. `--list` prints the names, and `--attach NAME` from
+  another machine takes the session over. The session finds its name in
+  `QSH_SESSION`
 - Restarting `qshd` under a session. The session lives in a process of its
   own, and `qsh` reattaches with the next packet it sends, a keystroke, data
   or the keep-alive that goes out every 15 seconds
