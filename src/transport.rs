@@ -113,6 +113,12 @@ use crate::{
    pipe::Waker,
 };
 
+/// How much unread data a peer may have sent, over all of its streams.
+pub const RECEIVE_WINDOW: u32 = 64 << 20;
+/// The same for a peer that has not logged in, which the server raises to
+/// [`RECEIVE_WINDOW`] with the login.
+const LOGIN_WINDOW: u32 = 64 << 10;
+
 /// Send window floor for a connection that carries keystrokes.
 pub const INTERACTIVE_WINDOW: u64 = 256 << 10;
 
@@ -176,8 +182,9 @@ impl Display for Congestion {
 }
 
 impl Congestion {
-   /// The QUIC transport settings for a path with this payload bound.
-   fn transport(self, route_bound: u16) -> Arc<TransportConfig> {
+   /// The QUIC transport settings for a path with this payload bound, where
+   /// the peer may have `window` bytes unread.
+   fn transport(self, route_bound: u16, window: u32) -> Arc<TransportConfig> {
       let mut discovery = MtuDiscoveryConfig::default();
       discovery.upper_bound(route_bound);
 
@@ -185,7 +192,7 @@ impl Congestion {
 
       transport
          .stream_receive_window(VarInt::from_u32(16 << 20))
-         .receive_window(VarInt::from_u32(64 << 20))
+         .receive_window(VarInt::from_u32(window))
          .send_window(INTERACTIVE_WINDOW)
          .max_idle_timeout(Some(VarInt::from_u32(IDLE_TIMEOUT_MS).into()))
          .keep_alive_interval(Some(KEEP_ALIVE))
@@ -867,7 +874,11 @@ impl Transport {
       };
 
       let mut config = ClientConfig::new(crypto);
-      config.transport_config(self.congestion.transport(socket.payload_bound(remote)?));
+      config.transport_config(
+         self
+            .congestion
+            .transport(socket.payload_bound(remote)?, RECEIVE_WINDOW),
+      );
 
       let (handle, connection) = self
          .endpoint
@@ -1118,7 +1129,11 @@ impl Transport {
       };
 
       let mut config = listener.config.clone();
-      config.transport_config(self.congestion.transport(socket.payload_bound(remote)?));
+      config.transport_config(
+         self
+            .congestion
+            .transport(socket.payload_bound(remote)?, LOGIN_WINDOW),
+      );
 
       match self
          .endpoint

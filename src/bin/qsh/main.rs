@@ -202,8 +202,6 @@ use crate::{
    },
 };
 
-/// How often the loop checks the authentication thread.
-const WORKER_POLL: Duration = Duration::from_millis(20);
 /// How often the loop checks the terminal size.
 const RESIZE_POLL: Duration = Duration::from_millis(250);
 /// How long one attempt to reach the server again may take.
@@ -334,14 +332,20 @@ fn authenticate(
    secret: &[u8; 32],
    attempts: &Sender<Attempt>,
    next: &Receiver<()>,
+   waker: &Waker,
 ) -> Result<()> {
    if let Some(host_key) = host {
       trust_host(login, host_key)?;
    }
 
    // The main loop takes one login and asks for the next when the server
-   // refuses it.
-   let offer = |request| attempts.send(Ok(Some(request))).is_ok() && next.recv().is_ok();
+   // refuses it. It sleeps until a packet arrives unless it is woken.
+   let offer = |request| {
+      let sent = attempts.send(Ok(Some(request))).is_ok();
+      waker.wake();
+
+      sent && next.recv().is_ok()
+   };
    let mut tried = Vec::new();
 
    let certified = |key: &PublicKey| {
@@ -960,7 +964,9 @@ impl Client {
                   if channel.resumable() {
                      channel.rejoin(label, connection)?;
                   } else if channel.started() {
-                     channel.fail("the session ended with its connection");
+                     if back {
+                        channel.fail("the session ended with its connection");
+                     }
                   } else {
                      channel.start(label, connection, &self.waker)?;
                   }
@@ -1101,10 +1107,23 @@ impl Client {
 
       // The host prompt and a FIDO touch can block for a long time, and
       // the loop must keep sending keep-alives meanwhile.
+      let waker = Arc::clone(&self.waker);
+
       thread::spawn(move || {
-         if let Err(error) = authenticate(&login, host.as_ref(), &secret, &attempt_tx, &next_rx) {
+         let ended = authenticate(
+            &login,
+            host.as_ref(),
+            &secret,
+            &attempt_tx,
+            &next_rx,
+            &waker,
+         );
+
+         if let Err(error) = ended {
             let _ = attempt_tx.send(Err(error));
          }
+
+         waker.wake();
       });
 
       Ok(())
@@ -1127,6 +1146,17 @@ impl Client {
             }
 
             self.outbox.push(&Message::Request(request));
+
+            // The server reads these streams once it accepted a login, which
+            // saves the round trip of waiting for its answer.
+            if self.lost.is_none() {
+               for (&label, channel) in &mut self.channels {
+                  if channel.piped() {
+                     channel.start(label, connection, &self.waker)?;
+                  }
+               }
+            }
+
             Ok(())
          },
          Ok(Ok(None)) => bail!("permission denied, the server accepted none of the offered keys"),
@@ -1243,7 +1273,7 @@ impl App for Client {
          self.forwards.pump(connection, &self.waker)?;
       }
 
-      if self.accepted {
+      if self.accepted || self.lost.is_none() {
          // The first session to write can fill the send window, so a
          // transfer that always went first would starve a shell beside it.
          for late in [false, true] {
@@ -1292,15 +1322,10 @@ impl App for Client {
 
       let resizing = self.channels.values().any(Channel::interactive);
 
-      Ok([
-         limit,
-         expiry,
-         self.attempts.is_some().then_some(now + WORKER_POLL),
-         resizing.then_some(now + RESIZE_POLL),
-      ]
-      .into_iter()
-      .flatten()
-      .min())
+      Ok([limit, expiry, resizing.then_some(now + RESIZE_POLL)]
+         .into_iter()
+         .flatten()
+         .min())
    }
 
    fn done(&self) -> bool {

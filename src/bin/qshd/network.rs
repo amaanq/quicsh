@@ -67,6 +67,7 @@ use quicsh::{
    transport::{
       App,
       Congestion,
+      RECEIVE_WINDOW,
       Transport,
       drain,
    },
@@ -433,6 +434,7 @@ impl Server {
 
                println!("accepted {label} from {}", origin(connection));
                peer.outbox.push(&Message::Accepted);
+               connection.set_receive_window(VarInt::from_u32(RECEIVE_WINDOW));
 
                peer.grant = Some(Grant {
                   id,
@@ -496,6 +498,24 @@ impl Server {
             },
             _ => bail!("unexpected control message"),
          }
+      }
+
+      self.admit(handle, connection)
+   }
+
+   /// Reads the streams a client opened along with its login, once the
+   /// login passed.
+   fn admit(&mut self, handle: ConnectionHandle, connection: &mut Connection) -> Result<()> {
+      let mut waiting = self
+         .peers
+         .get(&handle)
+         .filter(|peer| peer.grant.is_some())
+         .map_or_else(Vec::new, |peer| peer.opening.keys().copied().collect());
+
+      waiting.sort_unstable();
+
+      for stream in waiting {
+         self.opening(handle, connection, stream)?;
       }
 
       Ok(())
@@ -626,8 +646,10 @@ impl Server {
          .get_mut(&handle)
          .context("stream on an unknown connection")?;
 
+      // A client may ask for its session along with the login. The stream
+      // stays unread until the login passed.
       if peer.grant.is_none() {
-         bail!("stream before login");
+         return Ok(());
       }
 
       let Some(deframer) = peer.opening.get_mut(&stream) else {

@@ -329,7 +329,15 @@ impl Channel {
       Ok(())
    }
 
-   /// Opens the session stream once the server accepted the login.
+   /// Whether the session waits to start and has no terminal. Such a
+   /// session may start before the server accepted the login, since no
+   /// later prompt for a key needs the terminal back.
+   pub const fn piped(&self) -> bool {
+      matches!(self.open, Some(Open { terminal: None, .. }))
+   }
+
+   /// Opens the session stream, once the server accepted the login or along
+   /// with the login.
    pub fn start(
       &mut self,
       label: u32,
