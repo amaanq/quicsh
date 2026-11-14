@@ -207,7 +207,7 @@ event loop. There is no async runtime and no unsafe code in this crate.
 These came from `qsh` and OpenSSH 10.6 on one loaded machine, over loopback
 with `netem` adding delay and loss, so treat them as rough.
 
-- At 50 ms of round trip time, running `true` on the server takes 246 ms
+- At 50 ms of round trip time, running `true` on the server takes 132 ms
   from start to finish. OpenSSH takes 693 ms.
 - At 50 ms and 1% packet loss, a bulk upload with `--congestion bbr` runs at
   1.3 Gbit/s. OpenSSH manages 0.2.
@@ -223,9 +223,9 @@ network, which leaves 1372 bytes per packet, and the CPU time is the client's.
 
 | Path            | Tool  | `true` | Upload      | Download    | CPU per GB   |
 | --------------- | ----- | ------ | ----------- | ----------- | ------------ |
-| LAN             | `qsh` | 57 ms  | 2.09 Gbit/s | 1.74 Gbit/s | 1.2 to 1.3 s |
+| LAN             | `qsh` | 41 ms  | 2.09 Gbit/s | 1.74 Gbit/s | 1.2 to 1.3 s |
 | LAN             | `ssh` | 108 ms | 1.80 Gbit/s | 1.92 Gbit/s | 1.0 to 1.1 s |
-| VPS, 12 ms away | `qsh` | 118 ms | 0.50 Gbit/s | 1.39 Gbit/s | 2.1 to 2.3 s |
+| VPS, 12 ms away | `qsh` | 98 ms  | 0.50 Gbit/s | 1.39 Gbit/s | 2.1 to 2.3 s |
 | VPS, 12 ms away | `ssh` | 279 ms | 0.60 Gbit/s | 0.73 Gbit/s | 1.2 to 1.4 s |
 
 Connecting is about twice as fast and so is the download from the VPS. The
