@@ -940,7 +940,9 @@ impl Transport {
 
             // Unsent data beyond two round trips overflows the receiver's
             // socket buffer and delays every stream on the connection, so the
-            // window tracks the path's minimum RTT.
+            // window tracks the path's minimum RTT. Data beyond a few
+            // congestion windows only waits in line ahead of a keystroke's
+            // echo, so the congestion window bounds it too.
             #[expect(
                clippy::cast_possible_truncation,
                clippy::cast_sign_loss,
@@ -948,7 +950,13 @@ impl Transport {
             )]
             let window =
                (connection.stats().path.min_rtt.as_secs_f64() * 2.0 * RATE_CEILING) as u64;
-            connection.set_send_window(window.clamp(session.window_floor, SEND_WINDOW_CEILING));
+            let carried = connection.congestion_state().window().saturating_mul(4);
+
+            connection.set_send_window(
+               window
+                  .min(carried)
+                  .clamp(session.window_floor, SEND_WINDOW_CEILING),
+            );
 
             while let Some(event) = connection.poll() {
                app.event(now, handle, connection, event)?;
