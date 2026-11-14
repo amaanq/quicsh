@@ -76,6 +76,10 @@ const LOGOUT: u8 = 8;
 const ATTACH: u8 = 9;
 /// Tag of [`Request::Reach`].
 const REACH: u8 = 10;
+/// Tag of [`Request::Names`].
+const NAMES: u8 = 11;
+/// Tag of [`Request::Find`].
+const FIND: u8 = 12;
 
 /// Tag of [`Reply::Signature`].
 const SIGNATURE: u8 = 2;
@@ -89,6 +93,8 @@ const DONE: u8 = 7;
 const FAILED: u8 = 8;
 /// Tag of [`Reply::Held`].
 const HELD: u8 = 9;
+/// Tag of [`Reply::Named`].
+const NAMED: u8 = 10;
 
 /// What the network process asks of the monitor.
 pub enum Request {
@@ -131,6 +137,19 @@ pub enum Request {
       /// What the client showed for it.
       token: Token,
    },
+   /// Asks for the names of the account's terminal sessions.
+   Names {
+      /// The login that asks.
+      grant: u64,
+   },
+   /// Asks for a connection to the holder of the terminal session with a
+   /// name.
+   Find {
+      /// The login that wants the session.
+      grant: u64,
+      /// The session's name.
+      name:  String,
+   },
    /// Asks for a process that opens a Unix socket as the login's account.
    /// The answer is a socket pair on which that process passes the socket.
    /// It removes a listener's file when the pair closes.
@@ -172,7 +191,13 @@ pub enum Reply {
    Held {
       /// What a client shows to get the session back.
       token: Token,
+      /// The name of a terminal session, and empty for any other.
+      name:  String,
+      /// Whether the session ran before this request.
+      old:   bool,
    },
+   /// The names of the account's terminal sessions.
+   Named(Vec<String>),
    /// Success with nothing to say, or with one descriptor that the request
    /// asked for.
    Done,
@@ -265,6 +290,15 @@ impl Request {
             put_u64(&mut out, grant);
             put_string(&mut out, &token);
          },
+         Self::Names { grant } => {
+            out.push(NAMES);
+            put_u64(&mut out, grant);
+         },
+         Self::Find { grant, name } => {
+            out.push(FIND);
+            put_u64(&mut out, grant);
+            put_string(&mut out, name.as_bytes());
+         },
          Self::Reach {
             grant,
             path,
@@ -327,6 +361,19 @@ impl Request {
                token: reader.array()?,
             }
          },
+         NAMES => {
+            Self::Names {
+               grant: u64_from(&mut reader)?,
+            }
+         },
+         FIND => {
+            Self::Find {
+               grant: u64_from(&mut reader)?,
+               name:  str::from_utf8(reader.string()?)
+                  .map_err(|_| Error::Frame)?
+                  .to_owned(),
+            }
+         },
          REACH => {
             Self::Reach {
                grant:  u64_from(&mut reader)?,
@@ -380,9 +427,19 @@ impl Reply {
             put_list(&mut out, &forwarding.ports);
          },
          Self::Denied => out.push(DENIED),
-         Self::Held { ref token } => {
+         Self::Held {
+            ref token,
+            ref name,
+            old,
+         } => {
             out.push(HELD);
             put_string(&mut out, token);
+            put_string(&mut out, name.as_bytes());
+            out.push(u8::from(old));
+         },
+         Self::Named(ref names) => {
+            out.push(NAMED);
+            put_list(&mut out, names);
          },
          Self::Done => out.push(DONE),
          Self::Failed(ref text) => {
@@ -422,8 +479,11 @@ impl Reply {
          HELD => {
             Self::Held {
                token: reader.array()?,
+               name:  String::from_utf8_lossy(reader.string()?).into_owned(),
+               old:   reader.byte()? != 0,
             }
          },
+         NAMED => Self::Named(list(&mut reader)?),
          DONE => Self::Done,
          FAILED => Self::Failed(String::from_utf8_lossy(reader.string()?).into_owned()),
          _ => return Err(Error::Frame),
@@ -480,6 +540,18 @@ where
          .collect::<Vec<BorrowedFd>>();
       send_message(channel, &reply.encode(), &borrowed)?;
    }
+}
+
+/// A session in its holder, as the monitor hands it over.
+pub struct Held {
+   /// What a client shows to get the session back.
+   pub token: Token,
+   /// The name of a terminal session, and empty for any other.
+   pub name:  String,
+   /// Whether the session ran before this request.
+   pub old:   bool,
+   /// The connection to the holder.
+   pub link:  OwnedFd,
 }
 
 /// The network process's end of the channel.
@@ -570,18 +642,45 @@ impl Helper {
       }
    }
 
-   /// Asks the monitor to start a session. Returns what a client shows to
-   /// get the session back, and a connection to its holder.
-   pub fn spawn(&self, grant: u64, open: Open) -> Result<(Token, OwnedFd)> {
-      match self.call(Request::Spawn { grant, open })? {
-         (Reply::Held { token }, descriptors) => {
+   /// Asks the monitor to start a session, or for the terminal session that
+   /// already has the name the client asked for.
+   pub fn spawn(&self, grant: u64, open: Open) -> Result<Held> {
+      self
+         .held(Request::Spawn { grant, open })?
+         .context("the monitor started no session")
+   }
+
+   /// Asks for the terminal session with a name, which is `None` when the
+   /// account has none.
+   pub fn find(&self, grant: u64, name: String) -> Result<Option<Held>> {
+      self.held(Request::Find { grant, name })
+   }
+
+   /// Sends a request that a holder answers.
+   fn held(&self, request: Request) -> Result<Option<Held>> {
+      match self.call(request)? {
+         (Reply::Held { token, name, old }, descriptors) => {
             let link = descriptors
                .into_iter()
                .next()
                .context("monitor sent no holder connection")?;
 
-            Ok((token, link))
+            Ok(Some(Held {
+               token,
+               name,
+               old,
+               link,
+            }))
          },
+         (Reply::Denied, _) => Ok(None),
+         _ => bail!("unexpected reply from the monitor"),
+      }
+   }
+
+   /// The names of the account's terminal sessions.
+   pub fn names(&self, grant: u64) -> Result<Vec<String>> {
+      match self.call(Request::Names { grant })? {
+         (Reply::Named(names), _) => Ok(names),
          _ => bail!("unexpected reply from the monitor"),
       }
    }

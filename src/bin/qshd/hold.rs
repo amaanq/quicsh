@@ -524,6 +524,12 @@ struct Holder {
 }
 
 impl Holder {
+   /// When a session without a link gives up on it. A terminal session
+   /// stays until it ends, so that any client of the account can join it.
+   fn expiry(&self) -> Option<Instant> {
+      (self.link.is_none() && self.errors.is_some()).then(|| self.detached + DETACH_LIMIT)
+   }
+
    /// Forgets the link.
    fn detach(&mut self, now: Instant) {
       self.link = None;
@@ -755,7 +761,7 @@ impl Holder {
       sending.set(PollFlags::OUT, !self.outbox.is_empty());
 
       let deadline = [
-         self.link.is_none().then(|| self.detached + DETACH_LIMIT),
+         self.expiry(),
          self
             .exited
             .map(|(_, at)| at + EXIT_GRACE)
@@ -845,7 +851,7 @@ impl Holder {
          self.push(&Packet::Exit(status));
       }
 
-      if self.link.is_none() && now >= self.detached + DETACH_LIMIT {
+      if self.expiry().is_some_and(|at| now >= at) {
          return Ok(ControlFlow::Break(()));
       }
 

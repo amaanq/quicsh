@@ -571,6 +571,8 @@ struct Client {
    turn:     u32,
    /// The last session number handed out.
    issued:   u32,
+   /// What to ask the server about the account's sessions, once.
+   ask:      Option<Message>,
    /// The socket that later runs share this connection through.
    master:   Option<Master>,
    /// The run that waits for the login before it leaves this one in the
@@ -937,6 +939,31 @@ impl Client {
       Ok(())
    }
 
+   /// Handles the server's answer about the account's sessions, or its
+   /// word that a session did not start. A question about sessions goes
+   /// out under the number 0, which no session has.
+   fn heard(&mut self, message: Message) {
+      match message {
+         Message::Listing(names) => {
+            for name in names {
+               println!("{name}");
+            }
+
+            self.status = Some(0);
+         },
+         Message::Failed { session: 0, reason } => {
+            eprintln!("qsh: {reason}");
+            self.status = Some(1);
+         },
+         Message::Failed { session, reason } => {
+            if let Some(channel) = self.channels.get_mut(&session) {
+               channel.fail(&format!("the server did not start the session: {reason}"));
+            }
+         },
+         _ => {},
+      }
+   }
+
    /// Handles what arrived on the control stream.
    fn control(&mut self, connection: &mut Connection, id: StreamId) -> Result<()> {
       for bytes in drain(connection, id)?.0 {
@@ -960,6 +987,10 @@ impl Client {
                self.associate(connection)?;
                self.forwards.rejoin(connection);
 
+               if let Some(ref question) = self.ask.take() {
+                  self.outbox.push(question);
+               }
+
                for (&label, channel) in &mut self.channels {
                   if channel.resumable() {
                      channel.rejoin(label, connection)?;
@@ -981,11 +1012,18 @@ impl Client {
                   let _ = starter.write_all(&[0]);
                }
             },
-            Message::Resumable { session, token } => {
+            Message::Resumable {
+               session,
+               token,
+               name,
+               taken,
+               skipped,
+            } => {
                if let Some(channel) = self.channels.get_mut(&session) {
-                  channel.keep(token);
+                  channel.keep(token, &name, (taken, skipped));
                }
             },
+            heard @ (Message::Listing(_) | Message::Failed { .. }) => self.heard(heard),
             Message::Rejected => {
                if let Some(ref next) = self.next {
                   let _ = next.send(());
@@ -1003,11 +1041,6 @@ impl Client {
                }
             },
             Message::HostCertificate(blob) => self.vouched(connection, &blob)?,
-            Message::Failed { session, reason } => {
-               if let Some(channel) = self.channels.get_mut(&session) {
-                  channel.fail(&format!("the server did not start the session: {reason}"));
-               }
-            },
             Message::Listening { listener, port } => {
                let chosen = usize::try_from(listener)
                   .ok()
@@ -1502,12 +1535,18 @@ fn request(options: &Options, login: &Login) -> Result<Open> {
       None
    };
 
+   ensure!(
+      options.attach.is_none() || terminal.is_some(),
+      "--attach needs a terminal"
+   );
+
    Ok(Open {
       session: 0,
       terminal,
       program,
       agent: options.agent,
       environment,
+      name: options.attach.clone(),
    })
 }
 
@@ -1702,7 +1741,7 @@ fn divert(
 fn first(options: &Options, login: &Login, relaying: bool) -> Result<BTreeMap<u32, Channel>> {
    let mut channels = BTreeMap::new();
 
-   if !options.forward && !options.master && !relaying {
+   if !options.forward && !options.master && !relaying && options.ask().is_none() {
       let stdio = Streams {
          input:  standard(io::stdin())?,
          output: standard(io::stdout())?,
@@ -1792,6 +1831,7 @@ fn main() -> Result<()> {
    };
 
    let channels = first(&options, &login, relay.is_some())?;
+   let ask = options.ask();
 
    let signals = SignalPipe::install()?;
    let mut signalled = reopen(signals.read_fd())?;
@@ -1825,6 +1865,7 @@ fn main() -> Result<()> {
       spares: 0,
       channels,
       issued: 1,
+      ask,
       master,
       starter,
       agent: options.agent,

@@ -33,11 +33,16 @@ afford to lose :)
   runs `qshd` and only ever sees encrypted packets
 - IPv4 and IPv6 on one socket
 - Roaming. A session carries on when the client changes networks
-- Reattaching. A session survives up to an hour without a connection, and
-  `qsh` picks it up again. For a terminal the server keeps the last 256 KiB
-  of output, and `qsh` says so when more was produced. A command on pipes
-  waits instead and continues without a missing or repeated byte, so an
-  `rsync` or `scp` carries on where it was
+- Reattaching. A session survives a lost connection, and `qsh` picks it up
+  again. For a terminal the server keeps the last 256 KiB of output, and
+  `qsh` says so when more was produced. A command on pipes waits up to an
+  hour and continues without a missing or repeated byte, so an `rsync` or
+  `scp` carries on where it was
+- Sessions that any of your machines can join. Every session on a terminal
+  has a name, the one `--attach NAME` gives it or else a number, and runs
+  until its shell exits, its `qsh` exits or `--end NAME` ends it. `--list`
+  prints the names, and `--attach NAME` from another machine takes the
+  session over. The session finds its name in `QSH_SESSION`
 - Restarting `qshd` under a session. The session lives in a process of its
   own, and `qsh` reattaches with the next packet it sends, a keystroke, data
   or the keep-alive that goes out every 15 seconds

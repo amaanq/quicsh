@@ -126,6 +126,13 @@ impl Tail {
       }
    }
 
+   /// Counts `bytes` that came before anything recorded here, as sent by
+   /// an earlier client of the same session.
+   pub const fn shift(&mut self, bytes: u64) {
+      self.start += bytes;
+      self.total += bytes;
+   }
+
    /// How many of the bytes after the first `received` are no longer kept.
    #[must_use]
    pub const fn dropped(&self, received: u64) -> u64 {
@@ -275,6 +282,14 @@ impl Relay {
    #[must_use]
    pub const fn taken(&self) -> u64 {
       self.taken
+   }
+
+   /// Counts input that an earlier client of the session sent, so that the
+   /// count of kept input keeps matching the peer's.
+   pub const fn precede(&mut self, bytes: u64) {
+      if let Some(ref mut tail) = self.tail {
+         tail.shift(bytes);
+      }
    }
 
    /// Counts stream bytes that the peer could not send again, so that the

@@ -29,6 +29,7 @@ use quicsh::{
       Target,
       expand,
    },
+   control::Message,
    key::PublicKey,
    known_hosts::glob,
    transport::Congestion,
@@ -270,6 +271,17 @@ pub struct Options {
    /// Ask the qsh that shares its connection to check or to exit.
    #[pound(short = 'O', value_name = "COMMAND")]
    pub order:      Option<String>,
+   /// Join the terminal session NAME, or start it. Every session on a
+   /// terminal has a name and runs until it ends, and any client of the
+   /// account can join it.
+   #[pound(long, value_name = "NAME")]
+   pub attach:     Option<String>,
+   /// Print the names of the account's terminal sessions.
+   #[pound(long)]
+   pub list:       bool,
+   /// End the terminal session NAME.
+   #[pound(long, value_name = "NAME")]
+   pub end:        Option<String>,
    /// Marks the process that -f started, whose input is the pipe to the
    /// run that waits for the login.
    #[pound(long, hidden)]
@@ -492,16 +504,26 @@ impl Options {
       Ok(family)
    }
 
+   /// What the run asks the server about the account's sessions, in place
+   /// of a session of its own.
+   pub fn ask(&self) -> Option<Message> {
+      self.end.as_ref().map_or_else(
+         || self.list.then_some(Message::Sessions),
+         |name| Some(Message::End(name.clone())),
+      )
+   }
+
    /// Whether the run could be a session through a shared connection.
    /// Forwards from the configuration belong to the process that holds the
    /// connection, so only the command line counts here.
-   pub const fn plain(&self) -> bool {
+   pub fn plain(&self) -> bool {
       self.local.is_empty()
          && self.remote.is_empty()
          && self.dynamic.is_empty()
          && self.relay.is_none()
          && !self.forward
          && !self.master
+         && self.ask().is_none()
    }
 
    /// Takes the forwards, the command, the terminal and the agent switch from

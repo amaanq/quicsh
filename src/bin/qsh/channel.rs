@@ -275,8 +275,19 @@ impl Channel {
    }
 
    /// Notes what the server takes to give the session to a new connection.
-   pub const fn keep(&mut self, token: Token) {
+   /// A session that ran before this client joined it had `taken` bytes of
+   /// input by then, and `skipped` bytes of its output are gone.
+   pub fn keep(&mut self, token: Token, name: &str, (input, skipped): (u64, u64)) {
       self.token = Some(token);
+
+      if let Some(ref mut relay) = self.relay {
+         relay.precede(input);
+         relay.skip(skipped);
+      }
+
+      if input > 0 || skipped > 0 {
+         self.notice(&format!("joined session {name}"));
+      }
    }
 
    /// Notes the exit status of the remote command.

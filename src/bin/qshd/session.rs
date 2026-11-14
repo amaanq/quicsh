@@ -180,6 +180,9 @@ pub struct Session {
    errors:   Option<Relay>,
    /// The connection to the holder.
    link:     OwnedFd,
+   /// How much input the session had when this side joined it, and how
+   /// much of its output was gone by then.
+   before:   (u64, u64),
    /// Whether the session goes on when this side lets go of it.
    keep:     bool,
    /// Tells the input writer that its end is not the end of input.
@@ -317,6 +320,7 @@ impl Session {
          relay,
          errors: side,
          link,
+         before: (taken, skipped),
          keep: false,
          released,
          credit,
@@ -326,6 +330,12 @@ impl Session {
          status: None,
          reported: false,
       }))
+   }
+
+   /// How much input the session had when this side joined it, and how
+   /// much of its output was gone by then.
+   pub const fn before(&self) -> (u64, u64) {
+      self.before
    }
 
    /// The next program that wants the client's SSH agent.

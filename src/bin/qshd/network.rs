@@ -49,6 +49,7 @@ use quicsh::{
       Open,
       Outbox,
       SERVER_LABEL,
+      Size,
       Token,
    },
    forward::{
@@ -104,6 +105,7 @@ use rustls::{
 };
 
 use crate::{
+   hold::Packet,
    privsep::{
       Helper,
       Reply,
@@ -491,6 +493,7 @@ impl Server {
                peer.outbox.push(&reply);
             },
             Message::Bind { listener, path } => peer.listen(listener, path, &self.waker)?,
+            asking @ (Message::Sessions | Message::End(_)) => Self::sessions(peer, asking)?,
             Message::Certify => {
                peer
                   .outbox
@@ -538,8 +541,9 @@ impl Server {
       }
 
       let label = open.session;
+      let size = open.terminal.as_ref().map(|terminal| terminal.size);
 
-      let (token, link) = match helper.spawn(grant, open) {
+      let held = match helper.spawn(grant, open) {
          Ok(started) => started,
          Err(error) => {
             let reason = format!("{error}");
@@ -552,15 +556,58 @@ impl Server {
          },
       };
 
+      let session = Session::attach(held.link, label, None, stream, pending, connection, waker)?
+         .context("the session holder is from another version")?;
+
+      // A program that draws the whole screen draws it again for a client
+      // that joins, once the size changes and changes back.
+      if let (true, Some(wanted)) = (held.old, size) {
+         session.resize(Size {
+            rows: wanted.rows.saturating_add(1),
+            ..wanted
+         })?;
+         session.resize(wanted)?;
+      }
+
+      let (taken, skipped) = session.before();
+
       peer.outbox.push(&Message::Resumable {
          session: label,
-         token,
+         token: held.token,
+         name: held.name,
+         taken,
+         skipped,
       });
 
-      let session = Session::attach(link, label, None, stream, pending, connection, waker)?
-         .context("the session holder is from another version")?;
       peer.sessions.insert(label, session);
 
+      Ok(())
+   }
+
+   /// Answers a client that asks which terminal sessions its account has, or
+   /// that ends one of them.
+   fn sessions(peer: &mut Peer, message: Message) -> Result<()> {
+      let grant = peer.grant.as_ref().context("message before login")?;
+
+      let answer = match message {
+         Message::End(name) => {
+            match grant.helper.find(grant.id, name.clone())? {
+               Some(held) => {
+                  Packet::Hangup.send(&held.link)?;
+                  Message::Listing(vec![name])
+               },
+               None => {
+                  Message::Failed {
+                     session: 0,
+                     reason:  format!("no session is named {name}"),
+                  }
+               },
+            }
+         },
+         _ => Message::Listing(grant.helper.names(grant.id)?),
+      };
+
+      peer.outbox.push(&answer);
       Ok(())
    }
 

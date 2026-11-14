@@ -87,6 +87,26 @@ const CERTIFY: u8 = 23;
 const HOST_CERTIFICATE: u8 = 24;
 /// Tag of [`Message::Upgraded`].
 const UPGRADED: u8 = 25;
+/// Tag of [`Message::Sessions`].
+const SESSIONS: u8 = 26;
+/// Tag of [`Message::Listing`].
+const LISTING: u8 = 27;
+/// Tag of [`Message::End`].
+const END: u8 = 28;
+
+/// Most names one [`Message::Listing`] carries.
+const MAX_NAMES: u32 = 1024;
+/// Most bytes in the name of a session.
+const MAX_NAME: usize = 64;
+
+/// Whether `name` can name a session, which makes it part of a file name on
+/// the server.
+#[must_use]
+pub fn nameable(name: &str) -> bool {
+   let plain = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-');
+
+   (1..=MAX_NAME).contains(&name.len()) && !name.starts_with('.') && name.bytes().all(plain)
+}
 
 /// How long a session waits for a client whose connection died.
 pub const DETACH_LIMIT: Duration = Duration::from_hours(1);
@@ -140,6 +160,9 @@ pub struct Open {
    pub agent:       bool,
    /// Environment variables for the session, which the server may drop.
    pub environment: Vec<(String, String)>,
+   /// The name of the terminal session to join, or to start under that
+   /// name when none has it. Without one the server picks a name.
+   pub name:        Option<String>,
 }
 
 pub enum Message {
@@ -221,11 +244,24 @@ pub enum Message {
    /// The server's answer to [`Message::Resume`] for a session that an
    /// older server started in a way this one cannot continue.
    Upgraded,
-   /// Tells the client that a session can be resumed, and with what.
+   /// Tells the client that a session can be resumed, and with what. A
+   /// terminal session has a `name`, under which any client of the account
+   /// finds it. One that ran before this client joined it already took
+   /// `taken` bytes of input, and `skipped` bytes of its output are gone.
    Resumable {
       session: u32,
       token:   Token,
+      name:    String,
+      taken:   u64,
+      skipped: u64,
    },
+   /// Asks for the names of the account's terminal sessions.
+   Sessions,
+   /// The answer to [`Message::Sessions`], and to a [`Message::End`] that
+   /// found its session.
+   Listing(Vec<String>),
+   /// Ends the terminal session with this name.
+   End(String),
    /// The server did not start the session, and why.
    Failed {
       session: u32,
@@ -312,6 +348,38 @@ fn put_forward(out: &mut Vec<u8>, message: &Message) {
 
    put_u32(out, kept.label);
    put_string(out, &kept.token);
+}
+
+/// Writes a message about sessions that can be joined.
+fn put_session(out: &mut Vec<u8>, message: &Message) {
+   match *message {
+      Message::Resumable {
+         session,
+         ref token,
+         ref name,
+         taken,
+         skipped,
+      } => {
+         put_numbered(out, RESUMABLE, session);
+         put_string(out, token);
+         put_string(out, name.as_bytes());
+         put_string(out, &taken.to_be_bytes());
+         put_string(out, &skipped.to_be_bytes());
+      },
+      Message::Sessions => out.push(SESSIONS),
+      Message::Listing(ref names) => {
+         put_numbered(out, LISTING, u32::try_from(names.len()).unwrap_or(u32::MAX));
+
+         for name in names {
+            put_string(out, name.as_bytes());
+         }
+      },
+      Message::End(ref name) => {
+         out.push(END);
+         put_string(out, name.as_bytes());
+      },
+      _ => {},
+   }
 }
 
 /// Appends the tag and the one number of a message that carries no more.
@@ -415,12 +483,15 @@ fn open(reader: &mut Reader<'_>) -> Result<Open, Error> {
       environment.push((text(reader)?, text(reader)?));
    }
 
+   let name = Some(text(reader)?).filter(|name| !name.is_empty());
+
    Ok(Open {
       session,
       terminal,
       program,
       agent,
       environment,
+      name,
    })
 }
 
@@ -458,6 +529,10 @@ impl Message {
 
             payload.push(u8::from(open.agent));
             put_environment(&mut payload, &open.environment);
+            put_string(
+               &mut payload,
+               open.name.as_deref().unwrap_or_default().as_bytes(),
+            );
          },
          Self::Resize { session, size } => {
             payload.push(RESIZE);
@@ -510,10 +585,8 @@ impl Message {
          },
          Self::Gone => payload.push(GONE),
          Self::Upgraded => payload.push(UPGRADED),
-         Self::Resumable { session, ref token } => {
-            payload.push(RESUMABLE);
-            put_u32(&mut payload, session);
-            put_string(&mut payload, token);
+         Self::Resumable { .. } | Self::Sessions | Self::Listing(_) | Self::End(_) => {
+            put_session(&mut payload, self);
          },
          Self::Failed {
             session,
@@ -561,6 +634,38 @@ impl Message {
          Self::Listen { listener, port }
       } else {
          Self::Listening { listener, port }
+      })
+   }
+
+   /// Reads the rest of a message that [`put_session`] started.
+   fn session(tag: u8, reader: &mut Reader<'_>) -> Result<Self, Error> {
+      Ok(match tag {
+         RESUMABLE => {
+            Self::Resumable {
+               session: reader.u32()?,
+               token:   reader.array()?,
+               name:    text(reader)?,
+               taken:   u64::from_be_bytes(reader.array()?),
+               skipped: u64::from_be_bytes(reader.array()?),
+            }
+         },
+         SESSIONS => Self::Sessions,
+         LISTING => {
+            let count = reader.u32()?;
+
+            if count > MAX_NAMES {
+               return Err(Error::Frame);
+            }
+
+            let mut names = Vec::new();
+
+            for _ in 0..count {
+               names.push(text(reader)?);
+            }
+
+            Self::Listing(names)
+         },
+         _ => Self::End(text(reader)?),
       })
    }
 
@@ -657,12 +762,7 @@ impl Message {
          },
          GONE => Self::Gone,
          UPGRADED => Self::Upgraded,
-         RESUMABLE => {
-            Self::Resumable {
-               session: reader.u32()?,
-               token:   reader.array()?,
-            }
-         },
+         tag @ (RESUMABLE | SESSIONS | LISTING | END) => Self::session(tag, &mut reader)?,
          FAILED => {
             Self::Failed {
                session: reader.u32()?,
@@ -834,6 +934,7 @@ mod tests {
          program:     Program::Command("uname -a".to_owned()),
          agent:       true,
          environment: vec![("LANG".to_owned(), "C.UTF-8".to_owned())],
+         name:        Some("work".to_owned()),
       }));
 
       let mut deframer = Deframer::default();
@@ -845,6 +946,7 @@ mod tests {
       let size = open.terminal.as_ref().map(|terminal| terminal.size);
 
       assert_eq!(open.session, 3, "session");
+      assert_eq!(open.name.as_deref(), Some("work"), "session name");
       assert_eq!(
          open.terminal.map(|terminal| terminal.name).as_deref(),
          Some("xterm"),

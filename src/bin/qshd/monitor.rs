@@ -24,6 +24,7 @@ use std::{
             DirBuilderExt as _,
             FileTypeExt as _,
             OpenOptionsExt as _,
+            symlink,
          },
          process::CommandExt as _,
       },
@@ -62,6 +63,7 @@ use quicsh::{
       Open,
       Program,
       Token,
+      nameable,
    },
    key::{
       PublicKey,
@@ -115,6 +117,9 @@ const SFTP_SERVERS: [&str; 4] = [
    "/usr/lib/ssh/sftp-server",
    "/usr/libexec/sftp-server",
 ];
+
+/// Most terminal sessions one account has at a time.
+const MAX_KEPT: usize = 64;
 
 /// File in the holders directory with the keys a restarted server shares
 /// with the old one. It sits on a runtime directory, so a reboot replaces it.
@@ -273,6 +278,76 @@ impl Monitor {
       self.holders.join(name)
    }
 
+   /// Where the name of an account's terminal session lives, a link to the
+   /// socket of its holder.
+   fn named_path(&self, uid: u32, name: &str) -> PathBuf {
+      self.holders.join(format!("{uid}-n-{name}"))
+   }
+
+   /// The token and the holder of the terminal session that `uid` has under
+   /// `name`. A name whose session is over is forgotten.
+   fn find(&self, uid: u32, name: &str) -> Option<(Token, OwnedFd)> {
+      let link = self.named_path(uid, name);
+      let target = nameable(name)
+         .then(|| fs::read_link(&link).ok())
+         .flatten()?;
+
+      let mut token = Token::default();
+      let digits = target.to_str()?.strip_prefix(&format!("{uid}-"))?;
+      let wellformed = digits.len() == token.len() * 2 && digits.is_ascii();
+
+      for (byte, pair) in token.iter_mut().zip(digits.as_bytes().chunks(2)) {
+         *byte = u8::from_str_radix(str::from_utf8(pair).ok()?, 16).ok()?;
+      }
+
+      let holder = wellformed
+         .then(|| Self::holder(&self.holder_path(uid, token)).ok())
+         .flatten();
+
+      if holder.is_none() {
+         let _ = fs::remove_file(link);
+      }
+
+      Some((token, holder?))
+   }
+
+   /// The names of the terminal sessions `uid` has.
+   fn names(&self, uid: u32) -> Vec<String> {
+      sweep(&self.holders);
+
+      let prefix = format!("{uid}-n-");
+
+      let mut names = fs::read_dir(&self.holders)
+         .into_iter()
+         .flatten()
+         .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+         .filter_map(|file| Some(file.strip_prefix(&prefix)?.to_owned()))
+         .collect::<Vec<String>>();
+
+      names.sort_by_key(|name| (name.parse::<u64>().unwrap_or(u64::MAX), name.clone()));
+      names
+   }
+
+   /// The name for a new terminal session of `uid`, which is `wanted` or
+   /// else the lowest number no session has.
+   fn name(&self, uid: u32, wanted: Option<&str>) -> Result<String> {
+      let taken = self.names(uid);
+      ensure!(
+         taken.len() < MAX_KEPT,
+         "the account has {MAX_KEPT} terminal sessions, end one first"
+      );
+
+      let free = (1..=MAX_KEPT)
+         .map(|number| number.to_string())
+         .find(|name| !taken.contains(name));
+
+      match wanted {
+         Some(name) if nameable(name) => Ok(name.to_owned()),
+         Some(_) => bail!("a session name is 1 to 64 letters, digits, dots, dashes or underscores"),
+         None => free.context("no session name is free"),
+      }
+   }
+
    /// Connects to the holder that listens at `path`.
    fn holder(path: &Path) -> io::Result<OwnedFd> {
       let link = socket_with(
@@ -346,6 +421,26 @@ impl Monitor {
 
       sweep(&self.holders);
 
+      let uid = grant.account.uid;
+
+      let label = match (&open.terminal, open.name.as_deref()) {
+         (&None, None) => None,
+         (&None, Some(_)) => bail!("only a terminal session has a name"),
+         (&Some(_), wanted) => {
+            if let Some((token, link)) = wanted.and_then(|asked| self.find(uid, asked)) {
+               let reply = Reply::Held {
+                  token,
+                  name: wanted.unwrap_or_default().to_owned(),
+                  old: true,
+               };
+
+               return Ok((reply, vec![link]));
+            }
+
+            Some(self.name(uid, wanted)?)
+         },
+      };
+
       let mut token = Token::default();
       SystemRandom::new()
          .fill(&mut token)
@@ -383,6 +478,10 @@ impl Monitor {
 
       self.program(grant, open, &mut command)?;
 
+      if let Some(ref chosen) = label {
+         command.env(format!("{SESSION_ENVIRONMENT}QSH_SESSION"), chosen);
+      }
+
       for pair in &open.environment {
          let (name, value) = (&pair.0, &pair.1);
 
@@ -408,15 +507,29 @@ impl Monitor {
          .spawn()
          .context("starting the session holder")?;
 
+      let alias = label.as_deref().map(|chosen| self.named_path(uid, chosen));
+
+      if let (Some(link), Some(socket)) = (alias.as_ref(), path.file_name()) {
+         symlink(socket, link).with_context(|| format!("naming {}", link.display()))?;
+      }
+
       // The holder outlives this process on purpose. While both run, it is
       // reaped here.
       thread::spawn(move || {
          let _ = child.wait();
          let _ = fs::remove_file(path);
+         let _ = alias.map(fs::remove_file);
       });
 
-      let link = Self::holder(&self.holder_path(grant.account.uid, token))?;
-      Ok((Reply::Held { token }, vec![link]))
+      let link = Self::holder(&self.holder_path(uid, token))?;
+
+      let reply = Reply::Held {
+         token,
+         name: label.unwrap_or_default(),
+         old: false,
+      };
+
+      Ok((reply, vec![link]))
    }
 
    /// Starts a process that opens a Unix socket as the grant's account, and
@@ -501,7 +614,15 @@ impl Monitor {
             let _ = fs::remove_file(&path);
             (Reply::Denied, Vec::new())
          },
-         |link| (Reply::Held { token }, vec![link]),
+         |link| {
+            let reply = Reply::Held {
+               token,
+               name: String::new(),
+               old: true,
+            };
+
+            (reply, vec![link])
+         },
       ))
    }
 
@@ -546,6 +667,36 @@ impl Monitor {
             plain(Reply::Done)
          },
          Request::Attach { grant, token } => self.attach(grant, token),
+         Request::Names { grant } => {
+            let uid = self
+               .grants
+               .get(&grant)
+               .context("unknown grant")?
+               .account
+               .uid;
+            plain(Reply::Named(self.names(uid)))
+         },
+         Request::Find { grant, name } => {
+            let uid = self
+               .grants
+               .get(&grant)
+               .context("unknown grant")?
+               .account
+               .uid;
+
+            Ok(match self.find(uid, &name) {
+               Some((token, link)) => {
+                  let reply = Reply::Held {
+                     token,
+                     name,
+                     old: true,
+                  };
+
+                  (reply, vec![link])
+               },
+               None => (Reply::Denied, Vec::new()),
+            })
+         },
          Request::Reach {
             grant,
             path,
@@ -589,6 +740,8 @@ fn sweep(directory: &Path) {
       return;
    };
 
+   let mut names = Vec::new();
+
    for entry in entries.filter_map(io::Result::ok) {
       let path = entry.path();
       let socket = entry.file_type().is_ok_and(|kind| kind.is_socket());
@@ -598,6 +751,15 @@ fn sweep(directory: &Path) {
 
       if socket && !live {
          let _ = fs::remove_file(path);
+      } else if !socket {
+         names.push(path);
+      }
+   }
+
+   // A session's name is a link to its holder's socket.
+   for name in names {
+      if name.is_symlink() && !name.exists() {
+         let _ = fs::remove_file(name);
       }
    }
 }
