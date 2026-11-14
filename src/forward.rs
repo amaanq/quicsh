@@ -441,12 +441,21 @@ pub struct Forwards {
    dials:  Vec<Dial>,
    /// Streams joined to a socket.
    relays: Vec<Relay>,
+   /// Whether forwards went before sessions on the last turn.
+   led:    bool,
 }
 
 impl Forwards {
    #[must_use]
    pub const fn len(&self) -> usize {
       self.dials.len() + self.relays.len()
+   }
+
+   /// Whether forwards move their data before sessions on this turn. The two
+   /// take turns, since whichever writes first can fill the send window.
+   pub const fn leads(&mut self) -> bool {
+      self.led = !self.led;
+      self.led
    }
 
    #[must_use]
@@ -576,6 +585,10 @@ impl Forwards {
 
          !relay.is_done()
       });
+
+      if !self.relays.is_empty() {
+         self.relays.rotate_left(1);
+      }
 
       Ok(())
    }

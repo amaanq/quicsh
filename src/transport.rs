@@ -74,7 +74,6 @@ use quinn_udp::{
    BATCH_SIZE,
    RecvMeta,
    UdpSocketState,
-   is_msg_size_err,
 };
 use ring::hmac;
 use rustix::{
@@ -462,7 +461,7 @@ impl Socket {
          // reports once as ECONNREFUSED. The idle timeout ends that connection.
          // A router that drops an MTU probe answers the same way, as EMSGSIZE.
          Err(error)
-            if is_msg_size_err(&error)
+            if quinn_udp::is_msg_size_err(&error)
                || matches!(
                   error.kind(),
                   io::ErrorKind::WouldBlock | io::ErrorKind::ConnectionRefused
@@ -519,7 +518,8 @@ impl Socket {
             // An MTU probe larger than the path fails with EMSGSIZE, and a
             // closed peer port with ECONNREFUSED. Loss detection handles both.
             Err(error)
-               if is_msg_size_err(&error) || error.kind() == io::ErrorKind::ConnectionRefused =>
+               if quinn_udp::is_msg_size_err(&error)
+                  || error.kind() == io::ErrorKind::ConnectionRefused =>
             {
                return Ok(());
             },

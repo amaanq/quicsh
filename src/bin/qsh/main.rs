@@ -1206,7 +1206,12 @@ impl App for Client {
       self.arrive(connection)?;
       self.login(connection)?;
       self.connect(connection)?;
-      self.forwards.pump(connection, &self.waker)?;
+
+      let lead = self.forwards.leads();
+
+      if lead {
+         self.forwards.pump(connection, &self.waker)?;
+      }
 
       if self.accepted {
          // The first session to write can fill the send window, so a
@@ -1226,6 +1231,10 @@ impl App for Client {
          self.turn = following(&self.channels, self.turn);
 
          self.settle(connection);
+      }
+
+      if !lead {
+         self.forwards.pump(connection, &self.waker)?;
       }
 
       if let Some(control) = self.control {

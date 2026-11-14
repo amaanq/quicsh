@@ -711,6 +711,10 @@ impl Server {
          return Ok(None);
       };
 
+      if peer.forwards.leads() {
+         peer.forwards.pump(connection, &self.waker)?;
+      }
+
       // A session that ended stays until the client closes it or the
       // connection, because its holder goes on only for a client that may
       // still lack the last output.
