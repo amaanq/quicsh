@@ -265,8 +265,8 @@ nu bench.nu host --identity ~/.ssh/id_bench
   `ControlPath` takes `%h`, `%n`, `%p`, `%r`, `%u`, `%i` and `%C`, and `%C`
   is not the hash `ssh` computes. `StrictHostKeyChecking no` behaves like
   `accept-new`, so a changed host key is always refused. `Match` checks
-  `all`, `host`, `originalhost`, `user` and `localuser`, and a block with
-  `exec` or any other condition is skipped.
+  `all`, `host`, `originalhost`, `user`, `localuser` and `exec`, and a block
+  with any other condition is skipped.
 - RSA keys under 2048 bits and RSA signatures over SHA-1.
   `ecdsa-sk` keys are accepted but nobody has tried one.
 - RSA and P-521 host keys. `qshd` takes an `ed25519`, P-256 or P-384 key.

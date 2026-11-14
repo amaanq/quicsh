@@ -1,9 +1,9 @@
 //! The part of OpenSSH's `ssh_config` that names a server and a login.
 //!
 //! - `Host` blocks with `*`, `?` and `!` patterns, and `Include`.
-//! - `Match` blocks with `all`, `host`, `originalhost`, `user` and `localuser`.
-//!   A block with any other condition is skipped, since nothing here runs a
-//!   command or reads the file twice.
+//! - `Match` blocks with `all`, `host`, `originalhost`, `user`, `localuser` and
+//!   `exec`. A block with any other condition is skipped, since nothing here
+//!   reads the file twice.
 //! - `HostName`, `User`, `IdentityFile`, `CertificateFile`, `IdentityAgent`,
 //!   `ProxyJump`, `ForwardAgent`, the three forward keywords,
 //!   `ClearAllForwardings`, `RequestTTY`, `RemoteCommand`,
@@ -24,6 +24,10 @@ use std::{
    path::{
       Path,
       PathBuf,
+   },
+   process::{
+      Command,
+      Stdio,
    },
 };
 
@@ -169,10 +173,12 @@ impl Host {
    }
 
    /// Whether every condition of a `Match` line holds, given what was read
-   /// so far. A condition this parser cannot check, such as `exec`, holds
-   /// for nobody, and so does one that needs a second pass over the file.
+   /// so far. A condition this parser cannot check holds for nobody, and so
+   /// does one that needs a second pass over the file. As in OpenSSH, a
+   /// command after `exec` runs only when the conditions before it hold.
    fn matched(&self, conditions: &str, target: Target<'_>) -> bool {
-      let mut words = conditions.split_whitespace().peekable();
+      let quoted = words(conditions);
+      let mut words = quoted.iter().map(String::as_str).peekable();
 
       if words.peek().is_none() {
          return false;
@@ -185,6 +191,13 @@ impl Host {
 
          let holds = match keyword.to_ascii_lowercase().as_str() {
             "all" => true,
+            "exec" => {
+               let Some(command) = words.next() else {
+                  return false;
+               };
+
+               self.succeeds(command, target)
+            },
             checked => {
                let subject = match checked {
                   "host" => self.hostname.as_deref().unwrap_or(target.host),
@@ -198,7 +211,7 @@ impl Host {
                   return false;
                };
 
-               covers(patterns.trim_matches('"').split(','), subject)
+               covers(patterns.split(','), subject)
             },
          };
 
@@ -208,6 +221,42 @@ impl Host {
       }
 
       true
+   }
+
+   /// Whether `command` exits with success in the user's shell. `%h` is the
+   /// host name so far, `%n` the name as given, `%r` the account and `%u`
+   /// the local user.
+   fn succeeds(&self, command: &str, target: Target<'_>) -> bool {
+      let mut line = String::new();
+      let mut symbols = command.chars();
+
+      while let Some(symbol) = symbols.next() {
+         if symbol != '%' {
+            line.push(symbol);
+            continue;
+         }
+
+         match symbols.next() {
+            Some('h') => line.push_str(self.hostname.as_deref().unwrap_or(target.host)),
+            Some('n') => line.push_str(target.host),
+            Some('r') => {
+               line.push_str(target.user.or(self.user.as_deref()).unwrap_or(target.local));
+            },
+            Some('u') => line.push_str(target.local),
+            Some('%') => line.push('%'),
+            Some(_) | None => return false,
+         }
+      }
+
+      let shell = env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
+
+      Command::new(shell)
+         .arg("-c")
+         .arg(line)
+         .stdin(Stdio::null())
+         .stdout(Stdio::null())
+         .status()
+         .is_ok_and(|status| status.success())
    }
 
    /// Adds what `text` says about `target`. Relative `Include` paths start
@@ -267,7 +316,7 @@ impl Host {
 
          match lowered.as_str() {
             "host" => active = covers(value.split_whitespace(), name),
-            "match" => active = self.matched(value, target),
+            "match" => active = self.matched(arguments, target),
             _ if !active || value.is_empty() => {},
             "hostname" if self.hostname.is_none() => {
                self.hostname = Some(value.replace("%h", name));
@@ -397,6 +446,33 @@ mod tests {
       );
    }
 
+   /// `Match exec` runs its command with the tokens filled in, and only
+   /// after the conditions before it held.
+   #[test]
+   fn match_exec() {
+      let text = "
+         Host box
+            HostName box.example.com
+         Match host nowhere exec \"touch /nonexistent/quicsh\"
+            QshPort 1
+         Match exec \"test %h-%n-%u = box.example.com-box-me\"
+            QshPort 2
+         Match !exec false
+            QshPort 3
+      ";
+
+      assert_eq!(
+         lookup_as(text, "box", None).port.as_deref(),
+         Some("2"),
+         "a command that succeeds with its tokens"
+      );
+      assert_eq!(
+         lookup_as(text, "other", None).port.as_deref(),
+         Some("3"),
+         "a negated command that fails"
+      );
+   }
+
    /// `Match` conditions are checked against what is known when the line
    /// is read, and all of them must hold.
    #[test]
@@ -410,7 +486,7 @@ mod tests {
             HostName box.example.com
          Match host *.example.com originalhost box
             QshPort 3
-         Match exec true
+         Match canonical
             QshPort 4
          Match all
             QshPort 5
@@ -436,7 +512,7 @@ mod tests {
       assert_eq!(
          port("other", None).as_deref(),
          Some("5"),
-         "exec holds for nobody"
+         "a condition that needs a second pass holds for nobody"
       );
    }
 
