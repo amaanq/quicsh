@@ -8,6 +8,7 @@ use std::{
    env,
    fmt::Write as _,
    fs,
+   net::SocketAddr,
    path::{
       Path,
       PathBuf,
@@ -61,6 +62,8 @@ pub struct Login {
    pub agent:        Option<PathBuf>,
    /// What to do about a host key nobody vouched for yet.
    pub strict:       Strict,
+   /// Which of the host's addresses to try, from `AddressFamily`.
+   pub family:       Family,
    /// The name to look the host key up under, in place of the host's.
    pub alias:        Option<String>,
    /// The connection to share, when the configuration names a socket.
@@ -101,6 +104,37 @@ pub enum Strict {
    AcceptNew,
    /// Refuse it.
    Refuse,
+}
+
+/// Which of a host's addresses to try.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Family {
+   /// All of them.
+   Any,
+   /// The IPv4 ones.
+   Inet,
+   /// The IPv6 ones.
+   Inet6,
+}
+
+impl Family {
+   /// The command line flag that asks for this family.
+   pub const fn flag(self) -> Option<&'static str> {
+      match self {
+         Self::Any => None,
+         Self::Inet => Some("-4"),
+         Self::Inet6 => Some("-6"),
+      }
+   }
+
+   /// Whether `address` is one to try.
+   pub const fn admits(self, address: &SocketAddr) -> bool {
+      match self {
+         Self::Any => true,
+         Self::Inet => address.is_ipv4(),
+         Self::Inet6 => address.is_ipv6(),
+      }
+   }
 }
 
 /// A key to log in with.
@@ -160,6 +194,12 @@ pub struct Options {
    /// Run COMMAND on a terminal.
    #[pound(short = 't')]
    pub terminal:   bool,
+   /// Connect over IPv4 only.
+   #[pound(short = '4')]
+   pub inet:       bool,
+   /// Connect over IPv6 only.
+   #[pound(short = '6')]
+   pub inet6:      bool,
    /// Run COMMAND without a terminal, whatever the configuration says.
    #[pound(short = 'T')]
    pub piped:      bool,
@@ -433,6 +473,25 @@ impl Options {
       }))
    }
 
+   /// The addresses to try, where `-4` and `-6` win over `configured`.
+   fn family(&self, configured: Option<&str>) -> Result<Family> {
+      let family = match (self.inet, self.inet6, configured) {
+         (true, ..) => Family::Inet,
+         (false, true, _) => Family::Inet6,
+         (false, false, None) => Family::Any,
+         (false, false, Some(text)) => {
+            match text.to_ascii_lowercase().as_str() {
+               "any" => Family::Any,
+               "inet" => Family::Inet,
+               "inet6" => Family::Inet6,
+               _ => bail!("AddressFamily takes any, inet or inet6, not {text}"),
+            }
+         },
+      };
+
+      Ok(family)
+   }
+
    /// Whether the run could be a session through a shared connection.
    /// Forwards from the configuration belong to the process that holds the
    /// connection, so only the command line counts here.
@@ -583,6 +642,7 @@ impl Options {
       let control = self.control(&host, &user, &name, port)?;
 
       Ok(Login {
+         family: self.family(host.family.as_deref())?,
          control,
          known: known(&host),
          certificates,

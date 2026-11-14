@@ -21,7 +21,7 @@ afford to lose :)
 
 - Login shells and remote commands, with a terminal or with pipes
 - `-L`, `-R` and `-D` (SOCKS5) forwarding
-- `-f` to go to the background after the login, `-n` and `-T`
+- `-f` to go to the background after the login, `-n`, `-T`, `-4` and `-6`
 - Unix sockets on either side of `-L` and `-R`. The server opens them as
   your account, and it removes the ones it made when the forward ends
 - Agent forwarding with `-A`, which keeps working after a reattach
@@ -262,7 +262,7 @@ nu bench.nu host --identity ~/.ssh/id_bench
   `LocalForward`, `RemoteForward`, `DynamicForward`, `ClearAllForwardings`,
   `RequestTTY`, `RemoteCommand`, `StrictHostKeyChecking`, `HostKeyAlias`,
   `ControlMaster`, `ControlPath`, `ControlPersist`, `ConnectTimeout`,
-  `EscapeChar`, `SendEnv`, `SetEnv` and `QshPort` are read.
+  `EscapeChar`, `AddressFamily`, `SendEnv`, `SetEnv` and `QshPort` are read.
   `ControlPath` takes `%h`, `%n`, `%p`, `%r`, `%u`, `%i` and `%C`, and `%C`
   is not the hash `ssh` computes. `StrictHostKeyChecking no` behaves like
   `accept-new`, so a changed host key is always refused. `Match` checks

@@ -85,6 +85,8 @@ pub struct Host {
    pub known_global:    Option<String>,
    /// `EscapeChar`, as written.
    pub escape:          Option<String>,
+   /// `AddressFamily`, as written.
+   pub family:          Option<String>,
    /// The `SendEnv` patterns that name local variables to pass on.
    pub send_env:        Vec<String>,
    /// The `NAME=VALUE` words of the first `SetEnv` line.
@@ -301,6 +303,7 @@ impl Host {
             "controlpersist" => Some(&mut self.control_persist),
             "connecttimeout" => Some(&mut self.connect_timeout),
             "escapechar" => Some(&mut self.escape),
+            "addressfamily" => Some(&mut self.family),
             "userknownhostsfile" => Some(&mut self.known_user),
             "globalknownhostsfile" => Some(&mut self.known_global),
             _ => None,

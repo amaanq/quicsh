@@ -194,6 +194,7 @@ use crate::{
    mux::Arrival,
    options::{
       Control,
+      Family,
       Login,
       Options,
       Strict,
@@ -1417,6 +1418,8 @@ fn jump(hops: &str, login: &Login) -> Result<(Child, OwnedFd)> {
       command.arg("-p").arg(number.to_string());
    }
 
+   command.args(login.family.flag());
+
    let (link, remote) = socketpair(
       AddressFamily::UNIX,
       SocketType::SEQPACKET,
@@ -1551,7 +1554,7 @@ fn release(starter: Option<File>) -> Result<()> {
 /// Connects to the `qsh` that shares its connection, and starts one when
 /// none runs and the configuration says so. `None` means that this run
 /// makes a connection of its own.
-fn shared(control: &Control, options: &Options) -> Result<Option<OwnedFd>> {
+fn shared(control: &Control, options: &Options, family: Family) -> Result<Option<OwnedFd>> {
    if let Ok(socket) = mux::connect(&control.path) {
       return Ok(Some(socket));
    }
@@ -1563,6 +1566,7 @@ fn shared(control: &Control, options: &Options) -> Result<Option<OwnedFd>> {
    let mut command = Command::new(env::current_exe()?);
    command
       .arg("--master")
+      .args(family.flag())
       .arg("--congestion")
       .arg(options.congestion.to_string());
 
@@ -1655,7 +1659,7 @@ fn divert(
       Some(other) => bail!("-O takes check, exit or stop, not {other}"),
       None => {
          let socket = if plain {
-            shared(control, options)?
+            shared(control, options, login.family)?
          } else {
             None
          };
@@ -1699,7 +1703,14 @@ fn resolve(login: &Login) -> Result<Vec<SocketAddr>> {
    let found = (login.host.as_str(), login.port)
       .to_socket_addrs()
       .with_context(|| format!("resolving {}", login.host))?
-      .collect();
+      .filter(|address| login.family.admits(address))
+      .collect::<Vec<SocketAddr>>();
+
+   ensure!(
+      !found.is_empty(),
+      "{} has no address of the family asked for",
+      login.host
+   );
 
    Ok(found)
 }
