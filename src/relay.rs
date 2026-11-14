@@ -1,7 +1,10 @@
 //! Moves bytes between one QUIC stream and the [`pipe`](crate::pipe) threads.
 
 use std::{
-   collections::VecDeque,
+   collections::{
+      BTreeMap,
+      VecDeque,
+   },
    fs::File,
    mem,
    os::fd::OwnedFd,
@@ -49,6 +52,20 @@ const MERGE_LIMIT: usize = 1 << 16;
 /// How much sent data a relay keeps for a peer that reconnects, when it may
 /// forget the rest.
 const TAIL_LIMIT: u64 = 256 << 10;
+
+/// The key after `turn`, or the first key once `turn` was the last. Sessions
+/// that take turns at going first share the send window, which the first
+/// writer can fill.
+#[must_use]
+pub fn following<Session>(sessions: &BTreeMap<u32, Session>, turn: u32) -> u32 {
+   let later = turn
+      .checked_add(1)
+      .and_then(|next| sessions.range(next..).next());
+
+   later
+      .or_else(|| sessions.iter().next())
+      .map_or(0, |entry| *entry.0)
+}
 
 /// The bytes sent in one direction that the peer may lack, kept so that a
 /// peer whose connection died can get them again.

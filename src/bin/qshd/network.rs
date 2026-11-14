@@ -53,7 +53,10 @@ use quicsh::{
    },
    key::PublicKey,
    pipe::Waker,
-   relay::Relay,
+   relay::{
+      Relay,
+      following,
+   },
    tls,
    transport::{
       App,
@@ -214,6 +217,8 @@ struct Peer {
    opening:   HashMap<StreamId, Deframer>,
    /// Running sessions by the client's number for them.
    sessions:  BTreeMap<u32, Session>,
+   /// The session that moves its data first on the next turn.
+   turn:      u32,
    /// Every forwarded connection in progress.
    forwards:  Forwards,
    /// Remote listeners by the client's number for them. One on a Unix
@@ -638,6 +643,7 @@ impl Server {
                deadline:  now + LOGIN_GRACE,
                opening:   HashMap::new(),
                sessions:  BTreeMap::new(),
+               turn:      0,
                forwards:  Forwards::default(),
                listeners: BTreeMap::new(),
                binding:   Vec::new(),
@@ -708,19 +714,27 @@ impl Server {
       // A session that ended stays until the client closes it or the
       // connection, because its holder goes on only for a client that may
       // still lack the last output.
-      for (&session, running) in &mut peer.sessions {
-         if let Some(status) = running.pump(connection)? {
-            peer.outbox.push(&Message::Exit { session, status });
-         }
+      for late in [false, true] {
+         for (&session, running) in &mut peer.sessions {
+            if (session < peer.turn) != late {
+               continue;
+            }
 
-         if let Some(taken) = running.progress() {
-            peer.outbox.push(&Message::Taken {
-               session,
-               taken,
-               errors: 0,
-            });
+            if let Some(status) = running.pump(connection)? {
+               peer.outbox.push(&Message::Exit { session, status });
+            }
+
+            if let Some(taken) = running.progress() {
+               peer.outbox.push(&Message::Taken {
+                  session,
+                  taken,
+                  errors: 0,
+               });
+            }
          }
       }
+
+      peer.turn = following(&peer.sessions, peer.turn);
 
       peer.bind(&self.waker);
 

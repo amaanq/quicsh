@@ -123,7 +123,10 @@ use quicsh::{
       Waker,
       reopen,
    },
-   relay::Relay,
+   relay::{
+      Relay,
+      following,
+   },
    tls,
    transport::{
       App,
@@ -550,6 +553,8 @@ struct Client {
    spares:   usize,
    /// Every session, by the number the server knows it under.
    channels: BTreeMap<u32, Channel>,
+   /// The session that moves its data first on the next turn.
+   turn:     u32,
    /// The last session number handed out.
    issued:   u32,
    /// The socket that later runs share this connection through.
@@ -1204,11 +1209,21 @@ impl App for Client {
       self.forwards.pump(connection, &self.waker)?;
 
       if self.accepted {
-         for (&label, channel) in &mut self.channels {
-            if let Err(error) = channel.pump(label, connection, &mut self.outbox) {
-               channel.fail(&format!("{error}"));
+         // The first session to write can fill the send window, so a
+         // transfer that always went first would starve a shell beside it.
+         for late in [false, true] {
+            for (&label, channel) in &mut self.channels {
+               if (label < self.turn) != late {
+                  continue;
+               }
+
+               if let Err(error) = channel.pump(label, connection, &mut self.outbox) {
+                  channel.fail(&format!("{error}"));
+               }
             }
          }
+
+         self.turn = following(&self.channels, self.turn);
 
          self.settle(connection);
       }
@@ -1583,6 +1598,16 @@ fn first(options: &Options, login: &Login, relaying: bool) -> Result<BTreeMap<u3
    Ok(channels)
 }
 
+/// Every address of the host a login names.
+fn resolve(login: &Login) -> Result<Vec<SocketAddr>> {
+   let found = (login.host.as_str(), login.port)
+      .to_socket_addrs()
+      .with_context(|| format!("resolving {}", login.host))?
+      .collect();
+
+   Ok(found)
+}
+
 fn main() -> Result<()> {
    let mut options = Options::parse();
 
@@ -1626,12 +1651,7 @@ fn main() -> Result<()> {
 
       (vec![named], Some(link), Some(child))
    } else {
-      let found = (login.host.as_str(), login.port)
-         .to_socket_addrs()
-         .with_context(|| format!("resolving {}", login.host))?
-         .collect::<Vec<SocketAddr>>();
-
-      (found, None, None)
+      (resolve(&login)?, None, None)
    };
 
    let waker = Arc::new(Waker::new()?);
@@ -1670,6 +1690,7 @@ fn main() -> Result<()> {
       current: None,
       login,
       lost: None,
+      turn: 0,
       dialed: None,
       spares: 0,
       channels,
