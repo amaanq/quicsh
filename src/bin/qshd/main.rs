@@ -1,6 +1,7 @@
 mod child;
 /// The process that owns one session.
 mod hold;
+mod mirror;
 mod monitor;
 mod network;
 /// Command line options.

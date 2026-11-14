@@ -1,0 +1,13 @@
+[package]
+name        = "quicsh-vt"
+version     = "0.1.0"
+edition     = "2024"
+description = "The terminal emulator of libghostty-vt, as much of it as quicsh uses"
+repository  = "https://github.com/amaanq/quicsh"
+license     = "EUPL-1.2"
+keywords    = [ "ghostty", "terminal", "vt" ]
+categories  = [ "external-ffi-bindings" ]
+links       = "ghostty-vt"
+
+[build-dependencies]
+cc = "1.2"

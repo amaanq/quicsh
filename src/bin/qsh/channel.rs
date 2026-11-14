@@ -537,7 +537,9 @@ impl Channel {
 
       self.raw(true)?;
 
-      if skipped == 0 {
+      // The server draws a terminal's screen again in place of what it no
+      // longer has.
+      if skipped == 0 || self.interactive() {
          self.notice("reconnected");
       } else {
          self.notice(&format!(

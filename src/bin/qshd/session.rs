@@ -66,6 +66,9 @@ use crate::hold::{
 const NO_STATUS: u32 = 255;
 /// Chunks of session output queued for a stream before the holder waits.
 const QUEUE: usize = 16;
+/// The same for a terminal, whose holder shows a client that is behind the
+/// current screen once the queue has room again.
+const TERMINAL_QUEUE: usize = 2;
 /// How much input a holder may have beyond what its session accepted. More
 /// waits in the stream, which makes the client wait in turn.
 const INPUT_WINDOW: u64 = 1 << 20;
@@ -239,7 +242,7 @@ impl Session {
          Some(_) | None => bail!("the session holder did not answer"),
       };
 
-      let (chunks, outbound) = sync_channel(QUEUE);
+      let (chunks, outbound) = sync_channel(if piped { QUEUE } else { TERMINAL_QUEUE });
       let (lines, stderr) = sync_channel(QUEUE);
       let (status, exit) = channel();
       let (wanted, agents) = channel();

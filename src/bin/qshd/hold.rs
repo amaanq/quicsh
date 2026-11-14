@@ -109,6 +109,7 @@ use rustix::{
       recvmsg,
       send,
       sendmsg,
+      sockopt::set_socket_send_buffer_size,
    },
    process::{
       Pid,
@@ -132,9 +133,12 @@ use crate::{
       become_account,
       exit_code,
    },
+   mirror::Mirror,
    session::winsize,
 };
 
+/// How much terminal output waits in the link to the network process.
+const LINK_BUFFER: usize = 64 << 10;
 /// Most session bytes one packet carries.
 pub const DATA_LIMIT: usize = 32 << 10;
 /// Room for the largest packet.
@@ -491,6 +495,8 @@ struct Holder {
    output:   Flow,
    /// Standard error, for a session on pipes.
    errors:   Option<Flow>,
+   /// The terminal's screen, for a session on a terminal.
+   mirror:   Option<Mirror>,
    /// Accepts the network process.
    listener: OwnedFd,
    /// Accepts programs that want the client's SSH agent.
@@ -598,16 +604,33 @@ impl Holder {
       self.attached = true;
       self.told = self.written;
 
+      // A terminal's client that lacks output which is gone gets the screen
+      // in place of all the output it lacks.
+      let dropped = self.output.tail.dropped(received);
+      let redraw = self
+         .mirror
+         .as_mut()
+         .filter(|_| dropped > 0)
+         .map(|mirror| mirror.snapshot(Instant::now()));
+
+      let skipped = if redraw.is_some() {
+         self.output.tail.total().saturating_sub(received)
+      } else {
+         dropped
+      };
+
       let answer = Packet::Attached {
-         taken:   self.taken,
-         skipped: self.output.tail.dropped(received),
-         piped:   self.errors.is_some(),
+         taken: self.taken,
+         skipped,
+         piped: self.errors.is_some(),
       };
 
       let mut packets = vec![answer.encode(), Packet::Written(self.written).encode()];
 
-      for chunk in self.output.tail.since(received) {
-         packets.push([&[DATA][..], &chunk].concat());
+      if redraw.is_none() {
+         for chunk in self.output.tail.since(received) {
+            packets.push([&[DATA][..], &chunk].concat());
+         }
       }
 
       if let Some(ref flow) = self.errors {
@@ -617,6 +640,21 @@ impl Holder {
       }
 
       self.outbox.extend(packets.into_iter().map(Bytes::from));
+      self.emit(redraw.as_deref().unwrap_or_default());
+   }
+
+   /// Sends the client terminal output that the session did not write as
+   /// such, and keeps it like any other.
+   fn emit(&mut self, text: &[u8]) {
+      for part in text.chunks(DATA_LIMIT) {
+         let packet = Bytes::from([&[DATA][..], part].concat());
+         self.output.tail.record(packet.slice(1..));
+
+         if self.attached {
+            self.outbox.push_back(packet);
+         }
+      }
+
       self.flush();
    }
 
@@ -645,8 +683,9 @@ impl Holder {
                }
             },
             Some(Packet::Resize(size)) => {
-               if self.errors.is_none() {
+               if let Some(ref mut mirror) = self.mirror {
                   let _ = tcsetwinsize(&self.output.source, winsize(size));
+                  mirror.resize(size);
                }
             },
             Some(Packet::Hangup) => return ControlFlow::Break(()),
@@ -719,6 +758,19 @@ impl Holder {
       match read(&flow.source, &mut buffer[1..=DATA_LIMIT]) {
          Ok(0) => flow.ended = true,
          Ok(count) => {
+            // A terminal's program does not wait for a client that is
+            // behind. The client gets the screen later.
+            if let (Stream::Output, Some(mirror)) = (stream, self.mirror.as_mut()) {
+               let behind = self.attached && !self.outbox.is_empty();
+
+               if behind || mirror.skipping() {
+                  mirror.skip(&buffer[1..=count]);
+                  return;
+               }
+
+               mirror.watch(&buffer[1..=count]);
+            }
+
             let packet = Bytes::copy_from_slice(&buffer[..=count]);
             flow.tail.record(packet.slice(1..));
 
@@ -749,7 +801,7 @@ impl Holder {
    )]
    fn reading(&self) -> bool {
       if self.link.is_some() {
-         self.attached && self.outbox.is_empty()
+         self.attached && (self.outbox.is_empty() || self.mirror.is_some())
       } else {
          self.errors.is_none()
       }
@@ -760,8 +812,15 @@ impl Holder {
       let mut sending = PollFlags::IN;
       sending.set(PollFlags::OUT, !self.outbox.is_empty());
 
+      let caught = self.attached && self.outbox.is_empty();
+
       let deadline = [
          self.expiry(),
+         self
+            .mirror
+            .as_ref()
+            .filter(|_| caught)
+            .and_then(Mirror::due),
          self
             .exited
             .map(|(_, at)| at + EXIT_GRACE)
@@ -842,9 +901,13 @@ impl Holder {
    fn turn(&mut self, buffer: &mut [u8]) -> Result<ControlFlow<()>> {
       let mut now = Instant::now();
 
+      // A client that is behind gets the last screen before the status.
+      let shown = self.mirror.as_ref().is_none_or(|mirror| !mirror.skipping());
+
       if let Some((status, _)) = self.exited
          && self.ended()
          && self.attached
+         && shown
          && !self.reported
       {
          self.reported = true;
@@ -866,6 +929,12 @@ impl Holder {
       if !ready.listener.is_empty() {
          let accepted = accept_with(&self.listener, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK)
             .context("accepting the network process")?;
+
+         // A terminal's output that waits in the link is output the client
+         // sees before the current screen, so the link holds little.
+         if self.mirror.is_some() {
+            let _ = set_socket_send_buffer_size(&accepted, LINK_BUFFER);
+         }
 
          self.detach(now);
          self.link = Some(accepted);
@@ -900,6 +969,11 @@ impl Holder {
          if reading && (overdue || !flags.is_empty()) {
             self.collect(stream, overdue, buffer);
          }
+      }
+
+      if self.attached && self.outbox.is_empty() {
+         let update = self.mirror.as_mut().and_then(|mirror| mirror.frame(now));
+         self.emit(update.as_deref().unwrap_or_default());
       }
 
       Ok(ControlFlow::Continue(()))
@@ -1028,6 +1102,11 @@ impl Hold {
          input: Some(input),
          output: flow(output, piped),
          errors: errors.map(|source| flow(source, piped)),
+         mirror: self
+            .terminal
+            .as_ref()
+            .map(|terminal| Mirror::new(terminal.size, Instant::now()))
+            .transpose()?,
          listener,
          agent,
          status: File::from(OwnedFd::from(status)),

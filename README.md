@@ -34,10 +34,17 @@ afford to lose :)
 - IPv4 and IPv6 on one socket
 - Roaming. A session carries on when the client changes networks
 - Reattaching. A session survives a lost connection, and `qsh` picks it up
-  again. For a terminal the server keeps the last 256 KiB of output, and
-  `qsh` says so when more was produced. A command on pipes waits up to an
-  hour and continues without a missing or repeated byte, so an `rsync` or
-  `scp` carries on where it was
+  again. A terminal continues where it was, and after a long outage the
+  server sends its screen and up to 10,000 rows of history in place of
+  the output in between. A command on pipes waits up to an hour and
+  continues without a missing or repeated byte, so an `rsync` or `scp`
+  carries on where it was
+- A terminal that a slow link does not hold up. `qshd` follows every
+  terminal's screen with libghostty-vt. A program that writes faster than
+  the link carries keeps running, and `qsh` gets the current screen once
+  the link has room, so 14 MB of output over 4 Mbit/s shows its end in
+  under a second where the plain stream takes 36. Output that the link
+  keeps up with passes through byte for byte
 - Sessions that any of your machines can join. Every session on a terminal
   has a name, the one `--attach NAME` gives it or else a number, and runs
   until its shell exits, its `qsh` exits or `--end NAME` ends it. `--list`
@@ -299,13 +306,14 @@ nu bench.nu host --identity ~/.ssh/id_bench
 nix build
 ```
 
-Or with a Rust toolchain,
+Or with a Rust toolchain, a C compiler, `pkg-config` and
+[libghostty-vt](https://ghostty.org), whose static library `qshd` links,
 
 ```sh
 cargo build --release
 ```
 
-`nix develop` gives you a toolchain.
+`nix develop` gives you all of these.
 
 ## License
 

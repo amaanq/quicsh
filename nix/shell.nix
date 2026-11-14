@@ -5,6 +5,8 @@
   tombi,
   clang,
   wild,
+  pkg-config,
+  libghostty-vt,
   extraPackages ? [ ],
 }:
 mkShell {
@@ -18,8 +20,11 @@ mkShell {
     tombi
     clang
     wild
+    pkg-config
   ]
   ++ extraPackages;
+
+  buildInputs = [ libghostty-vt ];
 
   env = {
     RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
