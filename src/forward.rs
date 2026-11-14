@@ -309,6 +309,9 @@ pub fn handed(link: &OwnedFd, waker: &Arc<Waker>) -> io::Result<Receiver<io::Res
 const DATAGRAM_LIMIT: usize = 0xFFFF;
 /// Most datagrams the kernel joins into one batch.
 const BATCH_LIMIT: usize = 64;
+/// Room for a full batch of jumbo frames. The kernel cuts off what does not
+/// fit, and 64 datagrams of 1372 bytes are already more than 64 KiB.
+const BATCH_BYTES: usize = BATCH_LIMIT * 9216;
 /// How often an idle datagram relay checks whether its stream is gone.
 const RELAY_POLL: Timespec = Timespec {
    tv_sec:  1,
@@ -409,8 +412,8 @@ fn batches(socket: UdpSocket) -> io::Result<OwnedFd> {
    let gone = Arc::clone(&closed);
 
    thread::spawn(move || {
-      let mut buffer = vec![0; DATAGRAM_LIMIT + 1];
-      let mut batch = Vec::with_capacity(buffer.len() + 2 * BATCH_LIMIT);
+      let mut buffer = vec![0; BATCH_BYTES];
+      let mut batch = Vec::with_capacity(BATCH_BYTES + 2 * BATCH_LIMIT);
 
       while !gone.load(Ordering::Relaxed) {
          // The wait ends once a second so that the loop sees `gone`, and
@@ -442,7 +445,7 @@ fn batches(socket: UdpSocket) -> io::Result<OwnedFd> {
          batch.clear();
 
          for datagram in buffer[..meta[0].len].chunks(meta[0].stride.max(1)) {
-            // A chunk of a buffer of 64 KiB fits in two bytes.
+            // One datagram of a batch is never longer than two bytes count.
             let length = u16::try_from(datagram.len()).unwrap_or(u16::MAX);
 
             batch.extend_from_slice(&length.to_be_bytes());
