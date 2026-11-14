@@ -31,21 +31,71 @@ def moved [pipeline: string, bytes: int] {
    { gbit: ($bytes * 8 / $run.wall / 1e9), cpu_per_gb: ($run.cpu / ($bytes / 1e9)) }
 }
 
+# Times `count` round trips of one line through `cat` on the host, in
+# milliseconds. With `busy` an upload runs beside it on the same connection.
+def echoes [command: string, count: int, busy: bool] {
+   let script = r#'
+      tool=$1 count=$2 busy=$3
+
+      if [ "$busy" = true ]; then
+         head -c 1000000000000 /dev/zero | $tool wc -c > /dev/null 2>&1 &
+         load=$!
+         sleep 2
+      fi
+
+      coproc CAT { exec $tool cat 2> /dev/null; }
+      echo warm >&"${CAT[1]}"
+      read -r -t 20 -u "${CAT[0]}" line || exit 1
+
+      for ((round = 0; round < count; round++)); do
+         start=${EPOCHREALTIME/./}
+         echo ping >&"${CAT[1]}"
+         read -r -t 20 -u "${CAT[0]}" line || exit 1
+         echo $((${EPOCHREALTIME/./} - start))
+         sleep 0.05
+      done
+
+      [ -n "$load" ] && kill "$load"
+      kill "$CAT_PID"
+   '#
+
+   let run = ^bash -c $script bash $command $count $busy | complete
+
+   if $run.exit_code != 0 {
+      error make { msg: $"no echo through: ($command)" }
+   }
+
+   $run.stdout | lines | each {|micros| ($micros | into int) / 1000 }
+}
+
 def main [
    host: string # The server, as both tools name it.
    --size: filesize = 1GB # How much each transfer moves.
    --runs: int = 5 # How many rounds to take the median of.
    --identity: path # A key file that logs in without a prompt.
-   --qsh: string = "qsh -S none" # The qsh command, with a port if it needs one.
-   --ssh: string = "ssh -o ControlPath=none"
+   --echoes: int = 100 # How many keystroke round trips to time.
+   --qsh: string = "qsh" # The qsh command, with a port if it needs one.
+   --ssh: string = "ssh"
 ] {
    let bytes = $size | into int
    let key = if $identity == null { "" } else { $" -i ($identity)" }
 
-   let tools = [
-      { name: "qsh", command: $"($qsh)($key) ($host)" }
-      { name: "ssh", command: $"($ssh)($key) ($host)" }
-   ]
+   let sockets = mktemp --directory
+
+   let tools = [[name base]; [qsh $"($qsh)($key)"] [ssh $"($ssh)($key)"]] | each {|tool|
+      let shared = [
+         "-o ControlMaster=auto"
+         $"-o ControlPath=($sockets)/($tool.name)"
+         "-o ControlPersist=60"
+      ] | str join " "
+
+      {
+         name: $tool.name
+         command: $"($tool.base) -o ControlPath=none ($host)"
+         shared: $"($tool.base) ($shared) ($host)"
+         close: $"($tool.base) ($shared) -O exit ($host)"
+      }
+   }
 
    let samples = 1..$runs | each {|round|
       $tools | each {|tool|
@@ -66,7 +116,29 @@ def main [
       }
    } | flatten
 
-   $samples | group-by tool | items {|name, rows|
+   print ($samples | group-by tool | items {|name, rows|
       $rows | reject tool | math median | insert tool $name | move tool --first
+   })
+
+   # A shell and a transfer on one connection, which is where a lost packet
+   # of the transfer can hold up the shell.
+   let latency = $tools | each {|tool|
+      print --stderr $"keystrokes, ($tool.name)"
+      timed $"($tool.shared) true" | ignore
+
+      let idle = echoes $tool.shared $echoes false
+      let busy = echoes $tool.shared $echoes true
+      timed $tool.close | ignore
+
+      {
+         tool: $tool.name
+         idle_ms: ($idle | math median)
+         busy_ms: ($busy | math median)
+         busy_p95_ms: ($busy | sort | get (($echoes * 95 / 100 | into int) - 1))
+         busy_max_ms: ($busy | math max)
+      }
    }
+
+   rm --recursive $sockets
+   $latency
 }
