@@ -246,7 +246,9 @@ impl Session {
       let report = Arc::clone(&credit);
 
       // The thread stops at the exit status, which closes the channels and
-      // so tells the relays that no more output follows.
+      // so tells the relays that no more output follows. They close before
+      // the last wake, or the loop could look first and then sleep through
+      // the end of the session.
       thread::spawn(move || {
          while let Ok(Some((packet, descriptor))) = Packet::receive(&source, &mut buffer) {
             let delivered = match packet {
@@ -271,6 +273,7 @@ impl Session {
             }
          }
 
+         drop((chunks, lines, status, wanted));
          report.set(u64::MAX);
          signal.wake();
       });
