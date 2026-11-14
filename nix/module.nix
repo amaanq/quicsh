@@ -101,7 +101,7 @@ in
         "bbr"
         "cubic"
       ];
-      default = "bbr";
+      default = "cubic";
       description = "Congestion controller for what the server sends.";
     };
 

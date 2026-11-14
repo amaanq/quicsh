@@ -42,9 +42,9 @@ pub struct Options {
    /// The account the network process runs as when the server is root.
    #[pound(long, value_name = "NAME", default = "sshd")]
    pub user:             String,
-   /// Congestion controller for what this side sends, bbr or cubic. Cubic is
-   /// faster on a clean local network and collapses on a lossy one.
-   #[pound(long, value_name = "NAME", default = "bbr")]
+   /// Congestion controller for what this side sends, cubic or bbr. Bbr
+   /// holds its rate on a lossy path and delays a shell beside a transfer.
+   #[pound(long, value_name = "NAME", default = "cubic")]
    pub congestion:       Congestion,
 
    /// The internal process to run, absent when started by an operator.

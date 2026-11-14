@@ -150,8 +150,8 @@ const NETWORK_CHANGES: u32 = 0x10 | 0x40 | 0x100 | 0x400;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Congestion {
-   #[default]
    Bbr,
+   #[default]
    Cubic,
 }
 

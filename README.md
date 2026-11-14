@@ -207,8 +207,8 @@ with `netem` adding delay and loss, so treat them as rough.
 
 - At 50 ms of round trip time, running `true` on the server takes 246 ms
   from start to finish. OpenSSH takes 693 ms.
-- At 50 ms and 1% packet loss, a bulk upload runs at 1.3 Gbit/s. OpenSSH
-  manages 0.2.
+- At 50 ms and 1% packet loss, a bulk upload with `--congestion bbr` runs at
+  1.3 Gbit/s. OpenSSH manages 0.2.
 - On a clean path with a 1500 byte MTU, an upload moves about 4.4 Gbit/s per
   core, counting both ends. OpenSSH moves about 3.6.
 
@@ -221,14 +221,29 @@ network, which leaves 1372 bytes per packet, and the CPU time is the client's.
 
 | Path            | Tool  | `true` | Upload      | Download    | CPU per GB   |
 | --------------- | ----- | ------ | ----------- | ----------- | ------------ |
-| LAN             | `qsh` | 75 ms  | 1.66 Gbit/s | 1.62 Gbit/s | 2.2 to 2.3 s |
-| LAN             | `ssh` | 132 ms | 1.63 Gbit/s | 1.78 Gbit/s | 1.6 to 1.7 s |
-| VPS, 12 ms away | `qsh` | 111 ms | 0.45 Gbit/s | 1.14 Gbit/s | 2.2 to 2.8 s |
-| VPS, 12 ms away | `ssh` | 275 ms | 0.49 Gbit/s | 0.63 Gbit/s | 1.2 to 1.5 s |
+| LAN             | `qsh` | 65 ms  | 1.60 Gbit/s | 1.69 Gbit/s | 2.1 to 2.4 s |
+| LAN             | `ssh` | 134 ms | 1.75 Gbit/s | 1.66 Gbit/s | 1.5 to 2.0 s |
+| VPS, 12 ms away | `qsh` | 146 ms | 0.34 Gbit/s | 1.50 Gbit/s | 2.6 to 3.9 s |
+| VPS, 12 ms away | `ssh` | 296 ms | 0.57 Gbit/s | 0.75 Gbit/s | 1.8 to 2.0 s |
 
 Connecting is about twice as fast and so is the download from the VPS. The
-rest is a tie that the link decides, and `qsh` burns roughly half again as
-much CPU per byte to get there.
+upload to the VPS is slower, since Cubic backs off on my uplink where
+`--congestion bbr` reaches 0.45 Gbit/s, and `qsh` burns more CPU per byte
+everywhere.
+
+What I care about more is typing while something else uses the connection.
+This is one line echoed through `cat` on a shared connection, alone and then
+beside an upload, as the median and the 95th percentile.
+
+| Path            | Tool  | Alone   | Beside an upload | 95th percentile |
+| --------------- | ----- | ------- | ---------------- | --------------- |
+| LAN             | `qsh` | 0.9 ms  | 1.5 ms           | 5 ms            |
+| LAN             | `ssh` | 0.3 ms  | 6.2 ms           | 101 ms          |
+| VPS, 12 ms away | `qsh` | 13.0 ms | 13.6 ms          | 24 ms           |
+| VPS, 12 ms away | `ssh` | 12.4 ms | 24.3 ms          | 48 ms           |
+
+BBR is why Cubic is the default. With it the same keystroke took 28 to 59 ms
+beside the upload to the VPS.
 
 `bench.nu` takes those measurements between two machines. It runs `qsh` and
 `ssh` in turns against a host that has both servers and prints the medians.
