@@ -470,13 +470,17 @@ enum Link {
 /// A stream joined to a socket.
 struct Joined {
    /// Moves the data.
-   relay: Relay,
+   relay:   Relay,
    /// What names the forward, for one that can outlive its connection.
-   kept:  Option<Handle>,
-   /// The count of taken stream bytes the peer last heard.
-   told:  u64,
+   kept:    Option<Handle>,
+   /// The count of taken stream bytes the peer last heard, if it heard.
+   told:    Option<u64>,
    /// Where the forward stands with the connection.
-   link:  Link,
+   link:    Link,
+   /// The frame that opened the stream, for the side that opened it.
+   opening: Vec<u8>,
+   /// Whether the peer said that it has the forward.
+   seen:    bool,
 }
 
 impl Joined {
@@ -490,13 +494,17 @@ impl Joined {
       Self {
          relay,
          kept,
-         told: 0,
+         told: None,
          link: Link::Live,
+         opening: Vec::new(),
+         seen: false,
       }
    }
 
    /// Reads the server's answer to a request to continue and moves the
-   /// relay to the new stream. `false` means the forward is over.
+   /// relay to the new stream. A forward the server never had starts over
+   /// on a stream of its own, since nothing of it was delivered. `false`
+   /// means the forward is over.
    fn answered(&mut self, connection: &mut Connection) -> Result<bool, Error> {
       let Link::Asking {
          stream,
@@ -517,7 +525,26 @@ impl Joined {
 
       let received = match answer.pop()? {
          Some(Message::Resumed { received, .. }) => received,
-         Some(_) => return Ok(false),
+         Some(_) if self.seen || self.opening.is_empty() => return Ok(false),
+         Some(_) => {
+            let Some(fresh) = connection.streams().open(Dir::Bi) else {
+               return Ok(false);
+            };
+
+            let _ = connection.send_stream(stream).finish();
+
+            self.link = Link::Live;
+            self.told = None;
+            self.relay.resume(
+               connection,
+               fresh,
+               self.opening.clone(),
+               0,
+               (Vec::new(), false),
+            );
+
+            return Ok(true);
+         },
          None => return Ok(!finished),
       };
 
@@ -525,7 +552,7 @@ impl Joined {
          return Ok(true);
       };
 
-      self.told = self.relay.taken();
+      self.told = Some(self.relay.taken());
       self.relay.resume(
          connection,
          stream,
@@ -673,24 +700,30 @@ impl Forwards {
       socket: OwnedFd,
       waker: &Arc<Waker>,
    ) -> Result<(), Error> {
-      let mut relay = Relay::socket(stream, socket, waker, Vec::new(), false)?;
-      relay.prefix(opening.encode());
+      let frame = opening.encode();
 
-      self.joined.push(Joined::live(relay, kept));
+      let mut relay = Relay::socket(stream, socket, waker, Vec::new(), false)?;
+      relay.prefix(frame.clone());
+
+      let mut forward = Joined::live(relay, kept);
+      forward.opening = frame;
+
+      self.joined.push(forward);
       Ok(())
    }
 
    /// Queues a [`Message::Taken`] for every forward that took enough stream
-   /// data since the peer last heard, so that the peer may forget it.
+   /// data since the peer last heard, so that the peer may forget it. The
+   /// first one goes out at once and tells the peer that the forward exists.
    pub fn report(&mut self, outbox: &mut Outbox) {
       for forward in &mut self.joined {
          let taken = forward.relay.taken();
 
          if let Some(kept) = forward.kept
             && matches!(forward.link, Link::Live)
-            && taken >= forward.told + REPORT_STEP
+            && forward.told.is_none_or(|told| taken >= told + REPORT_STEP)
          {
-            forward.told = taken;
+            forward.told = Some(taken);
             outbox.push(&Message::Taken {
                session: kept.label,
                taken,
@@ -709,6 +742,7 @@ impl Forwards {
          .find(|forward| forward.kept.is_some_and(|kept| kept.label == label));
 
       if let Some(forward) = named {
+         forward.seen = true;
          forward.relay.release(taken);
       }
    }
@@ -782,7 +816,7 @@ impl Forwards {
          skipped:  0,
       };
 
-      forward.told = forward.relay.taken();
+      forward.told = Some(forward.relay.taken());
       forward.link = Link::Live;
       forward
          .relay
