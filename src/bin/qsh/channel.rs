@@ -347,6 +347,15 @@ impl Channel {
       matches!(self.open, Some(Open { terminal: None, .. }))
    }
 
+   /// Asks for the session on its stream and sends no input yet. A server
+   /// that has not accepted the login leaves the stream unread, and input
+   /// on it would use up what the login itself may send.
+   pub fn lead(&mut self, connection: &mut Connection) {
+      if let Some(ref mut relay) = self.relay {
+         relay.lead(connection);
+      }
+   }
+
    /// Opens the session stream, once the server accepted the login or along
    /// with the login.
    pub fn start(

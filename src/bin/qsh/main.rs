@@ -1180,12 +1180,17 @@ impl Client {
 
             self.outbox.push(&Message::Request(request));
 
+            if let Some(control) = self.control {
+               self.outbox.flush(connection, control)?;
+            }
+
             // The server reads these streams once it accepted a login, which
             // saves the round trip of waiting for its answer.
             if self.lost.is_none() {
                for (&label, channel) in &mut self.channels {
                   if channel.piped() {
                      channel.start(label, connection, &self.waker)?;
+                     channel.lead(connection);
                   }
                }
             }
@@ -1306,7 +1311,7 @@ impl App for Client {
          self.forwards.pump(connection, &self.waker)?;
       }
 
-      if self.accepted || self.lost.is_none() {
+      if self.accepted {
          // The first session to write can fill the send window, so a
          // transfer that always went first would starve a shell beside it.
          for late in [false, true] {

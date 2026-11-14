@@ -133,6 +133,12 @@ impl Tail {
       self.total += bytes;
    }
 
+   /// How many bytes were ever recorded.
+   #[must_use]
+   pub const fn total(&self) -> u64 {
+      self.total
+   }
+
    /// How many of the bytes after the first `received` are no longer kept.
    #[must_use]
    pub const fn dropped(&self, received: u64) -> u64 {
@@ -249,6 +255,20 @@ impl Relay {
    /// the first [`Relay::pump`].
    pub fn prefix(&mut self, frame: Vec<u8>) {
       self.unsent = Some(frame.into());
+   }
+
+   /// Sends what [`Relay::prefix`] queued and no input yet, for a stream
+   /// that its peer does not read before it has let this side in.
+   pub fn lead(&mut self, connection: &mut Connection) {
+      if let Some(ref mut frame) = self.unsent {
+         let _ = connection
+            .send_stream(self.stream)
+            .write_chunks(slice::from_mut(frame));
+
+         if frame.is_empty() {
+            self.unsent = None;
+         }
+      }
    }
 
    #[must_use]
