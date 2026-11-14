@@ -142,7 +142,7 @@ fn optimal_capacity(smoothed_rtt: Duration, window: u64, mtu: u16) -> u64 {
 /// 2ms is chosen here since framework timers might have 1ms precision.
 /// If kernel-level pacing is supported later a higher time here might be
 /// more applicable.
-const BURST_INTERVAL_NANOS: u128 = 2_000_000; // 2ms
+const BURST_INTERVAL_NANOS: u128 = 250_000; // 0.25ms
 
 /// Allows some usage of GSO, and doesn't slow down the handshake.
 const MIN_BURST_SIZE: u64 = 10;
