@@ -173,8 +173,16 @@ pub struct Relay {
 
 impl Drop for Relay {
    fn drop(&mut self) {
+      // A relay that ended in order may still have bytes on their way to the
+      // socket, which closing the sending side would cut off.
+      let how = if self.is_done() {
+         Shutdown::Read
+      } else {
+         Shutdown::Both
+      };
+
       if let Some(ref socket) = self.socket {
-         let _ = shutdown(socket, Shutdown::Both);
+         let _ = shutdown(socket, how);
       }
    }
 }
