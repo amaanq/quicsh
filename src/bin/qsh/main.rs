@@ -5,6 +5,7 @@ mod forward;
 mod mux;
 /// Command line options.
 mod options;
+mod predict;
 
 use std::{
    collections::{
@@ -721,7 +722,12 @@ impl Client {
                self.issued += 1;
                self.agent |= open.agent;
 
-               let mut channel = Channel::new(open, stdio, Owner::Peer(socket), self.login.escape)?;
+               let mut channel = Channel::new(
+                  open,
+                  stdio,
+                  Owner::Peer(socket),
+                  (self.login.escape, self.login.predict),
+               )?;
 
                if self.accepted {
                   channel.start(self.issued, connection, &self.waker)?;
@@ -1641,7 +1647,9 @@ fn shared(control: &Control, options: &Options, family: Family) -> Result<Option
       .arg("--master")
       .args(family.flag())
       .arg("--congestion")
-      .arg(options.congestion.to_string());
+      .arg(options.congestion.to_string())
+      .arg("--predict")
+      .arg(options.predict.to_string());
 
    for line in &options.option {
       command.arg("-o").arg(line);
@@ -1763,7 +1771,7 @@ fn first(options: &Options, login: &Login, relaying: bool) -> Result<BTreeMap<u3
             request(options, login)?,
             stdio,
             Owner::Process(None),
-            login.escape,
+            (login.escape, login.predict),
          )?,
       );
    }

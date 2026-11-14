@@ -45,6 +45,12 @@ afford to lose :)
   the link has room, so 14 MB of output over 4 Mbit/s shows its end in
   under a second where the plain stream takes 36. Output that the link
   keeps up with passes through byte for byte
+- Typed characters and backspaces that show before the server echoes them,
+  once an echo takes over 30 ms. `qsh` follows the screen with libghostty-vt
+  too, draws a character at the cursor, and puts back what was there when
+  the real output arrives. Nothing shows until the server has echoed since
+  the last enter, escape or control key, so a password prompt stays blank.
+  `--predict always` and `--predict never` change when it happens
 - Sessions that any of your machines can join. Every session on a terminal
   has a name, the one `--attach NAME` gives it or else a number, and runs
   until its shell exits, its `qsh` exits or `--end NAME` ends it. A session

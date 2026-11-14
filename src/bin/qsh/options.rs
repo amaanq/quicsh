@@ -40,10 +40,13 @@ use ring::digest::{
 };
 use rustix::process::getuid;
 
-use crate::forward::{
-   Fixed,
-   Remote,
-   Socks,
+use crate::{
+   forward::{
+      Fixed,
+      Remote,
+      Socks,
+   },
+   predict::Mode,
 };
 
 /// Where to connect and who to log in as.
@@ -74,6 +77,8 @@ pub struct Login {
    /// The character that starts an order to this program at the start of
    /// a line, when there is one.
    pub escape:       Option<u8>,
+   /// When typed characters show before their echo.
+   pub predict:      Mode,
    /// How long the first connection may take per address, from
    /// `ConnectTimeout`.
    pub timeout:      Option<Duration>,
@@ -289,6 +294,10 @@ pub struct Options {
    /// Hold the connection for other runs and start no session.
    #[pound(long, hidden)]
    pub master:     bool,
+   /// Show typed characters before the server echoes them: always, never
+   /// or auto, which does it while the echo takes over 30 ms.
+   #[pound(long, value_name = "WHEN", default = "auto")]
+   pub predict:    Mode,
    /// Congestion controller for what this side sends, cubic or bbr. Bbr
    /// holds its rate on a lossy path and delays a shell beside a transfer.
    #[pound(long, value_name = "NAME", default = "cubic")]
@@ -670,6 +679,7 @@ impl Options {
          certificates,
          environment: environment(&host)?,
          escape: escape(self.escape.as_deref().or(host.escape.as_deref()))?,
+         predict: self.predict,
          timeout: match host.connect_timeout.as_deref() {
             None | Some("none" | "0") => None,
             Some(seconds) => {

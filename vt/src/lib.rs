@@ -20,6 +20,8 @@ unsafe extern "C" {
    fn qvt_resize(terminal: *mut c_void, columns: u16, rows: u16) -> bool;
    fn qvt_alternate(terminal: *mut c_void) -> bool;
    fn qvt_history(terminal: *mut c_void) -> usize;
+   fn qvt_cursor(terminal: *mut c_void, column: *mut u16, row: *mut u16);
+   fn qvt_cell(terminal: *mut c_void, column: u16, row: u16) -> u32;
    fn qvt_format(
       terminal: *mut c_void,
       history: bool,
@@ -32,6 +34,10 @@ unsafe extern "C" {
 
 /// A terminal with a screen, the history above it and its modes.
 pub struct Terminal(NonNull<c_void>);
+
+// SAFETY: the library keeps a terminal's state behind its handle and ties
+// none of it to the thread that made it.
+unsafe impl Send for Terminal {}
 
 impl Terminal {
    /// A blank terminal that keeps about `history` rows above its screen.
@@ -68,6 +74,26 @@ impl Terminal {
    pub fn history_rows(&self) -> usize {
       // SAFETY: the handle is live until drop.
       unsafe { qvt_history(self.0.as_ptr()) }
+   }
+
+   /// The cursor's column and row on the screen, counted from 0.
+   #[must_use]
+   pub fn cursor(&self) -> (u16, u16) {
+      let (mut column, mut row) = (0, 0);
+
+      // SAFETY: the handle is live, and both pointers are valid for the
+      // call.
+      unsafe { qvt_cursor(self.0.as_ptr(), &raw mut column, &raw mut row) };
+
+      (column, row)
+   }
+
+   /// The character in a cell of the screen, which is 0 for an empty cell
+   /// and for a place outside the screen.
+   #[must_use]
+   pub fn cell(&self, column: u16, row: u16) -> u32 {
+      // SAFETY: the handle is live until drop.
+      unsafe { qvt_cell(self.0.as_ptr(), column, row) }
    }
 
    /// Runs a call that fills a buffer of the library's and copies it out.

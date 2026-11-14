@@ -52,6 +52,34 @@ size_t qvt_history(GhosttyTerminal terminal) {
   return rows;
 }
 
+void qvt_cursor(GhosttyTerminal terminal, uint16_t* column, uint16_t* row) {
+  *column = 0;
+  *row = 0;
+
+  ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_CURSOR_X, column);
+  ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_CURSOR_Y, row);
+}
+
+// The character in a cell of the screen, which is 0 for an empty cell and
+// for one outside the screen.
+uint32_t qvt_cell(GhosttyTerminal terminal, uint16_t column, uint16_t row) {
+  GhosttyPoint point = {
+      .tag = GHOSTTY_POINT_TAG_ACTIVE,
+      .value = {.coordinate = {.x = column, .y = row}},
+  };
+  GhosttyGridRef place = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  GhosttyCell cell;
+  uint32_t character = 0;
+
+  if (ghostty_terminal_grid_ref(terminal, point, &place) != GHOSTTY_SUCCESS ||
+      ghostty_grid_ref_cell(&place, &cell) != GHOSTTY_SUCCESS) {
+    return 0;
+  }
+
+  ghostty_cell_get(cell, GHOSTTY_CELL_DATA_CODEPOINT, &character);
+  return character;
+}
+
 // Where the rows start that `part` names, and where they end.
 static bool span(GhosttyTerminal terminal, GhosttyPointTag part, GhosttySelection* selection) {
   uint16_t columns = 0;

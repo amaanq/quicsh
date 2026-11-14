@@ -10,6 +10,7 @@ use std::{
    os::fd::OwnedFd,
    sync::{
       Arc,
+      Mutex,
       mpsc::{
          Receiver,
          Sender,
@@ -61,13 +62,21 @@ use rustix::{
    termios::{
       OptionalActions,
       Termios,
+      isatty,
       tcgetattr,
       tcgetwinsize,
       tcsetattr,
    },
 };
 
-use crate::mux::Notice;
+use crate::{
+   mux::Notice,
+   predict::{
+      Mode,
+      Predictor,
+      Screen,
+   },
+};
 
 /// How much more session output arrives before the server hears of it.
 const CONFIRM_STEP: u64 = 256 << 10;
@@ -222,6 +231,10 @@ pub struct Channel {
    escape:   Option<u8>,
    /// Yields what the user asks for with escape sequences.
    orders:   Option<Receiver<Order>>,
+   /// When typed characters show before their echo.
+   predict:  Mode,
+   /// Follows the terminal and draws typed characters early.
+   early:    Option<Arc<Mutex<Predictor>>>,
    /// Whether the user asked for the session by name.
    named:    bool,
    /// Whether the server has yet to hear that the session goes on without
@@ -237,8 +250,15 @@ impl Drop for Channel {
 
 impl Channel {
    /// A session that starts once the server accepted the login.
-   pub fn new(open: Open, stdio: Streams, owner: Owner, escape: Option<u8>) -> Result<Self> {
+   pub fn new(
+      open: Open,
+      stdio: Streams,
+      owner: Owner,
+      (escape, predict): (Option<u8>, Mode),
+   ) -> Result<Self> {
       Ok(Self {
+         predict,
+         early: None,
          named: open.name.is_some(),
          untold: false,
          open: Some(open),
@@ -390,19 +410,42 @@ impl Channel {
          self.raw(true)?;
       }
 
-      let filter = self.escape.filter(|_| self.interactive()).map(|key| {
+      let mut escapes = self.escape.filter(|_| self.interactive()).map(|key| {
          let (orders, given) = channel();
          self.orders = Some(given);
 
-         let mut escapes = Escapes {
+         Escapes {
             key,
             fresh: true,
             armed: false,
             orders,
             waker: Arc::clone(waker),
-         };
+         }
+      });
 
-         Box::new(move |input: &[u8]| escapes.filter(input)) as Filter
+      self.early = match self.size {
+         Some(size) if self.predict != Mode::Never && isatty(&self.stdio.output) => {
+            Predictor::new(self.predict, size, self.stdio.output.try_clone()?)
+               .map(|predictor| Arc::new(Mutex::new(predictor)))
+         },
+         Some(_) | None => None,
+      };
+
+      let typing = self.early.as_ref().map(Arc::clone);
+
+      let filter = (escapes.is_some() || typing.is_some()).then(|| {
+         Box::new(move |input: &[u8]| {
+            let passed = escapes.as_mut().map_or_else(
+               || Bytes::copy_from_slice(input),
+               |filter| filter.filter(input),
+            );
+
+            if let Some(mut predictor) = typing.as_ref().and_then(|shared| shared.lock().ok()) {
+               predictor.typed(&passed);
+            }
+
+            passed
+         }) as Filter
       });
 
       let input = reader_until(
@@ -411,7 +454,13 @@ impl Channel {
          filter,
          Arc::clone(waker),
       );
-      let (output, handle) = writer(self.stdio.output.try_clone()?, Arc::clone(waker));
+
+      let sink = self.stdio.output.try_clone()?;
+
+      let (output, handle) = match self.early {
+         Some(ref predictor) => writer(Screen::new(sink, Arc::clone(predictor)), Arc::clone(waker)),
+         None => writer(sink, Arc::clone(waker)),
+      };
 
       let mut relay = Relay::new(stream, Some(input), Some(output), Vec::new(), false);
       relay.prefix(Message::Open(open).encode());
@@ -651,6 +700,10 @@ impl Channel {
             size,
          });
          self.size = Some(size);
+
+         if let Some(mut predictor) = self.early.as_ref().and_then(|shared| shared.lock().ok()) {
+            predictor.resize(size);
+         }
       }
 
       Ok(())
