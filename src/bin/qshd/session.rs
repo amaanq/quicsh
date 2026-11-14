@@ -62,8 +62,6 @@ use crate::hold::{
    Packet,
 };
 
-/// Exit status reported when none arrived.
-const NO_STATUS: u32 = 255;
 /// Chunks of session output queued for a stream before the holder waits.
 const QUEUE: usize = 16;
 /// The same for a terminal, whose holder shows a client that is behind the
@@ -166,6 +164,37 @@ impl Drop for Input {
    }
 }
 
+/// How a session ended for this side of it.
+#[derive(Clone, Copy)]
+pub enum Ended {
+   /// The program ended with this status.
+   Exited(u32),
+   /// The holder let go without a status, which it does when another
+   /// connection takes the session over.
+   Orphaned,
+}
+
+impl Ended {
+   /// What the client hears about it, for the session it calls `label`.
+   pub fn report(self, label: u32) -> Message {
+      match self {
+         Self::Exited(status) => {
+            Message::Exit {
+               session: label,
+               status,
+            }
+         },
+         Self::Orphaned => {
+            Message::Failed {
+               session: label,
+               reason:  "another client took the session over, or its process on the server died"
+                  .to_owned(),
+            }
+         },
+      }
+   }
+}
+
 /// What a client that takes a session over says it has.
 #[derive(Clone, Copy)]
 pub struct Had {
@@ -200,8 +229,8 @@ pub struct Session {
    agents:   Receiver<OwnedFd>,
    /// Yields the exit status once.
    exit:     Receiver<u32>,
-   /// The exit status.
-   status:   Option<u32>,
+   /// How the session ended.
+   status:   Option<Ended>,
    /// Whether [`Session::pump`] returned the status.
    reported: bool,
 }
@@ -404,7 +433,7 @@ impl Session {
 
    /// Moves data and returns the exit status once, when the session is over
    /// and all of its output is on the streams.
-   pub fn pump(&mut self, connection: &mut Connection) -> Result<Option<u32>> {
+   pub fn pump(&mut self, connection: &mut Connection) -> Result<Option<Ended>> {
       self.relay.pump(connection)?;
 
       if let Some(ref mut errors) = self.errors {
@@ -415,9 +444,8 @@ impl Session {
 
       if self.status.is_none() {
          self.status = match self.exit.try_recv() {
-            Ok(code) => Some(code),
-            // A holder that another connection took over sends no status.
-            Err(TryRecvError::Disconnected) if drained => Some(NO_STATUS),
+            Ok(code) => Some(Ended::Exited(code)),
+            Err(TryRecvError::Disconnected) if drained => Some(Ended::Orphaned),
             Err(TryRecvError::Disconnected | TryRecvError::Empty) => None,
          };
       }

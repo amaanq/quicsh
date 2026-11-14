@@ -957,7 +957,11 @@ impl Client {
          },
          Message::Failed { session, reason } => {
             if let Some(channel) = self.channels.get_mut(&session) {
-               channel.fail(&format!("the server did not start the session: {reason}"));
+               if channel.started() {
+                  channel.fail(&reason);
+               } else {
+                  channel.fail(&format!("the server did not start the session: {reason}"));
+               }
             }
          },
          _ => {},

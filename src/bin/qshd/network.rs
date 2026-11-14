@@ -891,8 +891,8 @@ impl Server {
                continue;
             }
 
-            if let Some(status) = running.pump(connection)? {
-               peer.outbox.push(&Message::Exit { session, status });
+            if let Some(ended) = running.pump(connection)? {
+               peer.outbox.push(&ended.report(session));
             }
 
             if let Some(taken) = running.progress() {
