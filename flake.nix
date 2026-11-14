@@ -37,6 +37,25 @@
           inherit quicsh;
           default = quicsh;
         }
+        // lib.optionalAttrs (system == "x86_64-linux") {
+          quicsh-aarch64 =
+            let
+              cross = pkgs.pkgsCross.aarch64-multiplatform;
+
+              crossToolchain = fenix.packages.${system}.combine [
+                toolchain
+                fenix.packages.${system}.targets.aarch64-unknown-linux-gnu.latest.rust-std
+              ];
+            in
+            cross.callPackage ./nix/package.nix {
+              inherit (pkgsFor "aarch64-linux") libghostty-vt;
+
+              rustPlatform = cross.makeRustPlatform {
+                cargo = crossToolchain;
+                rustc = crossToolchain;
+              };
+            };
+        }
       );
 
       devShells = forAllSystems (
