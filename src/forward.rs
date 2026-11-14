@@ -792,8 +792,14 @@ impl Forwards {
    }
 
    /// Takes the forwards of a dead connection that a client may continue.
+   /// One that this side opened and the client never confirmed ends here,
+   /// since a client that does not know it cannot ask for it.
    pub fn park(&mut self) -> Vec<Parked> {
       self.detach();
+      self
+         .joined
+         .retain(|forward| forward.seen || forward.opening.is_empty());
+
       mem::take(&mut self.joined)
          .into_iter()
          .map(Parked)
