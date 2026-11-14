@@ -12,6 +12,9 @@
 !LICENSE
 !README.md
 !bench.nu
+
+!docs/
+!docs/**
 !flake.lock
 !flake.nix
 
