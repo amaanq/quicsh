@@ -240,8 +240,7 @@ impl Session {
    /// session. A client that takes the session over says in `had` what it
    /// has, and is first told how much input the holder has and how much
    /// output it missed for good. `buffered` and `finished` describe input
-   /// already read from `stream`. `None` means the holder is from another
-   /// version of this program and cannot be talked to.
+   /// already read from `stream`.
    pub fn attach(
       link: OwnedFd,
       label: u32,
@@ -250,7 +249,7 @@ impl Session {
       (buffered, finished): (Vec<u8>, bool),
       connection: &mut Connection,
       waker: &Arc<Waker>,
-   ) -> Result<Option<Self>> {
+   ) -> Result<Self> {
       let Had { received, errors } = had.unwrap_or(Had {
          received: 0,
          errors:   0,
@@ -260,17 +259,16 @@ impl Session {
 
       let mut buffer = vec![0; PACKET_LIMIT];
 
-      let (taken, skipped, piped) = match Packet::receive(&link, &mut buffer)? {
-         Some((
-            Packet::Attached {
-               taken,
-               skipped,
-               piped,
-            },
-            _,
-         )) => (taken, skipped, piped),
-         Some((Packet::Foreign, _)) => return Ok(None),
-         Some(_) | None => bail!("the session holder did not answer"),
+      let Some((
+         Packet::Attached {
+            taken,
+            skipped,
+            piped,
+         },
+         _,
+      )) = Packet::receive(&link, &mut buffer)?
+      else {
+         bail!("the session holder did not answer");
       };
 
       let (chunks, outbound) = sync_channel(if piped { QUEUE } else { TERMINAL_QUEUE });
@@ -350,7 +348,7 @@ impl Session {
          relay.prefix(answer.encode());
       }
 
-      Ok(Some(Self {
+      Ok(Self {
          relay,
          errors: side,
          link,
@@ -364,7 +362,7 @@ impl Session {
          exit,
          status: None,
          reported: false,
-      }))
+      })
    }
 
    /// How much input the session had when this side joined it, and how

@@ -149,12 +149,6 @@ const EXIT_GRACE: Duration = Duration::from_millis(200);
 /// How much more input the session accepts before the link hears of it.
 const REPORT_STEP: u64 = 64 << 10;
 
-/// Names the packet format. A holder outlives the server that started it,
-/// so a newer server may find one that speaks another format. The first
-/// two bytes of [`Packet::Attach`] and [`Packet::Attached`], the tag and
-/// this number, are the one part that must never change.
-const VERSION: u8 = 1;
-
 /// Tag of [`Packet::Attach`].
 const ATTACH: u8 = 1;
 /// Tag of [`Packet::Attached`].
@@ -230,9 +224,6 @@ pub enum Packet {
    /// A program in the session wants the client's SSH agent. Its socket
    /// comes along as a descriptor.
    Agent,
-   /// What the other side sent first is in another version's format. A
-   /// holder answers with this, which reads the same way to the server.
-   Foreign,
    /// Asks how the session is doing, as the first packet of a connection.
    /// The session's client stays connected.
    Inspect,
@@ -251,10 +242,9 @@ impl Packet {
    /// The bytes of one packet.
    pub fn encode(&self) -> Vec<u8> {
       match *self {
-         Self::Foreign => vec![ATTACHED, VERSION],
          Self::Attach { received, errors } => {
             [
-               &[ATTACH, VERSION][..],
+               &[ATTACH][..],
                &received.to_be_bytes(),
                &errors.to_be_bytes(),
             ]
@@ -266,7 +256,7 @@ impl Packet {
             piped,
          } => {
             [
-               &[ATTACHED, VERSION][..],
+               &[ATTACHED][..],
                &taken.to_be_bytes(),
                &skipped.to_be_bytes(),
                &[u8::from(piped)],
@@ -296,14 +286,14 @@ impl Packet {
          Self::Exit(status) => [&[EXIT][..], &status.to_be_bytes()].concat(),
          Self::Hangup => vec![HANGUP],
          Self::Agent => vec![AGENT],
-         Self::Inspect => vec![INSPECT, VERSION],
+         Self::Inspect => vec![INSPECT],
          Self::About {
             attached,
             quiet,
             ref title,
          } => {
             [
-               &[ABOUT, VERSION, u8::from(attached)][..],
+               &[ABOUT, u8::from(attached)][..],
                &quiet.to_be_bytes(),
                title.as_bytes(),
             ]
@@ -316,10 +306,6 @@ impl Packet {
    pub fn decode(bytes: &[u8]) -> Result<Self, Error> {
       let (&tag, rest) = bytes.split_first().ok_or(Error::Truncated)?;
       let mut reader = Reader::new(rest);
-
-      if matches!(tag, ATTACH | ATTACHED | INSPECT | ABOUT) && reader.byte()? != VERSION {
-         return Ok(Self::Foreign);
-      }
 
       let mut number =
          || Ok::<u64, Error>((u64::from(reader.u32()?) << 32) | u64::from(reader.u32()?));
@@ -362,14 +348,14 @@ impl Packet {
          INSPECT => Self::Inspect,
          ABOUT => {
             let quiet = rest
-               .get(2..10)
+               .get(1..9)
                .and_then(|field| field.try_into().ok())
                .ok_or(Error::Truncated)?;
 
             Self::About {
-               attached: rest[1] != 0,
+               attached: rest[0] != 0,
                quiet:    u64::from_be_bytes(quiet),
-               title:    String::from_utf8_lossy(&rest[10..]).into_owned(),
+               title:    String::from_utf8_lossy(&rest[9..]).into_owned(),
             }
          },
          _ => return Err(Error::Frame),
@@ -377,7 +363,7 @@ impl Packet {
    }
 
    /// Asks the holder behind a new `link` how its session is doing. `None`
-   /// means it did not say, as a holder of another version does not.
+   /// means it did not say in time.
    pub fn inspect(link: &OwnedFd) -> Option<Self> {
       Self::Inspect.send(link).ok()?;
 
@@ -825,13 +811,6 @@ impl Holder {
             }
          },
          Some(Packet::Hangup) => return ControlFlow::Break(()),
-         Some(Packet::Foreign) => {
-            if let Some(ref link) = self.link {
-               let _ = Packet::Foreign.send(link);
-            }
-
-            self.detach(now);
-         },
          Some(
             Packet::Attached { .. }
             | Packet::Errors(_)

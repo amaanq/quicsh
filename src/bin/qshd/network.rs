@@ -620,8 +620,7 @@ impl Server {
          },
       };
 
-      let session = Session::attach(held.link, label, None, stream, pending, connection, waker)?
-         .context("the session holder is from another version")?;
+      let session = Session::attach(held.link, label, None, stream, pending, connection, waker)?;
 
       // A program that draws the whole screen draws it again for a client
       // that joins, once the size changes and changes back.
@@ -713,32 +712,24 @@ impl Server {
          .attach(grant, token)?
          .filter(|_| !peer.sessions.contains_key(&label));
 
-      // A holder that an older server started may speak a format this one
-      // does not, and its session then stays out of reach.
-      let answer = match link {
-         Some(holder) => {
-            let attached = Session::attach(
-               holder,
-               label,
-               Some(had),
-               stream,
-               pending,
-               connection,
-               &self.waker,
-            )?;
+      if let Some(holder) = link {
+         let session = Session::attach(
+            holder,
+            label,
+            Some(had),
+            stream,
+            pending,
+            connection,
+            &self.waker,
+         )?;
 
-            match attached {
-               Some(session) => {
-                  peer.sessions.insert(label, session);
-                  return Ok(());
-               },
-               None => Message::Upgraded,
-            }
-         },
-         None => Message::Gone,
-      };
+         peer.sessions.insert(label, session);
+         return Ok(());
+      }
 
-      let _ = connection.send_stream(stream).write(&answer.encode());
+      let _ = connection
+         .send_stream(stream)
+         .write(&Message::Gone.encode());
       let _ = connection.send_stream(stream).finish();
 
       Ok(())

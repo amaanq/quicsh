@@ -85,8 +85,6 @@ const BIND: u8 = 22;
 const CERTIFY: u8 = 23;
 /// Tag of [`Message::HostCertificate`].
 const HOST_CERTIFICATE: u8 = 24;
-/// Tag of [`Message::Upgraded`].
-const UPGRADED: u8 = 25;
 /// Tag of [`Message::Sessions`].
 const SESSIONS: u8 = 26;
 /// Tag of [`Message::Listing`].
@@ -243,9 +241,6 @@ pub enum Message {
    /// The server's answer to [`Message::Resume`] for a session that ended or
    /// was never there.
    Gone,
-   /// The server's answer to [`Message::Resume`] for a session that an
-   /// older server started in a way this one cannot continue.
-   Upgraded,
    /// Tells the client that a session can be resumed, and with what. A
    /// terminal session has a `name`, under which any client of the account
    /// finds it. One that ran before this client joined it already took
@@ -593,7 +588,6 @@ impl Message {
             put_string(&mut payload, &skipped.to_be_bytes());
          },
          Self::Gone => payload.push(GONE),
-         Self::Upgraded => payload.push(UPGRADED),
          Self::Resumable { .. } | Self::Sessions | Self::Listing(_) | Self::End(_) => {
             put_session(&mut payload, self);
          },
@@ -775,7 +769,6 @@ impl Message {
             }
          },
          GONE => Self::Gone,
-         UPGRADED => Self::Upgraded,
          tag @ (RESUMABLE | SESSIONS | LISTING | END) => Self::session(tag, &mut reader)?,
          FAILED => {
             Self::Failed {

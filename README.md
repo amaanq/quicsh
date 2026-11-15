@@ -189,9 +189,7 @@ or the pipes and keeps the output the client may not have yet. The server
 talks to it over a socket in a directory only root can enter, which is how a
 session outlives both a lost connection and a restarted server. That process
 waits an hour for a client that vanished without closing the connection, so
-a command whose client was killed stays around that long. A `qshd` upgrade
-that changes how the server talks to that process can't pick its sessions
-up. `qsh` says so and exits.
+a command whose client was killed stays around that long.
 
 A `qshd` that is told to stop hands its open forwarded connections to one
 more process, which runs without privileges and keeps them until the next
