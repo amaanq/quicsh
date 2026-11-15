@@ -224,7 +224,7 @@ pub struct Channel {
    /// The terminal size last sent to the server.
    size:     Option<Size>,
    /// Threads still writing to standard output and error.
-   writers:  Vec<JoinHandle<()>>,
+   writers:  Vec<JoinHandle<Vec<u8>>>,
    /// Exit status of the remote command.
    status:   Option<u32>,
    /// The escape character for a session on a terminal.

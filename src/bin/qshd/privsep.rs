@@ -19,6 +19,10 @@ use std::{
       Arc,
       Mutex,
    },
+   time::{
+      Duration,
+      Instant,
+   },
 };
 
 use knell::signals::shutdown_requested;
@@ -55,6 +59,7 @@ use rustix::{
       poll,
    },
    io::Errno,
+   time::Timespec,
 };
 
 /// Largest request or reply.
@@ -80,6 +85,12 @@ const REACH: u8 = 10;
 const NAMES: u8 = 11;
 /// Tag of [`Request::Find`].
 const FIND: u8 = 12;
+/// Tag of [`Request::Keep`].
+const KEEP: u8 = 13;
+/// Tag of [`Request::Kept`].
+const KEPT: u8 = 14;
+/// How long a network process that was told to stop may go on asking.
+const STOP_LIMIT: Duration = Duration::from_secs(5);
 
 /// Tag of [`Reply::Signature`].
 const SIGNATURE: u8 = 2;
@@ -161,6 +172,12 @@ pub enum Request {
       /// Whether to listen there, and connect otherwise.
       listen: bool,
    },
+   /// Asks for a process that keeps forwarded connections for the next
+   /// server. The answer is the link to it.
+   Keep,
+   /// Asks for the link to the process an earlier server left its forwarded
+   /// connections with.
+   Kept,
 }
 
 /// The monitor's answer to one request.
@@ -294,6 +311,8 @@ impl Request {
             out.push(NAMES);
             put_u64(&mut out, grant);
          },
+         Self::Keep => out.push(KEEP),
+         Self::Kept => out.push(KEPT),
          Self::Find { grant, name } => {
             out.push(FIND);
             put_u64(&mut out, grant);
@@ -366,6 +385,8 @@ impl Request {
                grant: u64_from(&mut reader)?,
             }
          },
+         KEEP => Self::Keep,
+         KEPT => Self::Kept,
          FIND => {
             Self::Find {
                grant: u64_from(&mut reader)?,
@@ -525,20 +546,61 @@ where
          continue;
       }
 
-      let Some((bytes, _)) = receive_message(channel, MAX_MESSAGE)? else {
+      if !answer(channel, &mut handle)? {
          return Ok(Ended::Closed);
+      }
+   }
+}
+
+/// Answers the next request with `handle`. `false` means the network
+/// process went away.
+fn answer<Handler>(channel: &OwnedFd, handle: &mut Handler) -> Result<bool>
+where
+   Handler: FnMut(Request) -> Result<(Reply, Vec<OwnedFd>)>,
+{
+   let Some((bytes, _)) = receive_message(channel, MAX_MESSAGE)? else {
+      return Ok(false);
+   };
+
+   let (reply, descriptors) = Request::decode(&bytes)
+      .map_err(Into::into)
+      .and_then(handle)
+      .unwrap_or_else(|error| (Reply::Failed(format!("{error}")), Vec::new()));
+
+   let borrowed = descriptors
+      .iter()
+      .map(OwnedFd::as_fd)
+      .collect::<Vec<BorrowedFd>>();
+   send_message(channel, &reply.encode(), &borrowed)?;
+
+   Ok(true)
+}
+
+/// Answers the requests of a network process that was told to stop, until
+/// it goes away or took too long.
+pub fn finish<Handler>(channel: &OwnedFd, mut handle: Handler) -> Result<()>
+where
+   Handler: FnMut(Request) -> Result<(Reply, Vec<OwnedFd>)>,
+{
+   let limit = Instant::now() + STOP_LIMIT;
+
+   loop {
+      let left = limit.saturating_duration_since(Instant::now());
+      let wait = Timespec {
+         tv_sec:  i64::try_from(left.as_secs()).unwrap_or(i64::MAX),
+         tv_nsec: left.subsec_nanos().into(),
       };
 
-      let (reply, descriptors) = Request::decode(&bytes)
-         .map_err(Into::into)
-         .and_then(&mut handle)
-         .unwrap_or_else(|error| (Reply::Failed(format!("{error}")), Vec::new()));
+      match poll(&mut [PollFd::new(channel, PollFlags::IN)], Some(&wait)) {
+         Ok(0) => return Ok(()),
+         Ok(_) => {},
+         Err(Errno::INTR) => continue,
+         Err(errno) => return Err(errno.into()),
+      }
 
-      let borrowed = descriptors
-         .iter()
-         .map(OwnedFd::as_fd)
-         .collect::<Vec<BorrowedFd>>();
-      send_message(channel, &reply.encode(), &borrowed)?;
+      if !answer(channel, &mut handle)? {
+         return Ok(());
+      }
    }
 }
 
@@ -701,6 +763,22 @@ impl Helper {
    pub fn attach(&self, grant: u64, token: Token) -> Result<Option<OwnedFd>> {
       match self.call(Request::Attach { grant, token })? {
          (Reply::Held { .. }, descriptors) => Ok(descriptors.into_iter().next()),
+         (Reply::Denied, _) => Ok(None),
+         _ => bail!("unexpected reply from the monitor"),
+      }
+   }
+
+   /// Asks for a process that keeps forwarded connections for the next
+   /// server, and returns the link to it.
+   pub fn keeper(&self) -> Result<OwnedFd> {
+      self.descriptor(Request::Keep)
+   }
+
+   /// The link to the process an earlier server left its forwarded
+   /// connections with, if it left any.
+   pub fn kept(&self) -> Result<Option<OwnedFd>> {
+      match self.call(Request::Kept)? {
+         (Reply::Done, descriptors) => Ok(descriptors.into_iter().next()),
          (Reply::Denied, _) => Ok(None),
          _ => bail!("unexpected reply from the monitor"),
       }

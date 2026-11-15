@@ -63,7 +63,7 @@ afford to lose :)
   or the keep-alive that goes out every 15 seconds
 - `qsh -N` reconnects after an outage or a restart too, and its `-L`, `-R` and
   `-D` listeners work again. Connections that were open through them carry
-  on after an outage without a missing or repeated byte, for up to an hour
+  on after either without a missing or repeated byte, for up to an hour
 - Connection sharing with `ControlMaster`, `ControlPath` and `ControlPersist`,
   or `-S`. The first `qsh` leaves one in the background that holds the
   connection, and later runs, `rsync`, `scp` and `sftp` included, go through
@@ -188,6 +188,10 @@ a command whose client was killed stays around that long. A `qshd` upgrade
 that changes how the server talks to that process can't pick its sessions
 up. `qsh` says so and exits.
 
+A `qshd` that is told to stop hands its open forwarded connections to one
+more process, which keeps them until the next `qshd` asks or an hour has
+passed. A `qshd` that crashes or gets killed closes them.
+
 A shared connection is a logged-in connection that anything running as you
 can open sessions on, for as long as `ControlPersist` says, with no PIN and no
 touch. That's what the feature is for, and it's also what a security key's
@@ -303,9 +307,6 @@ nu bench.nu host --identity ~/.ssh/id_bench
   `from=` matches addresses and networks and never host names. An
   `expiry-time=` without a `Z` ends up to a day early, since `qshd` doesn't
   know your time zone.
-- Forwarded connections across a restart of `qshd`. The listeners come back,
-  and the connections that were open are closed. They do survive a lost
-  connection.
 - Anything but Linux.
 
 ## Building

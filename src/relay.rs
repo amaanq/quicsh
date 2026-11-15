@@ -18,6 +18,7 @@ use std::{
          TrySendError,
       },
    },
+   thread::JoinHandle,
 };
 
 use bytes::{
@@ -27,13 +28,17 @@ use bytes::{
 use quinn_proto::{
    Connection,
    Dir,
+   Side,
    StreamId,
    VarInt,
    WriteError,
 };
-use rustix::net::{
-   Shutdown,
-   shutdown,
+use rustix::{
+   io::ioctl_fionbio,
+   net::{
+      Shutdown,
+      shutdown,
+   },
 };
 
 use crate::{
@@ -45,6 +50,10 @@ use crate::{
       writer,
    },
    transport::drain,
+   wire::{
+      Reader,
+      put_string,
+   },
 };
 
 /// Most stream bytes joined into one write to the sink.
@@ -182,6 +191,8 @@ pub struct Relay {
    tail:      Option<Tail>,
    /// Kept so that dropping the relay unblocks the thread reading the socket.
    socket:    Option<OwnedFd>,
+   /// The thread that writes to the socket.
+   writing:   Option<JoinHandle<Vec<u8>>>,
 }
 
 impl Drop for Relay {
@@ -225,6 +236,7 @@ impl Relay {
             .collect(),
          finished,
          socket: None,
+         writing: None,
       }
    }
 
@@ -240,15 +252,87 @@ impl Relay {
       buffered: Vec<u8>,
       finished: bool,
    ) -> Result<Self, Error> {
+      // The threads of a socket that does not block can be stopped, which
+      // [`Relay::freeze`] needs.
+      ioctl_fionbio(&socket, true).map_err(|errno| Error::Forward(errno.into()))?;
+
       let source = File::from(socket.try_clone().map_err(Error::Forward)?);
       let sink = SendHalf(socket.try_clone().map_err(Error::Forward)?);
 
       let outbound = reader(source, Arc::clone(waker));
-      let (inbound, _) = writer(sink, Arc::clone(waker));
+      let (inbound, writing) = writer(sink, Arc::clone(waker));
 
       let mut relay = Self::new(stream, Some(outbound), Some(inbound), buffered, finished);
       relay.socket = Some(socket);
+      relay.writing = Some(writing);
       Ok(relay)
+   }
+
+   /// Ends a relay between a stream and a socket, after [`halt`], and
+   /// returns the socket with what [`Relay::thaw`] needs to go on with it
+   /// in another process. `None` means the relay cannot go on.
+   ///
+   /// [`halt`]: crate::pipe::halt
+   #[must_use]
+   pub fn freeze(mut self) -> Option<(OwnedFd, Vec<u8>)> {
+      let socket = self.socket.take()?;
+      let mut tail = self.tail.take()?;
+      let closed = self.inbound.take().is_none();
+
+      let mut owed = self
+         .writing
+         .take()
+         .and_then(|writing| writing.join().ok())
+         .unwrap_or_default();
+
+      for chunk in self.unwritten.drain(..) {
+         owed.extend_from_slice(&chunk);
+      }
+
+      for chunk in self.outbound.take().into_iter().flatten() {
+         tail.record(chunk);
+      }
+
+      let mut state = Vec::new();
+      state.extend_from_slice(&self.taken.to_be_bytes());
+      state.push(u8::from(closed));
+      state.extend_from_slice(&tail.start.to_be_bytes());
+      put_string(&mut state, &owed);
+
+      for chunk in tail.chunks {
+         state.extend_from_slice(&chunk);
+      }
+
+      Some((socket, state))
+   }
+
+   /// A relay for `socket` in the `state` that [`Relay::freeze`] left it
+   /// in, which [`Relay::resume`] then gives a stream. `None` means the
+   /// state is damaged or the process is out of file descriptors.
+   #[must_use]
+   pub fn thaw(socket: OwnedFd, state: &[u8], waker: &Arc<Waker>) -> Option<Self> {
+      let (taken, flagged) = state.split_first_chunk()?;
+      let (&closed, counted) = flagged.split_first()?;
+      let (start, rest) = counted.split_first_chunk()?;
+
+      let owed = Reader::new(rest).string().ok()?.to_vec();
+      let sent = Bytes::copy_from_slice(rest.get(4 + owed.len()..)?);
+
+      let mut tail = Tail::exact();
+      tail.shift(u64::from_be_bytes(*start));
+      tail.record(sent);
+
+      let stream = StreamId::new(Side::Client, Dir::Bi, 0);
+      let mut relay = Self::socket(stream, socket, waker, owed, false).ok()?;
+
+      relay.taken = u64::from_be_bytes(*taken);
+      relay.tail = Some(tail);
+
+      if closed != 0 {
+         relay.inbound = None;
+      }
+
+      Some(relay)
    }
 
    /// Queues `frame` to go out before any local input. Call it once, before

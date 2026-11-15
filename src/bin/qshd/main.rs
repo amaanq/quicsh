@@ -63,6 +63,7 @@ fn main() -> Result<()> {
          })
       },
       Some(Stage::Network) => network::run(options.congestion),
+      Some(Stage::Keep) => monitor::keep(),
       Some(Stage::Hold {
          user,
          term,

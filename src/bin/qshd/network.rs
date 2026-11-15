@@ -16,6 +16,7 @@ use std::{
       AsFd as _,
       OwnedFd,
    },
+   process,
    sync::{
       Arc,
       mpsc::{
@@ -30,6 +31,10 @@ use std::{
 };
 
 use bytes::Bytes;
+use knell::signals::{
+   SignalPipe,
+   shutdown_requested,
+};
 use misstep::{
    OptionExt as _,
    Result,
@@ -56,7 +61,9 @@ use quicsh::{
       Acceptor,
       Forwards,
       Parked,
+      hand_over,
       handed,
+      take_over,
    },
    key::PublicKey,
    pipe::Waker,
@@ -956,6 +963,36 @@ impl Server {
       Ok(peer.grant.is_none().then_some(peer.deadline))
    }
 
+   /// Hands every forwarded connection to a process that keeps it for the
+   /// next server, and exits. The sessions are not dropped, since that
+   /// would end them in their holders.
+   fn stop(&mut self) -> ! {
+      let mut forwards = mem::take(&mut self.parked)
+         .into_iter()
+         .map(|entry| entry.1)
+         .collect::<Vec<Parked>>();
+
+      forwards.extend(
+         self
+            .peers
+            .values_mut()
+            .flat_map(|peer| peer.forwards.park()),
+      );
+
+      if !forwards.is_empty() {
+         let sent = self
+            .helper
+            .keeper()
+            .and_then(|link| Ok(hand_over(&link, forwards)?));
+
+         if let Err(error) = sent {
+            eprintln!("forwarded connections end with this server: {error}");
+         }
+      }
+
+      process::exit(0)
+   }
+
    /// Closes a connection and forgets its state.
    fn drop_peer(&mut self, now: Instant, handle: ConnectionHandle, connection: &mut Connection) {
       connection.close(now, PROTOCOL_ERROR, Bytes::from_static(b"protocol error"));
@@ -984,6 +1021,10 @@ impl App for Server {
    }
 
    fn idle(&mut self, now: Instant) -> Result<Option<Instant>> {
+      if shutdown_requested() {
+         self.stop();
+      }
+
       self.parked.retain(|entry| now < entry.0);
 
       Ok(self.parked.iter().map(|entry| entry.0).min())
@@ -1069,5 +1110,19 @@ pub fn run(congestion: Congestion) -> Result<()> {
       parked: Vec::new(),
    };
 
-   Transport::adopt(socket, listen, crypto, congestion, opener, &secret)?.run(&mut server)
+   if let Some(link) = server.helper.kept()? {
+      let limit = Instant::now() + DETACH_LIMIT;
+      let forwards = take_over(&link, &server.waker)?;
+
+      server
+         .parked
+         .extend(forwards.into_iter().map(|forward| (limit, forward)));
+   }
+
+   let signals = SignalPipe::install()?;
+   let ended =
+      Transport::adopt(socket, listen, crypto, congestion, opener, &secret)?.run(&mut server);
+
+   drop(signals);
+   ended
 }

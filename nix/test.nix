@@ -3,6 +3,7 @@
   openssh,
   rsync,
   self,
+  socat,
 }:
 testers.runNixOSTest {
   name = "qshd";
@@ -16,6 +17,8 @@ testers.runNixOSTest {
     };
 
     users.users.alice.isNormalUser = true;
+
+    environment.systemPackages = [ socat ];
   };
 
   containers.client =
@@ -25,6 +28,7 @@ testers.runNixOSTest {
         self.packages.${pkgs.stdenv.hostPlatform.system}.quicsh
         openssh
         rsync
+        socat
       ];
     };
 
@@ -70,5 +74,21 @@ testers.runNixOSTest {
         server.succeed("pgrep -u alice sleep")
         server.wait_until_succeeds("grep survived /home/alice/after", timeout=60)
         client.wait_until_succeeds("grep -a 'COMMAND_EXIT_CODE=.0' /tmp/out", timeout=60)
+
+    with subtest("a forwarded connection survives a restart of the service"):
+        server.succeed(
+            "(runuser -u alice -- socat -t 60 UNIX-LISTEN:/home/alice/echo.sock EXEC:cat"
+            " >/dev/null 2>&1 &)"
+        )
+        client.succeed("(qsh -N -L /tmp/echo.sock:/home/alice/echo.sock alice@server >/dev/null 2>&1 &)")
+        client.wait_until_succeeds("test -S /tmp/echo.sock", timeout=30)
+        client.succeed(
+            "((echo before; sleep 15; echo after) | socat -t 60 - UNIX-CONNECT:/tmp/echo.sock"
+            " > /tmp/echoed 2>&1 &)"
+        )
+        client.wait_until_succeeds("grep before /tmp/echoed", timeout=30)
+        server.succeed("systemctl restart qshd.service")
+        server.wait_for_unit("qshd.service")
+        client.wait_until_succeeds("grep after /tmp/echoed", timeout=60)
   '';
 }

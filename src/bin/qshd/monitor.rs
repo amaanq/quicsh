@@ -18,7 +18,11 @@ use std::{
       SocketAddr,
    },
    os::{
-      fd::OwnedFd,
+      fd::{
+         AsFd as _,
+         BorrowedFd,
+         OwnedFd,
+      },
       unix::{
          fs::{
             DirBuilderExt as _,
@@ -60,6 +64,7 @@ use quicsh::{
    },
    certificate::Certificate,
    control::{
+      DETACH_LIMIT,
       Open,
       Program,
       Token,
@@ -70,7 +75,11 @@ use quicsh::{
       private_from_openssh,
    },
    known_hosts::glob,
-   pipe::reopen,
+   pipe::{
+      receive_message,
+      reopen,
+      send_message,
+   },
    tls::{
       self,
       HOST_SCHEMES,
@@ -85,18 +94,30 @@ use ring::rand::{
    SystemRandom,
 };
 use rustix::{
+   event::{
+      PollFd,
+      PollFlags,
+      poll,
+   },
    net::{
       AddressFamily,
       SocketAddrUnix,
       SocketFlags,
       SocketType,
+      accept,
       bind,
       connect,
       listen,
       socket_with,
       socketpair,
    },
-   process::geteuid,
+   process::{
+      Pid,
+      Signal,
+      geteuid,
+      kill_process,
+   },
+   time::Timespec,
 };
 use rustls::sign::SigningKey;
 
@@ -106,6 +127,7 @@ use crate::{
       Ended,
       Reply,
       Request,
+      finish,
       serve,
    },
 };
@@ -124,6 +146,15 @@ const MAX_KEPT: usize = 64;
 /// File in the holders directory with the keys a restarted server shares
 /// with the old one. It sits on a runtime directory, so a reboot replaces it.
 const RESTART_SECRET: &str = "restart-secret";
+/// Socket in the holders directory of the process that keeps forwarded
+/// connections for the next server.
+const KEPT: &str = "forwards";
+/// Most messages a keeper takes.
+const KEPT_MESSAGES: usize = 1 << 16;
+/// Most bytes a keeper takes.
+const KEPT_BYTES: usize = 256 << 20;
+/// Most bytes in one message to a keeper.
+const KEPT_MESSAGE: usize = 1 << 16;
 /// Bytes in the restart secret.
 const RESTART_SECRET_LEN: usize = 64;
 
@@ -603,6 +634,58 @@ impl Monitor {
       Ok(secret)
    }
 
+   /// Starts a process that keeps what the network process hands it until
+   /// the next server asks for it, and answers with the link to it.
+   fn keeper(&self) -> Result<(Reply, Vec<OwnedFd>)> {
+      let path = self.holders.join(KEPT);
+      let _ = fs::remove_file(&path);
+
+      let listener = socket_with(
+         AddressFamily::UNIX,
+         SocketType::SEQPACKET,
+         SocketFlags::CLOEXEC,
+         None,
+      )?;
+
+      bind(&listener, &SocketAddrUnix::new(&path)?)
+         .with_context(|| format!("binding {}", path.display()))?;
+      listen(&listener, 1)?;
+
+      let (link, remote) = socketpair(
+         AddressFamily::UNIX,
+         SocketType::SEQPACKET,
+         SocketFlags::CLOEXEC,
+         None,
+      )?;
+
+      let mut child = Command::new(env::current_exe()?)
+         .arg("keep")
+         .stdin(remote)
+         .stdout(listener)
+         .env_clear()
+         .process_group(0)
+         .spawn()
+         .context("starting the keeper of forwards")?;
+
+      // The keeper outlives this process on purpose.
+      thread::spawn(move || child.wait());
+
+      Ok((Reply::Done, vec![link]))
+   }
+
+   /// Connects to the process an earlier server left its forwarded
+   /// connections with.
+   fn kept(&self) -> (Reply, Vec<OwnedFd>) {
+      let path = self.holders.join(KEPT);
+      let link = Self::holder(&path);
+      let _ = fs::remove_file(&path);
+
+      link.map_or_else(
+         |_| (Reply::Denied, Vec::new()),
+         |keeper| (Reply::Done, vec![keeper]),
+      )
+   }
+
    /// Connects a login to a running session of its account.
    fn attach(&self, id: u64, token: Token) -> Result<(Reply, Vec<OwnedFd>)> {
       let grant = self.grants.get(&id).context("unknown grant")?;
@@ -648,6 +731,8 @@ impl Monitor {
             Ok((reply, vec![listener]))
          },
          Request::Sign(message) => plain(self.sign(&message)?),
+         Request::Keep => self.keeper(),
+         Request::Kept => Ok(self.kept()),
          Request::Socket { local, remote } => {
             ensure!(
                local.port() == self.listen.port(),
@@ -764,6 +849,51 @@ fn sweep(directory: &Path) {
    }
 }
 
+/// Takes what a network process that stops hands over on standard input,
+/// and gives it to the first process that connects to the socket on
+/// standard output. Nobody else can connect, since only the server's user
+/// can enter the socket's directory.
+pub fn keep() -> Result<()> {
+   let link = io::stdin().as_fd().try_clone_to_owned()?;
+   let listener = io::stdout().as_fd().try_clone_to_owned()?;
+
+   let mut kept = Vec::new();
+   let mut size = 0;
+
+   while let Some(message) = receive_message(&link, KEPT_MESSAGE)? {
+      size += message.0.len();
+      ensure!(
+         kept.len() < KEPT_MESSAGES && size <= KEPT_BYTES,
+         "more forwarded connections than one process keeps"
+      );
+
+      kept.push(message);
+   }
+
+   let wait = Timespec {
+      tv_sec:  i64::try_from(DETACH_LIMIT.as_secs()).unwrap_or(i64::MAX),
+      tv_nsec: 0,
+   };
+
+   if kept.is_empty() || poll(&mut [PollFd::new(&listener, PollFlags::IN)], Some(&wait))? == 0 {
+      return Ok(());
+   }
+
+   let taker = accept(&listener)?;
+
+   for message in &kept {
+      let borrowed = message
+         .1
+         .iter()
+         .map(OwnedFd::as_fd)
+         .collect::<Vec<BorrowedFd>>();
+
+      send_message(&taker, &message.0, &borrowed)?;
+   }
+
+   Ok(())
+}
+
 /// Starts the network process and serves it until it exits.
 pub fn run(settings: Settings) -> Result<()> {
    let key_text = fs::read_to_string(&settings.host_key)
@@ -844,7 +974,14 @@ pub fn run(settings: Settings) -> Result<()> {
    println!("listening on udp {}", settings.listen);
    let ended = serve(&channel, &signal, |request| monitor.handle(request));
 
+   // The network process hands its forwarded connections to a keeper
+   // before it exits.
    if matches!(ended, Ok(Ended::Signal)) {
+      if let Some(process) = i32::try_from(child.id()).ok().and_then(Pid::from_raw) {
+         let _ = kill_process(process, Signal::TERM);
+      }
+
+      let _ = finish(&channel, |request| monitor.handle(request));
       child.kill()?;
       child.wait()?;
       return Ok(());

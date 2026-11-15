@@ -28,7 +28,10 @@ use std::{
       UdpSocket,
    },
    os::{
-      fd::OwnedFd,
+      fd::{
+         AsFd as _,
+         OwnedFd,
+      },
       unix::{
          fs::{
             FileTypeExt as _,
@@ -106,7 +109,9 @@ use crate::{
    error::Error,
    pipe::{
       Waker,
+      halt,
       receive_message,
+      send_message,
    },
    relay::{
       Relay,
@@ -653,6 +658,102 @@ impl Parked {
    pub fn token(&self) -> Option<Token> {
       self.0.kept.map(|kept| kept.token)
    }
+
+   /// Ends the forward in this process and returns its socket with what
+   /// [`Parked::thaw`] needs.
+   fn freeze(self) -> Option<(OwnedFd, Vec<u8>)> {
+      let kept = self.0.kept?;
+      let (socket, relay) = self.0.relay.freeze()?;
+
+      let mut state = kept.label.to_be_bytes().to_vec();
+      state.extend_from_slice(&kept.token);
+      state.extend_from_slice(&relay);
+
+      Some((socket, state))
+   }
+
+   /// The forward that [`Parked::freeze`] ended in another process.
+   fn thaw(socket: OwnedFd, state: &[u8], waker: &Arc<Waker>) -> Option<Self> {
+      let (label, named) = state.split_first_chunk()?;
+      let (token, relay) = named.split_first_chunk()?;
+
+      let mut forward = Joined::live(Relay::thaw(socket, relay, waker)?, None);
+
+      forward.link = Link::Adrift;
+      forward.kept = Some(Handle {
+         label: u32::from_be_bytes(*label),
+         token: *token,
+      });
+
+      Some(Self(forward))
+   }
+}
+
+/// The first message of forwards on their way between two server processes.
+/// A process that expects another one takes none of them.
+const HANDOVER: &[u8] = b"quicsh forwards 1";
+/// Most bytes of a forward's state in one message.
+const PIECE: usize = 32 << 10;
+
+/// Ends `forwards` in this process, which is about to exit, and sends them
+/// over `link` for [`take_over`]. Each one is a message with its socket and
+/// the length of its state, then the state in pieces.
+///
+/// # Errors
+///
+/// Fails when `link` does.
+pub fn hand_over(link: &OwnedFd, forwards: Vec<Parked>) -> io::Result<()> {
+   halt();
+   send_message(link, HANDOVER, &[])?;
+
+   for (socket, state) in forwards.into_iter().filter_map(Parked::freeze) {
+      let length = u32::try_from(state.len()).map_err(io::Error::other)?;
+      send_message(link, &length.to_be_bytes(), &[socket.as_fd()])?;
+
+      for piece in state.chunks(PIECE) {
+         send_message(link, piece, &[])?;
+      }
+   }
+
+   Ok(())
+}
+
+/// The forwards that a server process sent with [`hand_over`] before it
+/// exited, as many as arrive whole.
+///
+/// # Errors
+///
+/// Fails when `link` does.
+pub fn take_over(link: &OwnedFd, waker: &Arc<Waker>) -> io::Result<Vec<Parked>> {
+   let mut forwards = Vec::new();
+
+   if receive_message(link, PIECE)?.is_none_or(|first| first.0 != HANDOVER) {
+      return Ok(forwards);
+   }
+
+   while let Some((head, sockets)) = receive_message(link, PIECE)? {
+      let length = head
+         .first_chunk()
+         .and_then(|length| usize::try_from(u32::from_be_bytes(*length)).ok());
+
+      let (Some(socket), Some(wanted)) = (sockets.into_iter().next(), length) else {
+         break;
+      };
+
+      let mut state = Vec::new();
+
+      while state.len() < wanted {
+         let Some((piece, _)) = receive_message(link, PIECE)? else {
+            return Ok(forwards);
+         };
+
+         state.extend_from_slice(&piece);
+      }
+
+      forwards.extend(Parked::thaw(socket, &state, waker));
+   }
+
+   Ok(forwards)
 }
 
 /// Every forwarded connection on one QUIC connection.

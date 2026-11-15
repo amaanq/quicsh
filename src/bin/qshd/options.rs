@@ -58,6 +58,9 @@ pub enum Stage {
    /// The unprivileged network process.
    #[pound(hidden)]
    Network,
+   /// The process that keeps forwarded connections for the next server.
+   #[pound(hidden)]
+   Keep,
    /// The process that owns one session.
    #[pound(hidden)]
    Hold {

@@ -26,6 +26,11 @@ use std::{
    },
    sync::{
       Arc,
+      LazyLock,
+      atomic::{
+         AtomicBool,
+         Ordering,
+      },
       mpsc::{
          Receiver,
          SyncSender,
@@ -108,9 +113,30 @@ impl AsFd for Waker {
    }
 }
 
-/// Sleeps until `descriptor` is ready for `interest`.
+/// Whether [`halt`] ran.
+static HALTED: AtomicBool = AtomicBool::new(false);
+/// Ends the sleep of a thread that waits for a descriptor once [`halt`] ran.
+static HALT: LazyLock<Option<Waker>> = LazyLock::new(|| Waker::new().ok());
+
+/// Stops the threads that read and write descriptors in non-blocking mode,
+/// for a process that hands the descriptors to another one.
+///
+/// A reader stops before its next read. A writer stops once its sink takes
+/// no more, and a [`SendHalf`] dropped from here on stays open.
+pub fn halt() {
+   HALTED.store(true, Ordering::SeqCst);
+
+   if let Some(ref waker) = *HALT {
+      waker.wake();
+   }
+}
+
+/// Sleeps until `descriptor` is ready for `interest` or [`halt`] ran.
 fn ready(descriptor: &impl AsFd, interest: PollFlags) {
-   let _ = poll(&mut [PollFd::new(descriptor, interest)], None);
+   let mut watched = vec![PollFd::new(descriptor, interest)];
+   watched.extend(HALT.iter().map(|waker| PollFd::new(waker, PollFlags::IN)));
+
+   let _ = poll(&mut watched, None);
 }
 
 /// The sending side of a socket. Dropping it tells the peer that no more data
@@ -135,7 +161,9 @@ impl AsFd for SendHalf {
 
 impl Drop for SendHalf {
    fn drop(&mut self) {
-      let _ = shutdown(&self.0, Shutdown::Write);
+      if !HALTED.load(Ordering::SeqCst) {
+         let _ = shutdown(&self.0, Shutdown::Write);
+      }
    }
 }
 
@@ -197,6 +225,10 @@ fn spawn_reader(
             if poll(&mut fds, None).is_ok() && !fds[1].revents().is_empty() {
                break;
             }
+         }
+
+         if HALTED.load(Ordering::SeqCst) {
+            break;
          }
 
          let count = match source.read(&mut buffer) {
@@ -304,16 +336,19 @@ pub fn receive_message(
 }
 
 /// Writes every chunk sent to it and closes `sink` once the sender is dropped.
-/// The handle finishes after the last write.
+/// The handle finishes after the last write, with the bytes a sink that
+/// took no more after [`halt`] is still owed.
 #[must_use]
-pub fn writer<Sink>(mut sink: Sink, waker: Arc<Waker>) -> (SyncSender<Bytes>, JoinHandle<()>)
+pub fn writer<Sink>(mut sink: Sink, waker: Arc<Waker>) -> (SyncSender<Bytes>, JoinHandle<Vec<u8>>)
 where
    Sink: Write + AsFd + Send + 'static,
 {
    let (sender, chunks) = sync_channel::<Bytes>(QUEUE);
 
    let handle = thread::spawn(move || {
-      'chunks: for chunk in chunks {
+      let mut owed = Vec::new();
+
+      'chunks: while let Ok(chunk) = chunks.recv() {
          let mut rest = &*chunk;
 
          while !rest.is_empty() {
@@ -321,6 +356,12 @@ where
                Ok(count @ 1..) => rest = &rest[count..],
                Err(error) if error.kind() == io::ErrorKind::Interrupted => {},
                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                  if HALTED.load(Ordering::SeqCst) {
+                     owed.extend_from_slice(rest);
+                     owed.extend(chunks.try_iter().flatten());
+                     break 'chunks;
+                  }
+
                   ready(&sink, PollFlags::OUT);
                },
                Ok(0) | Err(_) => break 'chunks,
@@ -332,6 +373,7 @@ where
 
       drop(sink);
       waker.wake();
+      owed
    });
 
    (sender, handle)
