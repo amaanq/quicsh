@@ -169,7 +169,12 @@ impl Controller for Adaptive {
       let most = held.iter().max().copied().unwrap_or(0);
 
       if least.saturating_mul(SPREAD) < most || self.stuck >= STUCK {
-         self.active = Arc::new(BbrConfig::default()).build(now, self.mtu);
+         let mut config = BbrConfig::default();
+         // The path carried the largest of those windows before a loss
+         // that had nothing to do with it.
+         config.initial_window(most.max(self.active.initial_window()));
+
+         self.active = Arc::new(config).build(now, self.mtu);
          self.switched = true;
       }
    }
