@@ -69,6 +69,8 @@ pub struct Login {
    /// Whether a forward that the server refuses ends the program, from
    /// `ExitOnForwardFailure`.
    pub exacting:     bool,
+   /// Whether nothing may be asked on the terminal, from `BatchMode`.
+   pub batch:        bool,
    /// Which of the host's addresses to try, from `AddressFamily`.
    pub family:       Family,
    /// The name to look the host key up under, in place of the host's.
@@ -711,6 +713,7 @@ impl Options {
          agent: socket(host.agent.as_deref()),
          strict,
          exacting: agreed(host.exacting.as_deref()),
+         batch: agreed(host.batch.as_deref()),
          alias: host.alias,
       })
    }

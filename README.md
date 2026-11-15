@@ -292,9 +292,7 @@ nu bench.nu host --identity ~/.ssh/id_bench
   `ControlMaster`, `ControlPath`, `ControlPersist`, `ConnectTimeout`,
   `EscapeChar`, `AddressFamily`, `SendEnv`, `SetEnv`, `CertificateFile`,
   `UserKnownHostsFile`, `GlobalKnownHostsFile`, `BatchMode`,
-  `ExitOnForwardFailure` and `QshPort` are read. `BatchMode` only stops the
-  question about an unknown host key, and a key that wants a passphrase or
-  a PIN still asks.
+  `ExitOnForwardFailure` and `QshPort` are read.
   `ControlPath` takes `%h`, `%n`, `%p`, `%r`, `%u`, `%i` and `%C`, and `%C`
   is not the hash `ssh` computes. `StrictHostKeyChecking no` behaves like
   `accept-new`, so a changed host key is always refused. `Match` checks

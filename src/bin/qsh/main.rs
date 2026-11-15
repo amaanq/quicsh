@@ -424,7 +424,15 @@ fn authenticate(
    }
 
    for file in files {
-      let (key, signature) = sign_with_file(&file, &message(secret, &login.user))?;
+      let signed = sign_with_file(&file, &message(secret, &login.user), login.batch);
+
+      // A key that would have to ask is passed over when nothing may be
+      // asked.
+      let (key, signature) = match signed {
+         Ok(pair) => pair,
+         Err(_) if login.batch => continue,
+         Err(error) => return Err(error),
+      };
 
       let request = Request {
          user: login.user.clone(),
@@ -443,8 +451,9 @@ fn authenticate(
 }
 
 /// Signs a login with `ssh-keygen`, which reads the key file and asks for its
-/// passphrase, PIN or touch on the terminal.
-fn sign_with_file(file: &Path, message: &[u8]) -> Result<(PublicKey, Vec<u8>)> {
+/// passphrase, PIN or touch on the terminal. With `batch` it asks a program
+/// that never answers, and so fails where it would have asked.
+fn sign_with_file(file: &Path, message: &[u8], batch: bool) -> Result<(PublicKey, Vec<u8>)> {
    let mut random = [0; 8];
    SystemRandom::new()
       .fill(&mut random)
@@ -465,13 +474,23 @@ fn sign_with_file(file: &Path, message: &[u8]) -> Result<(PublicKey, Vec<u8>)> {
    let signed = fs::write(&input, message)
       .map_err(Report::from)
       .and_then(|()| {
-         let status = Command::new("ssh-keygen")
+         let mut command = Command::new("ssh-keygen");
+         command
             .args(["-Y", "sign", "-q", "-n", NAMESPACE, "-f"])
             .arg(file)
-            .arg(&input)
-            .stdin(File::open("/dev/tty").map_or_else(|_| Stdio::null(), Stdio::from))
-            .status()
-            .context("starting ssh-keygen")?;
+            .arg(&input);
+
+         if batch {
+            command
+               .env("SSH_ASKPASS_REQUIRE", "force")
+               .env("SSH_ASKPASS", "false")
+               .stdin(Stdio::null())
+               .stderr(Stdio::null());
+         } else {
+            command.stdin(File::open("/dev/tty").map_or_else(|_| Stdio::null(), Stdio::from));
+         }
+
+         let status = command.status().context("starting ssh-keygen")?;
 
          if !status.success() {
             bail!("ssh-keygen could not sign with {}", file.display());
