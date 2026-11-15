@@ -32,6 +32,9 @@ fn main() {
    cc::Build::new()
       .file("src/shim.c")
       .include(variable("includedir"))
+      // The nix compiler wrapper defines _FORTIFY_SOURCE, and glibc warns
+      // about that without optimization, which a debug build has none of.
+      .opt_level(2)
       .warnings_into_errors(true)
       .compile("quicsh-vt-shim");
 
