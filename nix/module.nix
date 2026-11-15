@@ -98,10 +98,11 @@ in
 
     congestion = lib.mkOption {
       type = lib.types.enum [
+        "auto"
         "bbr"
         "cubic"
       ];
-      default = "cubic";
+      default = "auto";
       description = "Congestion controller for what the server sends.";
     };
 

@@ -2,6 +2,7 @@ pub mod agent;
 pub mod auth;
 pub mod certificate;
 pub mod config;
+mod congestion;
 pub mod control;
 pub mod error;
 pub mod forward;

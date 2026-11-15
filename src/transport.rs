@@ -109,6 +109,7 @@ use rustix::{
 };
 
 use crate::{
+   congestion::AdaptiveConfig,
    error::Error,
    pipe::Waker,
 };
@@ -158,8 +159,10 @@ const NETWORK_CHANGES: u32 = 0x10 | 0x40 | 0x100 | 0x400;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Congestion {
-   Bbr,
+   /// Cubic, and BBR once the path loses packets with an empty queue.
    #[default]
+   Auto,
+   Bbr,
    Cubic,
 }
 
@@ -168,6 +171,7 @@ impl FromStr for Congestion {
 
    fn from_str(name: &str) -> Result<Self, Error> {
       match name {
+         "auto" => Ok(Self::Auto),
          "bbr" => Ok(Self::Bbr),
          "cubic" => Ok(Self::Cubic),
          other => Err(Error::Congestion(other.to_owned())),
@@ -178,6 +182,7 @@ impl FromStr for Congestion {
 impl Display for Congestion {
    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
       formatter.write_str(match *self {
+         Self::Auto => "auto",
          Self::Bbr => "bbr",
          Self::Cubic => "cubic",
       })
@@ -202,6 +207,7 @@ impl Congestion {
          .mtu_discovery_config(Some(discovery));
 
       match self {
+         Self::Auto => transport.congestion_controller_factory(Arc::new(AdaptiveConfig)),
          Self::Bbr => transport.congestion_controller_factory(Arc::new(BbrConfig::default())),
          Self::Cubic => transport.congestion_controller_factory(Arc::new(CubicConfig::default())),
       };

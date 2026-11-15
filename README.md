@@ -33,6 +33,10 @@ afford to lose :)
   runs `qshd` and only ever sees encrypted packets
 - IPv4 and IPv6 on one socket
 - Roaming. A session carries on when the client changes networks
+- Congestion control that fits the path. A connection starts on Cubic,
+  which keeps a shell quick beside a transfer, and moves to BBR once the
+  path drops packets that no full queue explains. `--congestion cubic` or
+  `--congestion bbr` on either side pins one
 - Reattaching. A session survives a lost connection, and `qsh` picks it up
   again. A terminal continues where it was, and after a long outage the
   server sends its screen and up to 10,000 rows of history in place of
@@ -239,7 +243,9 @@ with `netem` adding delay and loss, so treat them as rough.
 - At 50 ms of round trip time, running `true` on the server takes 132 ms
   from start to finish. OpenSSH takes 693 ms.
 - At 50 ms and 1% packet loss, a bulk upload with `--congestion bbr` runs at
-  1.3 Gbit/s. OpenSSH manages 0.2.
+  1.3 Gbit/s. OpenSSH manages 0.2. The default gets from Cubic to BBR within
+  the first seconds there, and over ten seconds at a 1500 byte MTU it moves
+  0.8 to 1.0 Gbit/s where BBR from the start moves 1.1.
 - On a clean path with a 1500 byte MTU, an upload moves about 4.4 Gbit/s per
   core, counting both ends. OpenSSH moves about 3.6.
 

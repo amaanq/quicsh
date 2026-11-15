@@ -308,9 +308,10 @@ pub struct Options {
    /// or auto, which does it while the echo takes over 30 ms.
    #[pound(long, value_name = "WHEN", default = "auto")]
    pub predict:    Mode,
-   /// Congestion controller for what this side sends, cubic or bbr. Bbr
-   /// holds its rate on a lossy path and delays a shell beside a transfer.
-   #[pound(long, value_name = "NAME", default = "cubic")]
+   /// Congestion controller for what this side sends: cubic, bbr or auto.
+   /// Bbr holds its rate on a lossy path and delays a shell beside a
+   /// transfer. Auto is cubic until the path proves lossy, then bbr.
+   #[pound(long, value_name = "NAME", default = "auto")]
    pub congestion: Congestion,
 
    /// The server, with an optional account name. The OpenSSH client
