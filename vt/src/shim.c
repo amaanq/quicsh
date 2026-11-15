@@ -152,6 +152,50 @@ bool qvt_format(GhosttyTerminal terminal, bool history, uint8_t** out, size_t* l
   return result == GHOSTTY_SUCCESS;
 }
 
+// Writes the escape sequences that draw the cells `first` to `last` of a
+// row of the screen in their styles, and then set the style the terminal
+// writes in, into a buffer for qvt_release.
+bool qvt_cells(GhosttyTerminal terminal, uint16_t row, uint16_t first, uint16_t last, uint8_t** out,
+               size_t* length) {
+  GhosttySelection selection = GHOSTTY_INIT_SIZED(GhosttySelection);
+  GhosttyFormatterTerminalOptions options = GHOSTTY_INIT_SIZED(GhosttyFormatterTerminalOptions);
+  GhosttyFormatter formatter;
+  GhosttyPoint start = {
+      .tag = GHOSTTY_POINT_TAG_ACTIVE,
+      .value = {.coordinate = {.x = first, .y = row}},
+  };
+  GhosttyPoint end = {
+      .tag = GHOSTTY_POINT_TAG_ACTIVE,
+      .value = {.coordinate = {.x = last, .y = row}},
+  };
+
+  *out = NULL;
+  *length = 0;
+
+  selection.start = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+  selection.end = GHOSTTY_INIT_SIZED(GhosttyGridRef);
+
+  if (ghostty_terminal_grid_ref(terminal, start, &selection.start) != GHOSTTY_SUCCESS ||
+      ghostty_terminal_grid_ref(terminal, end, &selection.end) != GHOSTTY_SUCCESS) {
+    return false;
+  }
+
+  options.emit = GHOSTTY_FORMATTER_FORMAT_VT;
+  options.selection = &selection;
+  options.extra.size = sizeof(options.extra);
+  options.extra.screen.size = sizeof(options.extra.screen);
+  options.extra.screen.style = true;
+
+  if (ghostty_formatter_terminal_new(NULL, &formatter, terminal, options) != GHOSTTY_SUCCESS) {
+    return false;
+  }
+
+  GhosttyResult result = ghostty_formatter_format_alloc(formatter, NULL, out, length);
+
+  ghostty_formatter_free(formatter);
+  return result == GHOSTTY_SUCCESS;
+}
+
 // Writes the unfinished escape sequence the terminal is in the middle of,
 // which is empty between sequences, into a buffer for qvt_release.
 bool qvt_continuation(GhosttyTerminal terminal, uint8_t** out, size_t* length) {

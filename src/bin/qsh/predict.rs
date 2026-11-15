@@ -145,8 +145,8 @@ struct Outcome {
 struct Shown {
    /// The first column drawn over.
    low:    usize,
-   /// What the cells from there held.
-   held:   Vec<u8>,
+   /// How many cells from there may be drawn over.
+   width:  usize,
    /// Where the cursor was left.
    column: usize,
 }
@@ -324,9 +324,10 @@ impl Predictor {
       u16::try_from(column).map_or(0, |place| self.terminal.cell(place, self.anchor.1))
    }
 
-   /// Draws what the pending keys do, unless the server has not echoed in
-   /// this run, the echo is fast, the terminal is in the middle of an
-   /// escape sequence or a cell holds what this side cannot put back.
+   /// Draws what the pending keys do, in the style the session writes in,
+   /// unless the server has not echoed in this run, the echo is fast, the
+   /// terminal is in the middle of an escape sequence or a cell holds what
+   /// this side cannot put back.
    fn draw(&mut self) {
       let wanted = match self.mode {
          Mode::Always => true,
@@ -348,61 +349,69 @@ impl Predictor {
       };
 
       let anchor = usize::from(self.anchor.0);
-      let low = outcome
-         .cells
-         .keys()
-         .next()
-         .map_or(anchor, |&first| first.min(anchor));
-      let high = outcome
-         .cells
-         .keys()
-         .next_back()
-         .map_or(anchor, |&last| (last + 1).max(anchor));
+      let mut place = anchor;
+      let mut text = Vec::new();
 
-      let mut held = Vec::new();
-      let mut text = shift(anchor, low);
+      for (&column, &cell) in &outcome.cells {
+         if !matches!(self.cell(column), 0 | 0x20..=0x7E) {
+            return;
+         }
 
-      for column in low..high {
-         let under = match self.cell(column) {
-            0 => b' ',
-            character @ 0x20..=0x7E => u8::try_from(character).unwrap_or(b' '),
-            _ => return,
-         };
-
-         held.push(under);
-         text.push(match outcome.cells.get(&column) {
-            Some(&Some(character)) => character,
-            Some(&None) => b' ',
-            None => under,
-         });
+         text.extend(shift(place, column));
+         text.push(cell.unwrap_or(b' '));
+         place = column + 1;
       }
 
-      text.extend(shift(high, outcome.column));
+      text.extend(shift(place, outcome.column));
       put(&self.screen, &text);
+
+      let low = outcome.cells.keys().next().copied().unwrap_or(anchor);
 
       self.shown = Some(Shown {
          low,
-         held,
+         width: outcome
+            .cells
+            .keys()
+            .next_back()
+            .map_or(0, |&last| last + 1 - low),
          column: outcome.column,
       });
    }
 
-   /// Gives the cells that were drawn over their own back, in the style
-   /// the session writes in now, and puts the cursor where the session's
-   /// output expects it.
+   /// Gives the cells that were drawn over their own back, in their own
+   /// styles, and puts the cursor where the session's output expects it.
    fn hide(&mut self) {
       let Some(shown) = self.shown.take() else {
          return;
       };
 
-      let high = shown.low + shown.held.len();
+      let anchor = usize::from(self.anchor.0);
+      let high = shown.low + shown.width;
+      let last = (shown.low..high)
+         .rev()
+         .find(|&column| self.cell(column) != 0);
 
-      let text = [
-         shift(shown.column, shown.low),
-         shown.held,
-         shift(high, usize::from(self.anchor.0)),
-      ]
-      .concat();
+      let held = u16::try_from(shown.low)
+         .ok()
+         .zip(u16::try_from(last.unwrap_or(shown.low)).ok())
+         .filter(|_| shown.width > 0);
+
+      // The emulator leaves out the empty cells at the end, so all of the
+      // cells are emptied first. Its text ends with the session's style.
+      let text = match held {
+         Some((first, end)) => {
+            [
+               shift(shown.column, shown.low),
+               b"\x1b[0m".to_vec(),
+               vec![b' '; shown.width],
+               shift(high, shown.low),
+               self.terminal.cells(self.anchor.1, first, end),
+               shift(last.map_or(shown.low, |column| column + 1), anchor),
+            ]
+            .concat()
+         },
+         None => shift(shown.column, anchor),
+      };
 
       put(&self.screen, &text);
    }
@@ -552,7 +561,11 @@ mod tests {
       assert_eq!(drawn(&mut screen), b"s", "after an echo");
 
       predictor.hide();
-      assert_eq!(drawn(&mut screen), b"\x1b[1D \x1b[1D", "taken back");
+      assert_eq!(
+         drawn(&mut screen),
+         b"\x1b[1D\x1b[0m \x1b[1D\x1b[0m",
+         "taken back"
+      );
 
       predictor.output(b"s");
       predictor.typed(b"\x7f");
@@ -576,5 +589,17 @@ mod tests {
       predictor.output(b"\x08 \x08");
       predictor.typed(b"\x7fb");
       assert_eq!(drawn(&mut screen), b"b", "a backspace on an empty line");
+
+      predictor.hide();
+      drawn(&mut screen);
+      predictor.output(b"b\x1b[90mcd\x1b[39m\x1b[2D");
+      predictor.typed(b"e");
+      drawn(&mut screen);
+      predictor.hide();
+      assert_eq!(
+         drawn(&mut screen),
+         b"\x1b[1D\x1b[0m \x1b[1D\x1b[0m\x1b[38;5;8mc\x1b[0m\x1b[0m\x1b[1D",
+         "a covered cell gets its style back"
+      );
    }
 }

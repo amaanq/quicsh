@@ -29,6 +29,14 @@ unsafe extern "C" {
       length: *mut usize,
    ) -> bool;
    fn qvt_continuation(terminal: *mut c_void, out: *mut *mut u8, length: *mut usize) -> bool;
+   fn qvt_cells(
+      terminal: *mut c_void,
+      row: u16,
+      first: u16,
+      last: u16,
+      out: *mut *mut u8,
+      length: *mut usize,
+   ) -> bool;
    fn qvt_release(bytes: *mut u8, length: usize);
 }
 
@@ -131,6 +139,17 @@ impl Terminal {
    pub fn history(&self) -> Vec<u8> {
       // SAFETY: as in `screen`.
       self.copied(|terminal, out, length| unsafe { qvt_format(terminal, true, out, length) })
+   }
+
+   /// The escape sequences that draw the cells `first` to `last` of a row
+   /// of the screen in their styles, and then set the style the program
+   /// writes in.
+   #[must_use]
+   pub fn cells(&self, row: u16, first: u16, last: u16) -> Vec<u8> {
+      // SAFETY: as in `screen`.
+      self.copied(|terminal, out, length| unsafe {
+         qvt_cells(terminal, row, first, last, out, length)
+      })
    }
 
    /// The start of an escape sequence or of a character that the program
