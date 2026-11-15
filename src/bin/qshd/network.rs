@@ -133,6 +133,8 @@ const MAX_SESSIONS: usize = 64;
 const MAX_LISTENERS: usize = 16;
 /// Forwarded connections allowed on one connection.
 const MAX_FORWARDS: usize = 256;
+/// Most characters of a session's window title in a list of sessions.
+const TITLE_LIMIT: usize = 80;
 /// Lowest port a client may ask the server to listen on.
 const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
 /// Close code for a client that broke the protocol.
@@ -211,6 +213,57 @@ struct Grant {
    forwarding: Forwarding,
    /// Reaches the monitor.
    helper:     Helper,
+}
+
+impl Grant {
+   /// A line about each terminal session of the account.
+   fn list(&self) -> Result<Vec<String>> {
+      let names = self.helper.names(self.id)?;
+      Ok(names.into_iter().map(|name| self.describe(name)).collect())
+   }
+
+   /// One line about the session `name` for a client that lists its
+   /// account's sessions. After the name come whether a client is
+   /// connected, how long ago the session wrote anything and the window
+   /// title, when the session's holder says so.
+   fn describe(&self, name: String) -> String {
+      let about = self
+         .helper
+         .find(self.id, name.clone())
+         .ok()
+         .flatten()
+         .and_then(|held| Packet::inspect(&held.link));
+
+      let Some(Packet::About {
+         attached,
+         quiet,
+         title,
+      }) = about
+      else {
+         return name;
+      };
+
+      let state = if attached { "attached" } else { "detached" };
+
+      let idle = match quiet {
+         ..60 => format!("{quiet}s"),
+         60..3600 => format!("{}m", quiet / 60),
+         3600..86400 => format!("{}h", quiet / 3600),
+         _ => format!("{}d", quiet / 86400),
+      };
+
+      // The title is a program's text, and the client prints the line on
+      // a terminal.
+      let shown = title
+         .chars()
+         .filter(|symbol| !symbol.is_control())
+         .take(TITLE_LIMIT)
+         .collect::<String>();
+
+      format!("{name}\t{state}\tidle {idle}\t{shown}")
+         .trim_end()
+         .to_owned()
+   }
 }
 
 impl Drop for Grant {
@@ -615,7 +668,7 @@ impl Server {
                },
             }
          },
-         _ => Message::Listing(grant.helper.names(grant.id)?),
+         _ => Message::Listing(grant.list()?),
       };
 
       peer.outbox.push(&answer);

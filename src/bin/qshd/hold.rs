@@ -177,6 +177,16 @@ const END: u8 = 9;
 const WRITTEN: u8 = 10;
 /// Tag of [`Packet::Received`].
 const RECEIVED: u8 = 11;
+/// Tag of [`Packet::Inspect`].
+const INSPECT: u8 = 12;
+/// Tag of [`Packet::About`].
+const ABOUT: u8 = 13;
+/// How long the network process waits for a holder to say how its session
+/// is doing.
+const INSPECT_LIMIT: Timespec = Timespec {
+   tv_sec:  0,
+   tv_nsec: 200_000_000,
+};
 
 /// One message between the network process and a holder.
 pub enum Packet {
@@ -223,6 +233,18 @@ pub enum Packet {
    /// What the other side sent first is in another version's format. A
    /// holder answers with this, which reads the same way to the server.
    Foreign,
+   /// Asks how the session is doing, as the first packet of a connection.
+   /// The session's client stays connected.
+   Inspect,
+   /// The holder's answer to [`Packet::Inspect`].
+   About {
+      /// Whether a client is connected.
+      attached: bool,
+      /// How many seconds ago the session last wrote anything.
+      quiet:    u64,
+      /// The window title a program set, on a terminal.
+      title:    String,
+   },
 }
 
 impl Packet {
@@ -274,6 +296,19 @@ impl Packet {
          Self::Exit(status) => [&[EXIT][..], &status.to_be_bytes()].concat(),
          Self::Hangup => vec![HANGUP],
          Self::Agent => vec![AGENT],
+         Self::Inspect => vec![INSPECT, VERSION],
+         Self::About {
+            attached,
+            quiet,
+            ref title,
+         } => {
+            [
+               &[ABOUT, VERSION, u8::from(attached)][..],
+               &quiet.to_be_bytes(),
+               title.as_bytes(),
+            ]
+            .concat()
+         },
       }
    }
 
@@ -282,7 +317,7 @@ impl Packet {
       let (&tag, rest) = bytes.split_first().ok_or(Error::Truncated)?;
       let mut reader = Reader::new(rest);
 
-      if matches!(tag, ATTACH | ATTACHED) && reader.byte()? != VERSION {
+      if matches!(tag, ATTACH | ATTACHED | INSPECT | ABOUT) && reader.byte()? != VERSION {
          return Ok(Self::Foreign);
       }
 
@@ -324,8 +359,39 @@ impl Packet {
          EXIT => Self::Exit(reader.u32()?),
          HANGUP => Self::Hangup,
          AGENT => Self::Agent,
+         INSPECT => Self::Inspect,
+         ABOUT => {
+            let quiet = rest
+               .get(2..10)
+               .and_then(|field| field.try_into().ok())
+               .ok_or(Error::Truncated)?;
+
+            Self::About {
+               attached: rest[1] != 0,
+               quiet:    u64::from_be_bytes(quiet),
+               title:    String::from_utf8_lossy(&rest[10..]).into_owned(),
+            }
+         },
          _ => return Err(Error::Frame),
       })
+   }
+
+   /// Asks the holder behind a new `link` how its session is doing. `None`
+   /// means it did not say, as a holder of another version does not.
+   pub fn inspect(link: &OwnedFd) -> Option<Self> {
+      Self::Inspect.send(link).ok()?;
+
+      let answered = poll(
+         &mut [PollFd::new(link, PollFlags::IN)],
+         Some(&INSPECT_LIMIT),
+      );
+      let mut buffer = [0; 512];
+
+      match answered {
+         Ok(1..) => Self::receive(link, &mut buffer).ok()??.0.into(),
+         Ok(0) | Err(_) => None,
+      }
+      .filter(|packet| matches!(*packet, Self::About { .. }))
    }
 
    /// Sends the packet, waiting for room unless the socket is non-blocking.
@@ -460,6 +526,22 @@ struct Flow {
    ended:  bool,
 }
 
+impl Flow {
+   /// The output that `source` yields. A session on pipes keeps all of it
+   /// until the client has it.
+   fn new(source: OwnedFd, piped: bool) -> Self {
+      Self {
+         source,
+         tail: if piped {
+            Tail::exact()
+         } else {
+            Tail::default()
+         },
+         ended: false,
+      }
+   }
+}
+
 /// Names one of a session's output streams.
 #[derive(Clone, Copy)]
 enum Stream {
@@ -483,6 +565,8 @@ struct Ready {
    errors:   PollFlags,
    /// The network process.
    link:     PollFlags,
+   /// A new connection.
+   visitor:  PollFlags,
    /// Accepts programs that want the SSH agent.
    agent:    PollFlags,
 }
@@ -517,6 +601,10 @@ struct Holder {
    closing:  bool,
    /// The network process, while one is connected.
    link:     Option<OwnedFd>,
+   /// A new connection that has not said what it wants.
+   visitor:  Option<OwnedFd>,
+   /// When the session last wrote anything.
+   active:   Instant,
    /// Whether the link asked for output.
    attached: bool,
    /// Packets the link has not accepted yet.
@@ -658,6 +746,45 @@ impl Holder {
       self.flush();
    }
 
+   /// Reads what a new connection says first. One that asks how the
+   /// session is doing gets its answer, and the client's link stays. Any
+   /// other takes the session over. Breaks when it hung up the session.
+   fn greet(&mut self, now: Instant, buffer: &mut [u8]) -> ControlFlow<()> {
+      let Some(visitor) = self.visitor.take() else {
+         return ControlFlow::Continue(());
+      };
+
+      let packet = match recv(&visitor, &mut *buffer, RecvFlags::DONTWAIT) {
+         Ok((count, _)) if count > 0 => Packet::decode(&buffer[..count]).ok(),
+         Err(Errno::WOULDBLOCK) => {
+            self.visitor = Some(visitor);
+            return ControlFlow::Continue(());
+         },
+         Ok(_) | Err(_) => return ControlFlow::Continue(()),
+      };
+
+      if matches!(packet, Some(Packet::Inspect)) {
+         let about = Packet::About {
+            attached: self.attached,
+            quiet:    now.duration_since(self.active).as_secs(),
+            title:    self.mirror.as_ref().map_or_else(String::new, Mirror::title),
+         };
+
+         let _ = about.send(&visitor);
+         return ControlFlow::Continue(());
+      }
+
+      // A terminal's output that waits in the link is output the client
+      // sees before the current screen, so the link holds little.
+      if self.mirror.is_some() {
+         let _ = set_socket_send_buffer_size(&visitor, LINK_BUFFER);
+      }
+
+      self.detach(now);
+      self.link = Some(visitor);
+      self.handle(now, packet)
+   }
+
    /// Handles everything the link sent. Breaks when the client hung up.
    fn receive(&mut self, now: Instant, buffer: &mut [u8]) -> ControlFlow<()> {
       while let Some(ref link) = self.link {
@@ -667,41 +794,54 @@ impl Holder {
             Ok(_) | Err(_) => None,
          };
 
-         match packet {
-            Some(Packet::Attach { received, errors }) => self.attach(received, errors),
-            Some(Packet::Data(bytes)) => {
-               self.taken += bytes.len() as u64;
-               self.queue.push_back(bytes);
-            },
-            // A terminal has no end of input to pass on.
-            Some(Packet::End) => self.closing = self.errors.is_some(),
-            Some(Packet::Received { output, errors }) => {
-               self.output.tail.release(output);
+         self.handle(now, packet)?;
+      }
 
-               if let Some(ref mut flow) = self.errors {
-                  flow.tail.release(errors);
-               }
-            },
-            Some(Packet::Resize(size)) => {
-               if let Some(ref mut mirror) = self.mirror {
-                  let _ = tcsetwinsize(&self.output.source, winsize(size));
-                  mirror.resize(size);
-               }
-            },
-            Some(Packet::Hangup) => return ControlFlow::Break(()),
-            Some(Packet::Foreign) => {
+      ControlFlow::Continue(())
+   }
+
+   /// Handles one packet from the link, or its end. Breaks when the client
+   /// hung up.
+   fn handle(&mut self, now: Instant, packet: Option<Packet>) -> ControlFlow<()> {
+      match packet {
+         Some(Packet::Attach { received, errors }) => self.attach(received, errors),
+         Some(Packet::Data(bytes)) => {
+            self.taken += bytes.len() as u64;
+            self.queue.push_back(bytes);
+         },
+         // A terminal has no end of input to pass on.
+         Some(Packet::End) => self.closing = self.errors.is_some(),
+         Some(Packet::Received { output, errors }) => {
+            self.output.tail.release(output);
+
+            if let Some(ref mut flow) = self.errors {
+               flow.tail.release(errors);
+            }
+         },
+         Some(Packet::Resize(size)) => {
+            if let Some(ref mut mirror) = self.mirror {
+               let _ = tcsetwinsize(&self.output.source, winsize(size));
+               mirror.resize(size);
+            }
+         },
+         Some(Packet::Hangup) => return ControlFlow::Break(()),
+         Some(Packet::Foreign) => {
+            if let Some(ref link) = self.link {
                let _ = Packet::Foreign.send(link);
-               self.detach(now);
-            },
-            Some(
-               Packet::Attached { .. }
-               | Packet::Errors(_)
-               | Packet::Written(_)
-               | Packet::Exit(_)
-               | Packet::Agent,
-            )
-            | None => self.detach(now),
-         }
+            }
+
+            self.detach(now);
+         },
+         Some(
+            Packet::Attached { .. }
+            | Packet::Errors(_)
+            | Packet::Written(_)
+            | Packet::Exit(_)
+            | Packet::Agent
+            | Packet::Inspect
+            | Packet::About { .. },
+         )
+         | None => self.detach(now),
       }
 
       ControlFlow::Continue(())
@@ -758,6 +898,8 @@ impl Holder {
       match read(&flow.source, &mut buffer[1..=DATA_LIMIT]) {
          Ok(0) => flow.ended = true,
          Ok(count) => {
+            self.active = Instant::now();
+
             // A terminal's program does not wait for a client that is
             // behind. The client gets the screen later.
             if let (Stream::Output, Some(mirror)) = (stream, self.mirror.as_mut()) {
@@ -860,6 +1002,10 @@ impl Holder {
             .map(|flow| PollFd::new(&flow.source, PollFlags::IN)),
          self.link.as_ref().map(|link| PollFd::new(link, sending)),
          self
+            .visitor
+            .as_ref()
+            .map(|visitor| PollFd::new(visitor, PollFlags::IN)),
+         self
             .agent
             .as_ref()
             .and_then(|agent| agent.listener.as_ref())
@@ -880,7 +1026,7 @@ impl Holder {
       let ready = fds.iter().map(PollFd::revents).collect::<Vec<PollFlags>>();
       drop(fds);
 
-      let [status, input, output, errors, link, agent] =
+      let [status, input, output, errors, link, visitor, agent] =
          watched.map(|index| index.map_or(PollFlags::empty(), |at| ready[at]));
 
       Ok(Ready {
@@ -890,6 +1036,7 @@ impl Holder {
          output,
          errors,
          link,
+         visitor,
          agent,
       })
    }
@@ -930,14 +1077,14 @@ impl Holder {
          let accepted = accept_with(&self.listener, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK)
             .context("accepting the network process")?;
 
-         // A terminal's output that waits in the link is output the client
-         // sees before the current screen, so the link holds little.
-         if self.mirror.is_some() {
-            let _ = set_socket_send_buffer_size(&accepted, LINK_BUFFER);
+         self.visitor = Some(accepted);
+      } else if !ready.visitor.is_empty() {
+         if self.greet(now, buffer).is_break() {
+            return Ok(ControlFlow::Break(()));
          }
 
-         self.detach(now);
-         self.link = Some(accepted);
+         self.flush();
+         self.feed();
       } else if !ready.link.is_empty() {
          if self.receive(now, buffer).is_break() {
             return Ok(ControlFlow::Break(()));
@@ -1084,24 +1231,12 @@ impl Hold {
          ioctl_fionbio(descriptor, true)?;
       }
 
-      let flow = |source, piped: bool| {
-         Flow {
-            source,
-            tail: if piped {
-               Tail::exact()
-            } else {
-               Tail::default()
-            },
-            ended: false,
-         }
-      };
-
       let piped = errors.is_some();
 
       let mut holder = Holder {
          input: Some(input),
-         output: flow(output, piped),
-         errors: errors.map(|source| flow(source, piped)),
+         output: Flow::new(output, piped),
+         errors: errors.map(|source| Flow::new(source, piped)),
          mirror: self
             .terminal
             .as_ref()
@@ -1119,6 +1254,8 @@ impl Hold {
          link: None,
          attached: false,
          outbox: VecDeque::new(),
+         visitor: None,
+         active: Instant::now(),
          detached: Instant::now(),
          exited: None,
          reported: false,

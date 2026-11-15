@@ -80,6 +80,22 @@ uint32_t qvt_cell(GhosttyTerminal terminal, uint16_t column, uint16_t row) {
   return character;
 }
 
+// Copies the window title a program set into `out`, at most `limit` bytes of
+// it, and returns how many bytes that was.
+size_t qvt_title(GhosttyTerminal terminal, uint8_t* out, size_t limit) {
+  GhosttyString title = {.ptr = NULL, .len = 0};
+
+  ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_TITLE, &title);
+
+  size_t length = title.len < limit ? title.len : limit;
+
+  for (size_t at = 0; at < length; at++) {
+    out[at] = title.ptr[at];
+  }
+
+  return length;
+}
+
 // Where the rows start that `part` names, and where they end.
 static bool span(GhosttyTerminal terminal, GhosttyPointTag part, GhosttySelection* selection) {
   uint16_t columns = 0;

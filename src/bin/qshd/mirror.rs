@@ -67,6 +67,11 @@ impl Mirror {
       })
    }
 
+   /// The window title a program in the session set.
+   pub fn title(&self) -> String {
+      self.terminal.title()
+   }
+
    /// Follows the session's terminal to a new size.
    pub fn resize(&mut self, size: Size) {
       self.terminal.resize(size.columns, size.rows);

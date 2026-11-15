@@ -37,6 +37,7 @@ unsafe extern "C" {
       out: *mut *mut u8,
       length: *mut usize,
    ) -> bool;
+   fn qvt_title(terminal: *mut c_void, out: *mut u8, limit: usize) -> usize;
    fn qvt_release(bytes: *mut u8, length: usize);
 }
 
@@ -102,6 +103,19 @@ impl Terminal {
    pub fn cell(&self, column: u16, row: u16) -> u32 {
       // SAFETY: the handle is live until drop.
       unsafe { qvt_cell(self.0.as_ptr(), column, row) }
+   }
+
+   /// The start of the window title a program set, which is empty when
+   /// none did.
+   #[must_use]
+   pub fn title(&self) -> String {
+      let mut bytes = [0; 256];
+
+      // SAFETY: the handle is live, and the call writes at most the
+      // buffer's length into it.
+      let length = unsafe { qvt_title(self.0.as_ptr(), bytes.as_mut_ptr(), bytes.len()) };
+
+      String::from_utf8_lossy(&bytes[..length.min(bytes.len())]).into_owned()
    }
 
    /// Runs a call that fills a buffer of the library's and copies it out.

@@ -57,9 +57,10 @@ afford to lose :)
   has a name, the one `--attach NAME` gives it or else a number, and runs
   until its shell exits, its `qsh` exits or `--end NAME` ends it. A session
   from `--attach NAME` outlives its `qsh` too, so a closed terminal window
-  leaves it running. `--list` prints the names, and `--attach NAME` from
-  another machine takes the session over. The session finds its name in
-  `QSH_SESSION`
+  leaves it running. `--list` prints each name with whether a client is
+  connected, how long ago the session wrote anything and its window title,
+  separated by tabs. `--attach NAME` from another machine takes the session
+  over. The session finds its name in `QSH_SESSION`
 - Restarting `qshd` under a session. The session lives in a process of its
   own. A `qshd` that is told to stop tells its clients, and `qsh` reattaches
   about a second after the next one is up. After a `qshd` that was killed it
