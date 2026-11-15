@@ -83,7 +83,7 @@ testers.runNixOSTest {
         client.succeed("(qsh -N -L /tmp/echo.sock:/home/alice/echo.sock alice@server >/dev/null 2>&1 &)")
         client.wait_until_succeeds("test -S /tmp/echo.sock", timeout=30)
         client.succeed(
-            "((echo before; sleep 15; echo after) | socat -t 60 - UNIX-CONNECT:/tmp/echo.sock"
+            "((echo before; sleep 5; echo after) | socat -t 60 - UNIX-CONNECT:/tmp/echo.sock"
             " > /tmp/echoed 2>&1 &)"
         )
         client.wait_until_succeeds("grep before /tmp/echoed", timeout=30)

@@ -16,7 +16,6 @@ use std::{
       AsFd as _,
       OwnedFd,
    },
-   process,
    sync::{
       Arc,
       mpsc::{
@@ -76,6 +75,7 @@ use quicsh::{
       App,
       Congestion,
       RECEIVE_WINDOW,
+      RESTARTING,
       Transport,
       drain,
    },
@@ -376,6 +376,8 @@ struct Server {
    /// Forwarded connections of clients that went silent, each with the
    /// instant it is closed at unless a client continues it.
    parked:      Vec<(Instant, Parked)>,
+   /// Whether the process was told to stop.
+   stopped:     bool,
 }
 
 impl Server {
@@ -964,9 +966,15 @@ impl Server {
    }
 
    /// Hands every forwarded connection to a process that keeps it for the
-   /// next server, and exits. The sessions are not dropped, since that
-   /// would end them in their holders.
-   fn stop(&mut self) -> ! {
+   /// next server, lets the sessions go on in their holders and ends the
+   /// loop.
+   fn stop(&mut self) {
+      self
+         .peers
+         .values_mut()
+         .flat_map(|peer| peer.sessions.values_mut())
+         .for_each(Session::keep);
+
       let mut forwards = mem::take(&mut self.parked)
          .into_iter()
          .map(|entry| entry.1)
@@ -990,7 +998,7 @@ impl Server {
          }
       }
 
-      process::exit(0)
+      self.stopped = true;
    }
 
    /// Closes a connection and forgets its state.
@@ -1060,7 +1068,7 @@ impl App for Server {
    }
 
    fn done(&self) -> bool {
-      false
+      self.stopped
    }
 
    fn waker(&self) -> Option<&Waker> {
@@ -1108,6 +1116,7 @@ pub fn run(congestion: Congestion) -> Result<()> {
       certificate,
       waker: Arc::new(Waker::new()?),
       parked: Vec::new(),
+      stopped: false,
    };
 
    if let Some(link) = server.helper.kept()? {
@@ -1120,8 +1129,12 @@ pub fn run(congestion: Congestion) -> Result<()> {
    }
 
    let signals = SignalPipe::install()?;
-   let ended =
-      Transport::adopt(socket, listen, crypto, congestion, opener, &secret)?.run(&mut server);
+   let mut transport = Transport::adopt(socket, listen, crypto, congestion, opener, &secret)?;
+   let ended = transport.run(&mut server);
+
+   if server.stopped {
+      transport.close(RESTARTING);
+   }
 
    drop(signals);
    ended

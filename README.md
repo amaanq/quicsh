@@ -59,8 +59,10 @@ afford to lose :)
   another machine takes the session over. The session finds its name in
   `QSH_SESSION`
 - Restarting `qshd` under a session. The session lives in a process of its
-  own, and `qsh` reattaches with the next packet it sends, a keystroke, data
-  or the keep-alive that goes out every 15 seconds
+  own. A `qshd` that is told to stop tells its clients, and `qsh` reattaches
+  about a second after the next one is up. After a `qshd` that was killed it
+  reattaches with the next packet it sends, a keystroke, data or the
+  keep-alive that goes out every 15 seconds
 - `qsh -N` reconnects after an outage or a restart too, and its `-L`, `-R` and
   `-D` listeners work again. Connections that were open through them carry
   on after either without a missing or repeated byte, for up to an hour

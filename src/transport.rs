@@ -142,6 +142,9 @@ const MAX_UDP_PAYLOAD: u16 = u16::MAX - 8;
 const MAX_UDP_PAYLOAD_V4: u16 = 65507;
 /// Idle time after which a connection is closed.
 const IDLE_TIMEOUT_MS: u32 = 60_000;
+/// What a server that stops closes its connections with. The client then
+/// looks for the next server at once.
+pub const RESTARTING: VarInt = VarInt::from_u32(3);
 /// Gap between keep-alive packets.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// Handshakes allowed in progress at once.
@@ -893,6 +896,17 @@ impl Transport {
          window_floor,
       });
       Ok(handle)
+   }
+
+   /// Closes every connection with `code` and sends the packets that say
+   /// so, for a process that is about to exit.
+   pub fn close(&mut self, code: VarInt) {
+      let now = Instant::now();
+
+      for (&handle, session) in &mut self.sessions {
+         session.connection.close(now, code, Bytes::new());
+         session.flush(now, handle, &mut self.endpoint, &mut self.send);
+      }
    }
 
    /// Drives every connection until `app` reports it is done.

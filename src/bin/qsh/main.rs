@@ -136,6 +136,7 @@ use quicsh::{
    transport::{
       App,
       INTERACTIVE_WINDOW,
+      RESTARTING,
       Transport,
       drain,
    },
@@ -1271,7 +1272,11 @@ impl App for Client {
             self.current = None;
          },
          Event::ConnectionLost { reason } => {
-            let silent = matches!(reason, ConnectionError::TimedOut | ConnectionError::Reset);
+            let silent = match reason {
+               ConnectionError::TimedOut | ConnectionError::Reset => true,
+               ConnectionError::ApplicationClosed(ref close) => close.error_code == RESTARTING,
+               _ => false,
+            };
 
             if !silent || !self.resumable() {
                bail!("connection lost: {reason}");
