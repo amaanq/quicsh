@@ -113,11 +113,18 @@ fn put(mut screen: &File, bytes: &[u8]) {
    }
 }
 
+/// Whether a cell that holds `code` is empty or holds a character that is
+/// one cell wide and stands alone, which leaves out the marks that join the
+/// character before them.
+const fn plain(code: u32) -> bool {
+   matches!(code, 0 | 0x20..=0x7E | 0xA1..=0xAC | 0xAE..=0x24F | 0x370..=0x482 | 0x48A..=0x52F)
+}
+
 /// A key this side knows the usual echo of.
 #[derive(Clone, Copy)]
 enum Key {
    /// A character, which goes to the cursor's cell.
-   Character(u8),
+   Character(char),
    /// The backspace key, which empties the cell before the cursor.
    Erase,
    /// The left arrow.
@@ -139,7 +146,15 @@ impl Key {
    /// shell with the usual bindings reads them.
    const fn read(input: &[u8]) -> Option<(Self, usize)> {
       Some(match *input {
-         [byte @ 0x20..=0x7E, ..] => (Self::Character(byte), 1),
+         [byte @ 0x20..=0x7E, ..] => (Self::Character(byte as char), 1),
+         [lead @ 0xC2..=0xDF, next @ 0x80..=0xBF, ..] => {
+            let code = ((lead as u32 & 0x1F) << 6) | (next as u32 & 0x3F);
+
+            match char::from_u32(code) {
+               Some(character) if plain(code) => (Self::Character(character), 2),
+               _ => return None,
+            }
+         },
          [0x7F, ..] => (Self::Erase, 1),
          [0x01, ..] => (Self::Home, 1),
          [0x02, ..] => (Self::Left, 1),
@@ -188,7 +203,7 @@ struct Outcome {
    column: usize,
    /// The cells that changed, by column. `None` is an emptied cell, which
    /// the server may fill with what stood to the right of it.
-   cells:  BTreeMap<usize, Option<u8>>,
+   cells:  BTreeMap<usize, Option<char>>,
    /// The column after the line's last character, when the line is known.
    end:    Option<usize>,
 }
@@ -243,7 +258,7 @@ pub struct Predictor {
    /// The line being typed as it was then, when that is known.
    line:     Option<Line>,
    /// The characters of that line, which the pending keys move.
-   text:     Vec<u8>,
+   text:     Vec<u32>,
    /// Whether the last key that is no character started an empty line.
    fresh:    bool,
    /// What is drawn of them.
@@ -308,22 +323,20 @@ impl Predictor {
    fn note(&mut self) {
       let line = self.line.map_or(0..0, |known| known.floor..known.end + 1);
 
-      self.text = line
-         .map(|column| u8::try_from(self.cell(column)).unwrap_or(u8::MAX))
-         .collect();
+      self.text = line.map(|column| self.cell(column)).collect();
    }
 
    /// What a cell of the known line holds once `cells` are drawn over it,
    /// which is 0 for an empty cell, unless that is no plain character.
-   fn under(&self, cells: &BTreeMap<usize, Option<u8>>, column: usize) -> Option<u8> {
+   fn under(&self, cells: &BTreeMap<usize, Option<char>>, column: usize) -> Option<u32> {
       let noted = || {
          let place = column.checked_sub(self.line?.floor)?;
          self.text.get(place).copied()
       };
 
       match cells.get(&column) {
-         Some(&drawn) => Some(drawn.unwrap_or(0)),
-         None => Some(noted().unwrap_or(0)).filter(|held| matches!(held, 0 | 0x20..=0x7E)),
+         Some(&drawn) => Some(drawn.map_or(0, u32::from)),
+         None => Some(noted().unwrap_or(0)).filter(|&held| plain(held)),
       }
    }
 
@@ -351,7 +364,10 @@ impl Predictor {
             Key::Character(character) => {
                for place in (column..end.unwrap_or(column)).rev() {
                   let moved = self.under(&cells, place)?;
-                  cells.insert(place + 1, Some(moved).filter(|&held| held != 0));
+                  cells.insert(
+                     place + 1,
+                     char::from_u32(moved).filter(|&held| held != '\0'),
+                  );
                }
 
                cells.insert(column, Some(character));
@@ -369,7 +385,10 @@ impl Predictor {
 
                for place in column + 1..last {
                   let moved = self.under(&cells, place)?;
-                  cells.insert(place - 1, Some(moved).filter(|&held| held != 0));
+                  cells.insert(
+                     place - 1,
+                     char::from_u32(moved).filter(|&held| held != '\0'),
+                  );
                }
 
                cells.insert(last - 1, None);
@@ -499,12 +518,12 @@ impl Predictor {
       let mut text = Vec::new();
 
       for (&column, &cell) in &outcome.cells {
-         if !matches!(self.cell(column), 0 | 0x20..=0x7E) {
+         if !plain(self.cell(column)) {
             return;
          }
 
          text.extend(shift(place, column));
-         text.push(cell.unwrap_or(b' '));
+         text.extend(cell.unwrap_or(' ').encode_utf8(&mut [0; 4]).bytes());
          place = column + 1;
       }
 
@@ -580,8 +599,9 @@ impl Predictor {
                   .clone()
                   .all(|(column, character)| self.cell(column) == u32::from(character))
                && (cursor.0 != self.anchor.0
-                  || placed
-                     .any(|(column, character)| self.under(&unchanged, column) != Some(character)))
+                  || placed.any(|(column, character)| {
+                     self.under(&unchanged, column) != Some(u32::from(character))
+                  }))
          })
    }
 
@@ -790,6 +810,18 @@ mod tests {
          drawn(&mut screen),
          b"\x1b[1Dc \x1b[2D",
          "a backspace before the end of the line"
+      );
+
+      predictor.typed(b"\r");
+      predictor.output(b"\r\n$ ");
+      predictor.typed(b"a");
+      predictor.output(b"a");
+      drawn(&mut screen);
+      predictor.typed("\u{e9}\u{44f}".as_bytes());
+      assert_eq!(
+         drawn(&mut screen),
+         "\u{e9}\u{44f}".as_bytes(),
+         "letters outside ASCII"
       );
    }
 }
