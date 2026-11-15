@@ -79,6 +79,10 @@ pub struct Host {
    pub certificates:    Vec<PathBuf>,
    /// `ConnectTimeout`, as written.
    pub connect_timeout: Option<String>,
+   /// `BatchMode`, as written.
+   pub batch:           Option<String>,
+   /// `ExitOnForwardFailure`, as written.
+   pub exacting:        Option<String>,
    /// `UserKnownHostsFile`, as written.
    pub known_user:      Option<String>,
    /// `GlobalKnownHostsFile`, as written.
@@ -302,6 +306,8 @@ impl Host {
             "controlpath" => Some(&mut self.control_path),
             "controlpersist" => Some(&mut self.control_persist),
             "connecttimeout" => Some(&mut self.connect_timeout),
+            "batchmode" => Some(&mut self.batch),
+            "exitonforwardfailure" => Some(&mut self.exacting),
             "escapechar" => Some(&mut self.escape),
             "addressfamily" => Some(&mut self.family),
             "userknownhostsfile" => Some(&mut self.known_user),

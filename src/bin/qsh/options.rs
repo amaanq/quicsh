@@ -66,6 +66,9 @@ pub struct Login {
    pub agent:        Option<PathBuf>,
    /// What to do about a host key nobody vouched for yet.
    pub strict:       Strict,
+   /// Whether a forward that the server refuses ends the program, from
+   /// `ExitOnForwardFailure`.
+   pub exacting:     bool,
    /// Which of the host's addresses to try, from `AddressFamily`.
    pub family:       Family,
    /// The name to look the host key up under, in place of the host's.
@@ -88,6 +91,11 @@ pub struct Login {
    /// Certificates for the keys to log in with, from `CertificateFile` and
    /// from beside the named key files.
    pub certificates: Vec<Certificate>,
+}
+
+/// Whether a keyword that takes yes or no is set to yes.
+fn agreed(value: Option<&str>) -> bool {
+   value.is_some_and(|text| text.eq_ignore_ascii_case("yes") || text.eq_ignore_ascii_case("true"))
 }
 
 /// How a connection is shared with other runs of this program.
@@ -667,6 +675,7 @@ impl Options {
       {
          Some("yes") => Strict::Refuse,
          Some("accept-new" | "no" | "off") => Strict::AcceptNew,
+         Some(_) | None if agreed(host.batch.as_deref()) => Strict::Refuse,
          Some(_) | None => Strict::Ask,
       };
 
@@ -701,6 +710,7 @@ impl Options {
             .filter(|jump| !jump.eq_ignore_ascii_case("none")),
          agent: socket(host.agent.as_deref()),
          strict,
+         exacting: agreed(host.exacting.as_deref()),
          alias: host.alias,
       })
    }

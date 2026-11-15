@@ -272,7 +272,8 @@ fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
    match login.strict {
       Strict::Refuse => {
          bail!(
-            "no known hosts file lists [{named}]:{}, and StrictHostKeyChecking forbids asking",
+            "no known hosts file lists [{named}]:{}, and StrictHostKeyChecking or BatchMode \
+             forbids asking",
             login.port
          )
       },
@@ -1084,6 +1085,8 @@ impl Client {
                      },
                   }
                }
+
+               ensure!(!self.login.exacting, "the server refused a forward");
             },
             _ => bail!("unexpected control message from the server"),
          }
