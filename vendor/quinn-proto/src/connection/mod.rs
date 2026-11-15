@@ -602,8 +602,9 @@ impl Connection {
                 }
 
                 // Congestion control and pacing checks
-                // Tail loss probes must not be blocked by congestion, or a deadlock could arise
-                if ack_eliciting && self.spaces[space_id].loss_probes == 0 {
+                // Tail loss probes must not be blocked by congestion, or a deadlock could arise.
+                // Neither must a close, which an endpoint that exits never gets to send later.
+                if ack_eliciting && !close && self.spaces[space_id].loss_probes == 0 {
                     // Assume the current packet will get padded to fill the segment
                     let untracked_bytes = if let Some(builder) = &builder_storage {
                         buf_capacity - builder.partial_encode.start
