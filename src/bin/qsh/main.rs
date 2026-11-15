@@ -1493,7 +1493,7 @@ fn jump(hops: &str, login: &Login) -> Result<(Child, OwnedFd)> {
    command
       .arg("-N")
       .arg("-W")
-      .arg(format!("{}:{}", login.host, login.port));
+      .arg(format!("[{}]:{}", login.host, login.port));
 
    if let Some(hosts) = earlier {
       command.arg("-J").arg(hosts);
