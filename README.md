@@ -278,8 +278,10 @@ beside an upload, as the median and the 95th percentile.
 | VPS, 12 ms away | `qsh` | 12.4 ms | 14.0 ms          | 27 ms           |
 | VPS, 12 ms away | `ssh` | 12.1 ms | 29.7 ms          | 68 ms           |
 
-BBR is why Cubic is the default. With it the same keystroke took 28 to 59 ms
-beside the upload to the VPS.
+BBR is why a connection starts on Cubic. With it the same keystroke took 28
+to 59 ms beside the upload to the VPS. These rows predate the switch between
+the two. The VPS path rarely triggers it, and on the LAN both controllers
+measure the same.
 
 `bench.nu` takes those measurements between two machines. It runs `qsh` and
 `ssh` in turns against a host that has both servers and prints the medians.
