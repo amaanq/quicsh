@@ -193,8 +193,9 @@ that changes how the server talks to that process can't pick its sessions
 up. `qsh` says so and exits.
 
 A `qshd` that is told to stop hands its open forwarded connections to one
-more process, which keeps them until the next `qshd` asks or an hour has
-passed. A `qshd` that crashes or gets killed closes them.
+more process, which runs without privileges and keeps them until the next
+`qshd` asks or an hour has passed. A `qshd` that crashes or gets killed
+closes them.
 
 A shared connection is a logged-in connection that anything running as you
 can open sessions on, for as long as `ControlPersist` says, with no PIN and no

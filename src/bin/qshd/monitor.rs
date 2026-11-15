@@ -13,6 +13,7 @@ use std::{
       self,
       Write as _,
    },
+   mem,
    net::{
       IpAddr,
       SocketAddr,
@@ -46,7 +47,10 @@ use std::{
    },
 };
 
-use knell::signals::SignalPipe;
+use knell::signals::{
+   SignalPipe,
+   shutdown_requested,
+};
 use misstep::{
    OptionExt as _,
    Result,
@@ -216,6 +220,11 @@ struct Monitor {
    holders:         PathBuf,
    /// The last grant or session number handed out.
    issued:          u64,
+   /// The user and group the network process runs as, when this process
+   /// is root.
+   unprivileged:    Option<(u32, u32)>,
+   /// Whether a keeper of forwarded connections was started.
+   kept:            bool,
 }
 
 impl Monitor {
@@ -636,7 +645,14 @@ impl Monitor {
 
    /// Starts a process that keeps what the network process hands it until
    /// the next server asks for it, and answers with the link to it.
-   fn keeper(&self) -> Result<(Reply, Vec<OwnedFd>)> {
+   fn keeper(&mut self) -> Result<(Reply, Vec<OwnedFd>)> {
+      // A network process that a client took over gets one keeper, at the
+      // end, and that keeper has no more rights than it has itself.
+      ensure!(
+         shutdown_requested() && !mem::replace(&mut self.kept, true),
+         "the server is not stopping"
+      );
+
       let path = self.holders.join(KEPT);
       let _ = fs::remove_file(&path);
 
@@ -658,14 +674,19 @@ impl Monitor {
          None,
       )?;
 
-      let mut child = Command::new(env::current_exe()?)
+      let mut command = Command::new(env::current_exe()?);
+      command
          .arg("keep")
          .stdin(remote)
          .stdout(listener)
          .env_clear()
-         .process_group(0)
-         .spawn()
-         .context("starting the keeper of forwards")?;
+         .process_group(0);
+
+      if let Some((uid, gid)) = self.unprivileged {
+         command.uid(uid).gid(gid);
+      }
+
+      let mut child = command.spawn().context("starting the keeper of forwards")?;
 
       // The keeper outlives this process on purpose.
       thread::spawn(move || child.wait());
@@ -938,7 +959,7 @@ pub fn run(settings: Settings) -> Result<()> {
       .stdin(remote)
       .env_clear();
 
-   if geteuid().is_root() {
+   let unprivileged = if geteuid().is_root() {
       let Some(account) = Account::lookup(&settings.user)? else {
          bail!(
             "no account {} to run the network process as, name one with --user",
@@ -947,7 +968,10 @@ pub fn run(settings: Settings) -> Result<()> {
       };
 
       network.uid(account.uid).gid(account.gid);
-   }
+      Some((account.uid, account.gid))
+   } else {
+      None
+   };
 
    let mut child = network.spawn().context("starting the network process")?;
 
@@ -969,6 +993,8 @@ pub fn run(settings: Settings) -> Result<()> {
       grants: HashMap::new(),
       holders: holders()?,
       issued: 0,
+      unprivileged,
+      kept: false,
    };
 
    println!("listening on udp {}", settings.listen);
