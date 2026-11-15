@@ -148,6 +148,8 @@ const IDLE_TIMEOUT_MS: u32 = 60_000;
 pub const RESTARTING: VarInt = VarInt::from_u32(3);
 /// Gap between keep-alive packets.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
+/// How many times the packet that closes a connection is sent.
+const CLOSE_COPIES: usize = 3;
 /// Handshakes allowed in progress at once.
 const MAX_HANDSHAKES: usize = 64;
 /// Silence from the peer before a dialed connection tests its path.
@@ -705,7 +707,14 @@ impl Session {
             return false;
          };
 
-         let sent = self.socket.transmit(&meta, buffer);
+         // A close is sent once and never again, and a peer that misses it
+         // keeps the connection's sessions for a client that will not return.
+         let copies = if self.connection.is_closed() {
+            CLOSE_COPIES
+         } else {
+            1
+         };
+         let sent = (0..copies).try_for_each(|_| self.socket.transmit(&meta, buffer));
 
          if let Role::Dialed(ref mut probe) = self.role {
             probe.unanswered.get_or_insert(now);
