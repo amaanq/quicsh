@@ -95,7 +95,6 @@ use rustix::{
       shutdown,
       socket_with,
    },
-   time::Timespec,
 };
 
 use crate::{
@@ -317,11 +316,6 @@ const BATCH_LIMIT: usize = 64;
 /// Room for a full batch of jumbo frames. The kernel cuts off what does not
 /// fit, and 64 datagrams of 1372 bytes are already more than 64 KiB.
 const BATCH_BYTES: usize = BATCH_LIMIT * 9216;
-/// How often an idle datagram relay checks whether its stream is gone.
-const RELAY_POLL: Timespec = Timespec {
-   tv_sec:  1,
-   tv_nsec: 0,
-};
 
 /// Joins a datagram socket to a byte stream and returns the stream's other
 /// end.
@@ -338,18 +332,22 @@ pub fn datagrams(socket: OwnedFd) -> io::Result<OwnedFd> {
    let mut framed = near.try_clone()?;
    let inbound = socket.try_clone()?;
 
-   let closed = Arc::new(AtomicBool::new(false));
+   let closed = Arc::new(Waker::new().map_err(io::Error::other)?);
    let gone = Arc::clone(&closed);
 
    thread::spawn(move || {
       let mut buffer = vec![0; DATAGRAM_LIMIT + 2];
 
-      while !gone.load(Ordering::Relaxed) {
-         // The wait ends once a second so that the loop sees `gone`.
-         let _ = poll(
-            &mut [PollFd::new(&inbound, PollFlags::IN)],
-            Some(&RELAY_POLL),
-         );
+      loop {
+         let mut watched = [
+            PollFd::new(&inbound, PollFlags::IN),
+            PollFd::new(&*gone, PollFlags::IN),
+         ];
+         let _ = poll(&mut watched, None);
+
+         if !watched[1].revents().is_empty() {
+            break;
+         }
 
          let count = match recv(&inbound, &mut buffer[2..], RecvFlags::DONTWAIT) {
             Ok((0, _)) => break,
@@ -369,6 +367,10 @@ pub fn datagrams(socket: OwnedFd) -> io::Result<OwnedFd> {
             break;
          }
       }
+
+      // The other thread holds this socket too, so dropping it here would
+      // not end the stream.
+      let _ = shutdown(&framed, Shutdown::Write);
    });
 
    thread::spawn(move || unframe(near, &socket, &closed));
@@ -377,8 +379,8 @@ pub fn datagrams(socket: OwnedFd) -> io::Result<OwnedFd> {
 }
 
 /// Sends each length-prefixed datagram that `framed` yields on `socket`, and
-/// sets `closed` once the stream ends.
-fn unframe(mut framed: UnixStream, socket: &OwnedFd, closed: &AtomicBool) {
+/// wakes `closed` once the stream ends.
+fn unframe(mut framed: UnixStream, socket: &OwnedFd, closed: &Waker) {
    let mut header = [0; 2];
    let mut buffer = vec![0; DATAGRAM_LIMIT];
 
@@ -394,7 +396,7 @@ fn unframe(mut framed: UnixStream, socket: &OwnedFd, closed: &AtomicBool) {
       let _ = send(socket, &buffer[..length], SendFlags::NOSIGNAL);
    }
 
-   closed.store(true, Ordering::Relaxed);
+   closed.wake();
 }
 
 /// Joins a connected UDP socket to a byte stream as [`datagrams`] does. The
@@ -413,22 +415,26 @@ fn batches(socket: UdpSocket) -> io::Result<OwnedFd> {
    let inbound = socket.try_clone()?;
    let outbound = OwnedFd::from(socket);
 
-   let closed = Arc::new(AtomicBool::new(false));
+   let closed = Arc::new(Waker::new().map_err(io::Error::other)?);
    let gone = Arc::clone(&closed);
 
    thread::spawn(move || {
       let mut buffer = vec![0; BATCH_BYTES];
       let mut batch = Vec::with_capacity(BATCH_BYTES + 2 * BATCH_LIMIT);
 
-      while !gone.load(Ordering::Relaxed) {
-         // The wait ends once a second so that the loop sees `gone`, and
-         // the socket is only read when that cannot block.
-         let ready = poll(
-            &mut [PollFd::new(&inbound, PollFlags::IN)],
-            Some(&RELAY_POLL),
-         );
+      loop {
+         // The socket is only read when that cannot block.
+         let mut watched = [
+            PollFd::new(&inbound, PollFlags::IN),
+            PollFd::new(&*gone, PollFlags::IN),
+         ];
+         let ready = poll(&mut watched, None);
 
-         if !matches!(ready, Ok(1..)) {
+         if !watched[1].revents().is_empty() {
+            break;
+         }
+
+         if ready.is_err() || watched[0].revents().is_empty() {
             continue;
          }
 
@@ -461,6 +467,8 @@ fn batches(socket: UdpSocket) -> io::Result<OwnedFd> {
             break;
          }
       }
+
+      let _ = shutdown(&framed, Shutdown::Write);
    });
 
    thread::spawn(move || unframe(near, &outbound, &closed));

@@ -483,6 +483,11 @@ fn sign_with_file(file: &Path, message: &[u8]) -> Result<(PublicKey, Vec<u8>)> {
    Ok(armored(&signed?)?)
 }
 
+/// How long a process waits at its end for the one that relays for it.
+const HELPER_EXIT: Duration = Duration::from_secs(2);
+/// How often it looks whether that one is gone.
+const HELPER_POLL: Duration = Duration::from_millis(2);
+
 /// The UDP relay that `-W` asks for.
 struct Hop {
    /// Host the server sends the datagrams to.
@@ -1362,10 +1367,16 @@ impl App for Client {
          .as_mut()
          .and_then(|master| master.deadline(now, busy));
 
+      // A relay ends once its user is gone and the server sent on all
+      // that the user left for it.
+      let relayed = self.relay.as_ref().is_some_and(|hop| hop.ready)
+         && self.lost.is_none()
+         && self.forwards.is_empty();
+
       let over = if self.master.is_some() {
          expiry.is_some_and(|at| now >= at)
       } else {
-         self.status.is_some()
+         self.status.is_some() || relayed
       };
 
       if (shutdown_requested() || over) && !self.done {
@@ -1521,6 +1532,21 @@ fn jump(hops: &str, login: &Login) -> Result<(Child, OwnedFd)> {
    ensure!(opened, "no connection through {host}");
 
    Ok((child, link))
+}
+
+/// Waits for a helper that [`jump`] started to pass on the last packets
+/// of this process, which closed its end. The helper would end with this
+/// process and lose them.
+fn outlast(helper: Option<Child>) {
+   let Some(mut child) = helper else {
+      return;
+   };
+
+   let limit = Instant::now() + HELPER_EXIT;
+
+   while Instant::now() < limit && matches!(child.try_wait(), Ok(None)) {
+      thread::sleep(HELPER_POLL);
+   }
 }
 
 /// What the options ask the server to run, on a terminal when this
@@ -1836,7 +1862,7 @@ fn main() -> Result<()> {
    // A connection through a jump host has no address of its own to dial.
    // The one below only names the peer, and the jump host looks the real
    // one up.
-   let (addresses, link, _helper) = if let Some(ref hops) = login.jump {
+   let (addresses, link, helper) = if let Some(ref hops) = login.jump {
       let (child, link) = jump(hops, &login)?;
       let named = SocketAddr::from((Ipv4Addr::LOCALHOST, login.port));
 
@@ -1923,7 +1949,9 @@ fn main() -> Result<()> {
       None => client.status.unwrap_or(255),
    };
 
-   drop((client, sockets));
+   drop((client, sockets, transport));
+
+   outlast(helper);
    ended?;
 
    process::exit(i32::try_from(status).unwrap_or(255))
