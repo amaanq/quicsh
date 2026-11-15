@@ -120,6 +120,56 @@ enum Key {
    Character(u8),
    /// The backspace key, which empties the cell before the cursor.
    Erase,
+   /// The left arrow.
+   Left,
+   /// The right arrow.
+   Right,
+   /// The key that goes to the start of the line.
+   Home,
+   /// The key that goes to the end of the line.
+   End,
+   /// The key that removes the character under the cursor.
+   Delete,
+   /// The key that removes the rest of the line.
+   Kill,
+}
+
+impl Key {
+   /// The key that `input` starts with and how many bytes it takes, as a
+   /// shell with the usual bindings reads them.
+   const fn read(input: &[u8]) -> Option<(Self, usize)> {
+      Some(match *input {
+         [byte @ 0x20..=0x7E, ..] => (Self::Character(byte), 1),
+         [0x7F, ..] => (Self::Erase, 1),
+         [0x01, ..] => (Self::Home, 1),
+         [0x02, ..] => (Self::Left, 1),
+         [0x05, ..] => (Self::End, 1),
+         [0x06, ..] => (Self::Right, 1),
+         [0x0B, ..] => (Self::Kill, 1),
+         [0x1B, b'[' | b'O', b'D', ..] => (Self::Left, 3),
+         [0x1B, b'[' | b'O', b'C', ..] => (Self::Right, 3),
+         [0x1B, b'[' | b'O', b'H', ..] => (Self::Home, 3),
+         [0x1B, b'[' | b'O', b'F', ..] => (Self::End, 3),
+         [0x1B, b'[', b'1' | b'7', b'~', ..] => (Self::Home, 4),
+         [0x1B, b'[', b'4' | b'8', b'~', ..] => (Self::End, 4),
+         [0x1B, b'[', b'3', b'~', ..] => (Self::Delete, 4),
+         _ => return None,
+      })
+   }
+}
+
+/// The line the user types, for one that began empty and that only keys
+/// with a known echo changed since.
+#[derive(Clone, Copy)]
+struct Line {
+   /// The row it is on.
+   row:   u16,
+   /// The column it starts at. A backspace and a left arrow there do
+   /// nothing.
+   floor: usize,
+   /// The column after its last character. A character typed before it
+   /// moves the rest of the line.
+   end:   usize,
 }
 
 /// A typed key whose echo has not arrived.
@@ -139,6 +189,8 @@ struct Outcome {
    /// The cells that changed, by column. `None` is an emptied cell, which
    /// the server may fill with what stood to the right of it.
    cells:  BTreeMap<usize, Option<u8>>,
+   /// The column after the line's last character, when the line is known.
+   end:    Option<usize>,
 }
 
 /// What is drawn on the terminal ahead of the server.
@@ -160,6 +212,20 @@ fn shift(from: usize, to: usize) -> Vec<u8> {
    }
 }
 
+/// Whether `input` starts with what a terminal answers a program's question
+/// with, such as where the cursor is. A shell may ask at every prompt, and
+/// the answer is no key.
+fn answer(input: &[u8]) -> bool {
+   match *input {
+      [0x1B, b']' | b'P' | b'_', ..] | [0x1B, b'[', b'?' | b'>', ..] => true,
+      [0x1B, b'[', ref rest @ ..] => {
+         let last = rest.iter().find(|&&byte| matches!(byte, 0x40..=0x7E));
+         last.is_some_and(|byte| b"Rcnty".contains(byte))
+      },
+      _ => false,
+   }
+}
+
 /// Follows a session's terminal and draws typed characters on it early.
 pub struct Predictor {
    /// What the terminal shows without the early characters.
@@ -174,9 +240,10 @@ pub struct Predictor {
    pending:  VecDeque<Guess>,
    /// Where the cursor was when the first of them was typed.
    anchor:   (u16, u16),
-   /// Where the line being typed starts, when that is known. A backspace
-   /// there does nothing.
-   floor:    Option<(u16, u16)>,
+   /// The line being typed as it was then, when that is known.
+   line:     Option<Line>,
+   /// The characters of that line, which the pending keys move.
+   text:     Vec<u8>,
    /// Whether the last key that is no character started an empty line.
    fresh:    bool,
    /// What is drawn of them.
@@ -206,7 +273,8 @@ impl Predictor {
          mode,
          pending: VecDeque::new(),
          anchor: (0, 0),
-         floor: None,
+         line: None,
+         text: Vec::new(),
          fresh: false,
          shown: None,
          run: 0,
@@ -221,7 +289,7 @@ impl Predictor {
    /// server's output to replace.
    fn restart(&mut self) {
       self.pending.clear();
-      self.floor = None;
+      self.line = None;
       self.shown = None;
       self.run = self.run.wrapping_add(1);
       self.blind = false;
@@ -234,44 +302,114 @@ impl Predictor {
       self.restart();
    }
 
+   /// Notes what the known line and the cell after it hold, before any
+   /// pending key changes them. The emulator shows the line with their echo
+   /// later, when the keys are still compared with it.
+   fn note(&mut self) {
+      let line = self.line.map_or(0..0, |known| known.floor..known.end + 1);
+
+      self.text = line
+         .map(|column| u8::try_from(self.cell(column)).unwrap_or(u8::MAX))
+         .collect();
+   }
+
+   /// What a cell of the known line holds once `cells` are drawn over it,
+   /// which is 0 for an empty cell, unless that is no plain character.
+   fn under(&self, cells: &BTreeMap<usize, Option<u8>>, column: usize) -> Option<u8> {
+      let noted = || {
+         let place = column.checked_sub(self.line?.floor)?;
+         self.text.get(place).copied()
+      };
+
+      match cells.get(&column) {
+         Some(&drawn) => Some(drawn.unwrap_or(0)),
+         None => Some(noted().unwrap_or(0)).filter(|held| matches!(held, 0 | 0x20..=0x7E)),
+      }
+   }
+
    /// The row after the first `count` pending keys, unless they lead off
-   /// the row.
+   /// the row or move what this side cannot draw.
    fn outcome(&self, count: usize) -> Option<Outcome> {
+      let line = self.line.filter(|line| line.row == self.anchor.1);
+      let floor = line.map(|known| known.floor);
+
+      // A shell that shows a suggestion after the line takes it when the
+      // cursor is sent right from the end.
+      let suggested = line.is_some_and(|known| {
+         self
+            .text
+            .get(known.end - known.floor)
+            .is_some_and(|&next| next != 0)
+      });
+
+      let mut end = line.map(|known| known.end);
       let mut column = usize::from(self.anchor.0);
       let mut cells = BTreeMap::new();
 
       for guess in self.pending.iter().take(count) {
          match guess.key {
             Key::Character(character) => {
+               for place in (column..end.unwrap_or(column)).rev() {
+                  let moved = self.under(&cells, place)?;
+                  cells.insert(place + 1, Some(moved).filter(|&held| held != 0));
+               }
+
                cells.insert(column, Some(character));
                column += 1;
+               end = end.map(|last| (last + 1).max(column));
             },
-            Key::Erase => {
-               let start = self.floor.is_some_and(|floor| {
-                  floor == (u16::try_from(column).unwrap_or(0), self.anchor.1)
-               });
-
-               if !start {
+            Key::Erase if floor == Some(column) => {},
+            Key::Delete if end.is_none_or(|last| column >= last) => {},
+            key @ (Key::Erase | Key::Delete) => {
+               if matches!(key, Key::Erase) {
                   column = column.checked_sub(1)?;
-                  cells.insert(column, None);
                }
+
+               let last = end.unwrap_or(column + 1).max(column + 1);
+
+               for place in column + 1..last {
+                  let moved = self.under(&cells, place)?;
+                  cells.insert(place - 1, Some(moved).filter(|&held| held != 0));
+               }
+
+               cells.insert(last - 1, None);
+               end = end.map(|_| last - 1);
             },
+            Key::Kill => {
+               cells.extend((column..end.unwrap_or(column)).map(|place| (place, None)));
+               end = end.map(|_| column);
+            },
+            Key::Left => column -= usize::from(floor.is_some_and(|start| column > start)),
+            Key::Right if end.is_some_and(|last| column < last) => column += 1,
+            Key::Right | Key::End if suggested => return None,
+            Key::Right => {},
+            Key::Home => column = floor.unwrap_or(column),
+            Key::End => column = end.unwrap_or(column),
          }
       }
 
-      (column + 1 < usize::from(self.columns)).then_some(Outcome { column, cells })
+      (end.unwrap_or(column).max(column) + 1 < usize::from(self.columns)).then_some(Outcome {
+         column,
+         cells,
+         end,
+      })
    }
 
    /// Takes what the user typed, which goes to the server as it is.
    pub fn typed(&mut self, input: &[u8]) {
       let now = Instant::now();
+      let mut rest = input;
 
-      for &byte in input {
-         let key = match byte {
-            0x20..=0x7E => Some(Key::Character(byte)),
-            0x7F => Some(Key::Erase),
-            _ => None,
-         };
+      while let Some((&byte, after)) = rest.split_first().filter(|_| !answer(rest)) {
+         // Only a character and a backspace have a known echo on a line
+         // whose start and end are not known.
+         let read = Key::read(rest).filter(|read| {
+            matches!(read.0, Key::Character(_) | Key::Erase) || self.line.is_some() || self.fresh
+         });
+
+         rest = read.map_or(after, |(_, length)| rest.get(length..).unwrap_or_default());
+
+         let key = read.map(|(key, _)| key);
 
          if let Some(known) = key.filter(|_| !self.blind && self.pending.len() < LIMIT) {
             if self.pending.is_empty() {
@@ -279,7 +417,15 @@ impl Predictor {
             }
 
             if take(&mut self.fresh) {
-               self.floor = Some(self.anchor);
+               self.line = Some(Line {
+                  row:   self.anchor.1,
+                  floor: usize::from(self.anchor.0),
+                  end:   usize::from(self.anchor.0),
+               });
+            }
+
+            if self.pending.is_empty() {
+               self.note();
             }
 
             self.pending.push_back(Guess {
@@ -298,7 +444,7 @@ impl Predictor {
          self.run = self.run.wrapping_add(1);
          self.blind = !self.pending.is_empty();
          self.fresh = matches!(byte, b'\r' | 0x03 | 0x15);
-         self.floor = None;
+         self.line = None;
 
          // What follows an escape character in one read is the rest of a
          // key's sequence, of a terminal's answer or of pasted text.
@@ -417,15 +563,25 @@ impl Predictor {
    }
 
    /// Whether the terminal shows what the first `count` pending keys do.
-   /// Keys that leave the cursor where it was are not told from no echo.
+   /// Keys that leave the cursor where it was and put no other character
+   /// in a cell are not told from no echo.
    fn echoed(&self, count: usize, cursor: (u16, u16)) -> bool {
+      let unchanged = BTreeMap::new();
+
       cursor.1 == self.anchor.1
-         && cursor.0 != self.anchor.0
          && self.outcome(count).is_some_and(|outcome| {
+            let mut placed = outcome
+               .cells
+               .iter()
+               .filter_map(|(&column, &cell)| Some((column, cell?)));
+
             outcome.column == usize::from(cursor.0)
-               && outcome.cells.iter().all(|(&column, &cell)| {
-                  cell.is_none_or(|character| self.cell(column) == u32::from(character))
-               })
+               && placed
+                  .clone()
+                  .all(|(column, character)| self.cell(column) == u32::from(character))
+               && (cursor.0 != self.anchor.0
+                  || placed
+                     .any(|(column, character)| self.under(&unchanged, column) != Some(character)))
          })
    }
 
@@ -439,6 +595,14 @@ impl Predictor {
       let settled = (1..=self.pending.len())
          .rev()
          .find(|&count| self.echoed(count, cursor));
+
+      let end = settled
+         .and_then(|count| self.outcome(count))
+         .and_then(|outcome| outcome.end);
+
+      if let (Some(line), Some(last)) = (self.line.as_mut(), end) {
+         line.end = last;
+      }
 
       if let Some(last) = settled.and_then(|count| self.pending.drain(..count).next_back()) {
          let sample = last.typed.elapsed();
@@ -455,6 +619,7 @@ impl Predictor {
          }
 
          self.anchor = cursor;
+         self.note();
       }
 
       if self.pending.is_empty() {
@@ -600,6 +765,31 @@ mod tests {
          drawn(&mut screen),
          b"\x1b[1D\x1b[0m \x1b[1D\x1b[0m\x1b[38;5;8mc\x1b[0m\x1b[0m\x1b[1D",
          "a covered cell gets its style back"
+      );
+
+      predictor.typed(b"\r");
+      predictor.output(b"\r\n$ ");
+      predictor.typed(b"a");
+      predictor.output(b"a");
+      drawn(&mut screen);
+      predictor.typed(b"c\x1b[D");
+      assert_eq!(drawn(&mut screen), b"c\x1b[1D", "a left arrow");
+
+      predictor.typed(b"b");
+      assert_eq!(
+         drawn(&mut screen),
+         b"\x1b[0m \x1b[1D\x1b[0mbc\x1b[1D",
+         "a character before the end of the line"
+      );
+
+      predictor.hide();
+      drawn(&mut screen);
+      predictor.output(b"c\x08bc\x08");
+      predictor.typed(b"\x7f");
+      assert_eq!(
+         drawn(&mut screen),
+         b"\x1b[1Dc \x1b[2D",
+         "a backspace before the end of the line"
       );
    }
 }

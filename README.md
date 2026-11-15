@@ -50,7 +50,9 @@ afford to lose :)
   too, draws a character at the cursor, and puts back what was there when
   the real output arrives. Nothing shows until the server has echoed since
   the last enter, escape or control key, so a password prompt stays blank.
-  `--predict always` and `--predict never` change when it happens
+  On a line that began after enter, the keys that move the cursor along the
+  line and edits in the middle of it show early too. `--predict always` and
+  `--predict never` change when it happens
 - Sessions that any of your machines can join. Every session on a terminal
   has a name, the one `--attach NAME` gives it or else a number, and runs
   until its shell exits, its `qsh` exits or `--end NAME` ends it. A session
