@@ -1406,7 +1406,7 @@ impl App for Client {
 
 /// Runs `client` on the first of `addresses` that answers, and dials that
 /// address again for as long as a lost session can be resumed.
-fn drive(transport: &mut Transport, client: &mut Client, addresses: &[SocketAddr]) -> Result<()> {
+fn serve(transport: &mut Transport, client: &mut Client, addresses: &[SocketAddr]) -> Result<()> {
    let dial = |endpoint: &mut Transport, address, link: Option<&OwnedFd>| {
       let handle = endpoint.connect(
          Instant::now(),
@@ -1465,6 +1465,19 @@ fn drive(transport: &mut Transport, client: &mut Client, addresses: &[SocketAddr
    }
 
    Ok(())
+}
+
+/// Runs `client` as [`serve`] does, and closes its connection when that
+/// ends with an error. A server keeps the sessions of a client that ends
+/// without a close.
+fn drive(transport: &mut Transport, client: &mut Client, addresses: &[SocketAddr]) -> Result<()> {
+   let ended = serve(transport, client, addresses);
+
+   if ended.is_err() {
+      transport.close(VarInt::from_u32(0));
+   }
+
+   ended
 }
 
 /// Splits `HOST:PORT`, where brackets may enclose an IPv6 address. A text
