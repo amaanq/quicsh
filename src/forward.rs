@@ -697,9 +697,6 @@ impl Parked {
    }
 }
 
-/// The first message of forwards on their way between two server processes.
-/// A process that expects another one takes none of them.
-const HANDOVER: &[u8] = b"quicsh forwards 1";
 /// Most bytes of a forward's state in one message.
 const PIECE: usize = 32 << 10;
 
@@ -712,7 +709,6 @@ const PIECE: usize = 32 << 10;
 /// Fails when `link` does.
 pub fn hand_over(link: &OwnedFd, forwards: Vec<Parked>) -> io::Result<()> {
    halt();
-   send_message(link, HANDOVER, &[])?;
 
    for (socket, state) in forwards.into_iter().filter_map(Parked::freeze) {
       let length = u32::try_from(state.len()).map_err(io::Error::other)?;
@@ -734,10 +730,6 @@ pub fn hand_over(link: &OwnedFd, forwards: Vec<Parked>) -> io::Result<()> {
 /// Fails when `link` does.
 pub fn take_over(link: &OwnedFd, waker: &Arc<Waker>) -> io::Result<Vec<Parked>> {
    let mut forwards = Vec::new();
-
-   if receive_message(link, PIECE)?.is_none_or(|first| first.0 != HANDOVER) {
-      return Ok(forwards);
-   }
 
    while let Some((head, sockets)) = receive_message(link, PIECE)? {
       let length = head
