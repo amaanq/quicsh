@@ -277,6 +277,26 @@ impl Account {
          .find_map(|(options, listed)| Permit::parse(options, &listed, (&self.name, key), attempt)))
    }
 
+   /// Whether one of the `authorities`, a file with a key on each line,
+   /// signed a certificate for `key` that names this account. That is what
+   /// `TrustedUserCAKeys` does in `sshd`.
+   ///
+   /// # Errors
+   ///
+   /// Fails when the file cannot be read.
+   pub fn certified(
+      &self,
+      key: &PublicKey,
+      authorities: &Path,
+      attempt: &Attempt<'_>,
+   ) -> Result<Option<Permit>, Error> {
+      let text = fs::read_to_string(authorities).map_err(Error::AuthorizedKeys)?;
+
+      Ok(text.lines().filter_map(entry).find_map(|(_, listed)| {
+         Permit::parse("cert-authority", &listed, (&self.name, key), attempt)
+      }))
+   }
+
    /// Whether only the account or root can write `path`.
    fn controls(&self, path: &Path) -> bool {
       fs::metadata(path).is_ok_and(|metadata| {

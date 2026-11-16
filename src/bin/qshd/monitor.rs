@@ -183,6 +183,8 @@ pub struct Settings {
    pub host_certificate: Option<PathBuf>,
    /// File that replaces every account's own `authorized_keys`.
    pub authorized_keys:  Option<PathBuf>,
+   /// File of the authorities whose certificates let an account in.
+   pub authorities:      Option<PathBuf>,
    /// Program behind the `sftp` subsystem.
    pub sftp_server:      Option<PathBuf>,
    /// Patterns for the environment variables a client may set.
@@ -213,6 +215,8 @@ struct Monitor {
    listener:        Option<OwnedFd>,
    /// File that replaces every account's own `authorized_keys`.
    authorized_keys: Option<PathBuf>,
+   /// File of the authorities whose certificates let an account in.
+   authorities:     Option<PathBuf>,
    /// Program behind the `sftp` subsystem.
    sftp_server:     Option<PathBuf>,
    /// Patterns for the environment variables a client may set.
@@ -293,7 +297,16 @@ impl Monitor {
          certificate: login.certificate.as_deref(),
       };
 
-      let Some(permit) = account.authorizes(&login.key, keys_file, &attempt)? else {
+      let listed = account.authorizes(&login.key, keys_file, &attempt)?;
+
+      let trusted = match self.authorities {
+         Some(ref authorities) if listed.is_none() => {
+            account.certified(&login.key, authorities, &attempt)?
+         },
+         Some(_) | None => listed,
+      };
+
+      let Some(permit) = trusted else {
          return Ok(Reply::Denied);
       };
 
@@ -1011,6 +1024,7 @@ pub fn run(settings: Settings) -> Result<()> {
       listen: settings.listen,
       listener: Some(listener),
       authorized_keys: settings.authorized_keys,
+      authorities: settings.authorities,
       sftp_server: settings.sftp_server,
       accept_env: settings.accept_env,
       grants: HashMap::new(),

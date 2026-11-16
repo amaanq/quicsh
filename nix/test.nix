@@ -12,6 +12,11 @@ let
     ssh-keygen -q -t ed25519 -N "" -f $out/authority
     ssh-keygen -q -t ed25519 -N "" -f $out/host
     ssh-keygen -q -s $out/authority -h -I certified -n certified $out/host.pub
+    ssh-keygen -q -t ed25519 -N "" -f $out/user
+    cp $out/user $out/other
+    cp $out/user.pub $out/other.pub
+    ssh-keygen -q -s $out/authority -I alice -n alice $out/user.pub
+    ssh-keygen -q -s $out/authority -I bob -n bob $out/other.pub
   '';
 in
 testers.runNixOSTest {
@@ -26,6 +31,7 @@ testers.runNixOSTest {
       hostKey = "${keys}/host";
       hostCertificate = "${keys}/host-cert.pub";
       acceptEnv = [ "PROBE_*" ];
+      authorities = "${keys}/authority.pub";
     };
 
     users.users.alice.isNormalUser = true;
@@ -64,10 +70,9 @@ testers.runNixOSTest {
     client.succeed("mkdir -p /root/.ssh && ssh-keygen -q -t ed25519 -N ''' -f /root/.ssh/id_ed25519")
     key = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
 
-    for machine in [server, certified]:
-        machine.succeed("install -d -m 700 -o alice /home/alice/.ssh")
-        machine.succeed(f"echo '{key}' > /home/alice/.ssh/authorized_keys")
-        machine.succeed("chown alice /home/alice/.ssh/authorized_keys")
+    server.succeed("install -d -m 700 -o alice /home/alice/.ssh")
+    server.succeed(f"echo '{key}' > /home/alice/.ssh/authorized_keys")
+    server.succeed("chown alice /home/alice/.ssh/authorized_keys")
 
     host = server.succeed("cat /etc/ssh/ssh_host_ed25519_key.pub").split()
     client.succeed(f"echo 'server {host[0]} {host[1]}' > /root/.ssh/known_hosts")
@@ -84,12 +89,14 @@ testers.runNixOSTest {
     with subtest("an accepted environment variable reaches the session"):
         assert "LC_PROBE=sent" in client.succeed("qsh -o 'SetEnv LC_PROBE=sent' alice@server env")
 
-    with subtest("a host certificate stands in for a known host key"):
+    with subtest("certificates stand in for a known host key and a listed login key"):
         client.succeed("echo '@cert-authority certified '$(cat ${keys}/authority.pub) >> /root/.ssh/known_hosts")
-        assert "uid=1000(alice)" in client.succeed("qsh -o BatchMode=yes alice@certified id")
+        client.succeed("install -m 600 ${keys}/user* ${keys}/other* /root/")
+        assert "uid=1000(alice)" in client.succeed("qsh -o BatchMode=yes -i /root/user alice@certified id")
+        client.fail("qsh -o BatchMode=yes -i /root/other alice@certified id")
 
     with subtest("only the listed environment patterns are accepted"):
-        sent = client.succeed("qsh -o 'SetEnv PROBE_ONE=sent LC_PROBE=sent' alice@certified env")
+        sent = client.succeed("qsh -i /root/user -o 'SetEnv PROBE_ONE=sent LC_PROBE=sent' alice@certified env")
         assert "PROBE_ONE=sent" in sent
         assert "LC_PROBE" not in sent
 

@@ -83,8 +83,10 @@ afford to lose :)
   `ssh-agent` or `ssh-keygen`
 - User certificates. A `cert-authority` line in `authorized_keys` lets in
   every key that authority signed for the account, or for one of the line's
-  `principals=`. `qsh` finds the certificate beside the key, in the agent or
-  through `CertificateFile`
+  `principals=`. `qshd --authorities FILE` trusts the authorities in a file
+  for every account a certificate names, as `TrustedUserCAKeys` does in
+  `sshd`. `qsh` finds the certificate beside the key, in the agent or through
+  `CertificateFile`
 - Host certificates. `qshd --host-certificate` shows one, and a
   `@cert-authority` line in `known_hosts` makes `qsh` take it in place of an
   entry for the host

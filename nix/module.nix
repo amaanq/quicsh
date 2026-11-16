@@ -74,6 +74,16 @@ in
       '';
     };
 
+    authorities = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        Let in every key with a certificate that names the account and that
+        one of the authorities in this file signed. `sshd` calls the file
+        `TrustedUserCAKeys`.
+      '';
+    };
+
     sftpServer = lib.mkOption {
       type = lib.types.path;
       default = "${pkgs.openssh}/libexec/sftp-server";
@@ -164,6 +174,10 @@ in
           ++ lib.optionals (cfg.authorizedKeysFile != null) [
             "--authorized-keys"
             cfg.authorizedKeysFile
+          ]
+          ++ lib.optionals (cfg.authorities != null) [
+            "--authorities"
+            cfg.authorities
           ]
           ++ lib.optionals (cfg.hostCertificate != null) [
             "--host-certificate"
