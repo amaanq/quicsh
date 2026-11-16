@@ -113,28 +113,32 @@ impl Curve {
       }
    }
 
-   /// DER bytes that precede the point in a `SubjectPublicKeyInfo` document,
-   /// for the curves a host key may be on.
-   const fn spki_prefix(self) -> Option<&'static [u8]> {
+   /// DER bytes that precede the point in a `SubjectPublicKeyInfo` document.
+   const fn spki_prefix(self) -> &'static [u8] {
       match self {
          Self::P256 => {
-            Some(&[
+            &[
                0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01, 0x06,
                0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
-            ])
+            ]
          },
          Self::P384 => {
-            Some(&[
+            &[
                0x30, 0x76, 0x30, 0x10, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01, 0x06,
                0x05, 0x2B, 0x81, 0x04, 0x00, 0x22, 0x03, 0x62, 0x00,
-            ])
+            ]
          },
-         Self::P521 => None,
+         Self::P521 => {
+            &[
+               0x30, 0x81, 0x9B, 0x30, 0x10, 0x06, 0x07, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01,
+               0x06, 0x05, 0x2B, 0x81, 0x04, 0x00, 0x23, 0x03, 0x81, 0x86, 0x00,
+            ]
+         },
       }
    }
 
-   /// Content of the DER object identifier of the curve, for the curves a
-   /// host key may be on.
+   /// Content of the DER object identifier of the curve, for the curves
+   /// ring signs on.
    const fn identifier(self) -> Option<&'static [u8]> {
       match self {
          Self::P256 => Some(&[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]),
@@ -313,16 +317,16 @@ impl PublicKey {
    /// # Errors
    ///
    /// Fails when the structure is not the `SubjectPublicKeyInfo` of an
-   /// ed25519, P-256 or P-384 key.
+   /// ed25519 or ECDSA key.
    pub fn from_spki(der: &[u8]) -> Result<Self, Error> {
       if let Some(key) = der.strip_prefix(&SPKI_PREFIX) {
          return Ok(Self::Ed25519(key.try_into().map_err(|_| Error::KeyType)?));
       }
 
-      [Curve::P256, Curve::P384]
+      [Curve::P256, Curve::P384, Curve::P521]
          .into_iter()
          .find_map(|curve| {
-            let point = der.strip_prefix(curve.spki_prefix()?)?;
+            let point = der.strip_prefix(curve.spki_prefix())?;
 
             (point.len() == curve.width() * 2 + 1).then(|| {
                Self::Ecdsa {
@@ -332,6 +336,19 @@ impl PublicKey {
             })
          })
          .ok_or(Error::KeyType)
+   }
+
+   /// The key as the `SubjectPublicKeyInfo` document a TLS peer presents.
+   ///
+   /// # Errors
+   ///
+   /// Fails for a key type that cannot be a host key.
+   pub fn to_spki(&self) -> Result<Vec<u8>, Error> {
+      match *self {
+         Self::Ed25519(ref key) => Ok([&SPKI_PREFIX[..], key].concat()),
+         Self::Ecdsa { curve, ref point } => Ok([curve.spki_prefix(), point].concat()),
+         Self::SkEd25519 { .. } | Self::SkEcdsa { .. } | Self::Rsa { .. } => Err(Error::KeyType),
+      }
    }
 
    /// The SSH name of the key type.
@@ -501,18 +518,42 @@ impl Display for PublicKey {
    }
 }
 
-/// Reads the rest of an ECDSA private key into an RFC 5915 document.
-fn sec1(curve: Curve, private: &mut Reader<'_>) -> Result<PrivateKeyDer<'static>, Error> {
+/// A host key in the form its signer takes.
+pub enum HostKey {
+   /// A private key document that ring reads.
+   Document(PrivateKeyDer<'static>),
+   /// A P-521 key, which ring cannot sign with.
+   P521 {
+      /// The private number, 66 bytes.
+      scalar: Zeroizing<Vec<u8>>,
+      /// The uncompressed public point.
+      point:  Vec<u8>,
+   },
+}
+
+/// Reads the rest of an ECDSA private key, into an RFC 5915 document where
+/// ring signs on the curve.
+fn ecdsa(curve: Curve, private: &mut Reader<'_>) -> Result<HostKey, Error> {
    if Curve::named(private.string()?) != Some(curve) {
       return Err(Error::PrivateKey);
    }
 
    let point = private.string()?;
    let scalar = unsigned(private.string()?);
-   let identifier = curve.identifier().ok_or(Error::PrivateKey)?;
    let width = curve.width();
 
    let padding = width.checked_sub(scalar.len()).ok_or(Error::PrivateKey)?;
+
+   let Some(identifier) = curve.identifier() else {
+      let mut padded = Zeroizing::new(vec![0; padding]);
+      padded.extend_from_slice(scalar);
+
+      return Ok(HostKey::P521 {
+         scalar: padded,
+         point:  point.to_vec(),
+      });
+   };
+
    let byte = |length: usize| u8::try_from(length).map_err(|_| Error::PrivateKey);
 
    let mut body = Zeroizing::new(Vec::with_capacity(256));
@@ -547,18 +588,18 @@ fn sec1(curve: Curve, private: &mut Reader<'_>) -> Result<PrivateKeyDer<'static>
    document.push(byte(body.len())?);
    document.extend_from_slice(&body);
 
-   Ok(PrivateKeyDer::Sec1(PrivateSec1KeyDer::from(
-      document.to_vec(),
+   Ok(HostKey::Document(PrivateKeyDer::Sec1(
+      PrivateSec1KeyDer::from(document.to_vec()),
    )))
 }
 
-/// Reads an unencrypted OpenSSH private key file that holds an ed25519,
-/// P-256 or P-384 key.
+/// Reads an unencrypted OpenSSH private key file that holds an ed25519 or
+/// ECDSA key.
 ///
 /// # Errors
 ///
 /// Fails when the file is malformed, encrypted, or holds another key type.
-pub fn private_from_openssh(text: &str) -> Result<PrivateKeyDer<'static>, Error> {
+pub fn private_from_openssh(text: &str) -> Result<HostKey, Error> {
    let body = text
       .trim()
       .strip_prefix(PRIVATE_BEGIN)
@@ -587,7 +628,7 @@ pub fn private_from_openssh(text: &str) -> Result<PrivateKeyDer<'static>, Error>
 
    if name != ED25519_NAME {
       let curve = Curve::named(name).ok_or(Error::PrivateKey)?;
-      return sec1(curve, &mut private);
+      return ecdsa(curve, &mut private);
    }
 
    let _repeated = private.string()?;
@@ -596,8 +637,8 @@ pub fn private_from_openssh(text: &str) -> Result<PrivateKeyDer<'static>, Error>
    let mut pkcs8 = Zeroizing::new(PKCS8_PREFIX.to_vec());
    pkcs8.extend_from_slice(&pair[..32]);
 
-   Ok(PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
-      pkcs8.to_vec(),
+   Ok(HostKey::Document(PrivateKeyDer::Pkcs8(
+      PrivatePkcs8KeyDer::from(pkcs8.to_vec()),
    )))
 }
 

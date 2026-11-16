@@ -1,5 +1,14 @@
 use std::sync::Arc;
 
+use p521::ecdsa::{
+   Signature,
+   SigningKey as P521SigningKey,
+   VerifyingKey,
+   signature::{
+      Signer as _,
+      Verifier as _,
+   },
+};
 use quinn_proto::{
    Connection,
    crypto::rustls::{
@@ -8,10 +17,12 @@ use quinn_proto::{
    },
 };
 use rustls::{
+   CertificateError,
    CipherSuite,
    ClientConfig,
    DigitallySignedStruct,
    ServerConfig,
+   SignatureAlgorithm,
    SignatureScheme,
    client::danger::{
       HandshakeSignatureValid,
@@ -29,7 +40,6 @@ use rustls::{
    },
    pki_types::{
       CertificateDer,
-      PrivateKeyDer,
       ServerName,
       SubjectPublicKeyInfoDer,
       UnixTime,
@@ -37,6 +47,7 @@ use rustls::{
    server::AlwaysResolvesServerRawPublicKeys,
    sign::{
       CertifiedKey,
+      Signer,
       SigningKey,
    },
    version::TLS13,
@@ -47,6 +58,7 @@ use crate::{
    kex::X25519_MLKEM768,
    key::{
       Curve,
+      HostKey,
       PublicKey,
    },
 };
@@ -65,11 +77,15 @@ fn provider() -> Arc<CryptoProvider> {
 }
 
 /// The signature schemes a host key may use, one per key type.
-pub const HOST_SCHEMES: [SignatureScheme; 3] = [
+pub const HOST_SCHEMES: [SignatureScheme; 4] = [
    SignatureScheme::ED25519,
    SignatureScheme::ECDSA_NISTP256_SHA256,
    SignatureScheme::ECDSA_NISTP384_SHA384,
+   SignatureScheme::ECDSA_NISTP521_SHA512,
 ];
+
+/// Bytes in one number of a P-521 signature.
+const P521_WIDTH: usize = 66;
 
 /// The scheme a host key of this type signs handshakes with.
 ///
@@ -87,18 +103,143 @@ pub const fn scheme(key: &PublicKey) -> Result<SignatureScheme, Error> {
       } => Ok(SignatureScheme::ECDSA_NISTP384_SHA384),
       PublicKey::Ecdsa {
          curve: Curve::P521, ..
-      }
-      | PublicKey::SkEd25519 { .. }
-      | PublicKey::SkEcdsa { .. }
-      | PublicKey::Rsa { .. } => Err(Error::KeyType),
+      } => Ok(SignatureScheme::ECDSA_NISTP521_SHA512),
+      PublicKey::SkEd25519 { .. } | PublicKey::SkEcdsa { .. } | PublicKey::Rsa { .. } => {
+         Err(Error::KeyType)
+      },
    }
+}
+
+/// A P-521 host key. The ring provider has none, so the `p521` crate signs.
+#[derive(Debug)]
+struct P521Key {
+   /// The private half.
+   key:    Arc<P521SigningKey>,
+   /// The public half as a `SubjectPublicKeyInfo` document.
+   public: Vec<u8>,
+}
+
+impl SigningKey for P521Key {
+   fn choose_scheme(&self, offered: &[SignatureScheme]) -> Option<Box<dyn Signer>> {
+      offered
+         .contains(&SignatureScheme::ECDSA_NISTP521_SHA512)
+         .then(|| Box::new(P521Signer(Arc::clone(&self.key))) as Box<dyn Signer>)
+   }
+
+   fn public_key(&self) -> Option<SubjectPublicKeyInfoDer<'_>> {
+      Some(SubjectPublicKeyInfoDer::from(self.public.as_slice()))
+   }
+
+   fn algorithm(&self) -> SignatureAlgorithm {
+      SignatureAlgorithm::ECDSA
+   }
+}
+
+/// Signs one handshake with a [`P521Key`].
+#[derive(Debug)]
+struct P521Signer(Arc<P521SigningKey>);
+
+impl Signer for P521Signer {
+   fn sign(&self, message: &[u8]) -> Result<Vec<u8>, rustls::Error> {
+      let signature: Signature = self
+         .0
+         .try_sign(message)
+         .map_err(|_| rustls::Error::General("signing with the host key failed".into()))?;
+
+      let joined = signature.to_bytes();
+      let mut body = Vec::with_capacity(P521_WIDTH * 2 + 6);
+
+      // DER wants the shortest form of each number, with a zero in front of
+      // one whose top bit is set.
+      for number in joined.chunks(P521_WIDTH) {
+         let zeros = number.iter().take_while(|&&byte| byte == 0).count();
+         let digits = number.get(zeros..).unwrap_or_default();
+         let signed = digits.first().is_none_or(|&top| top >= 0x80);
+
+         body.push(0x02);
+         body.push(u8::try_from(digits.len() + usize::from(signed)).unwrap_or(u8::MAX));
+         body.extend(signed.then_some(0));
+         body.extend_from_slice(digits);
+      }
+
+      let mut document = vec![0x30];
+      document.extend((body.len() >= 0x80).then_some(0x81));
+      document.push(u8::try_from(body.len()).unwrap_or(u8::MAX));
+      document.extend_from_slice(&body);
+      Ok(document)
+   }
+
+   fn scheme(&self) -> SignatureScheme {
+      SignatureScheme::ECDSA_NISTP521_SHA512
+   }
+}
+
+/// Checks the DER signature of a TLS 1.3 handshake by the P-521 key in
+/// `spki`.
+fn verify_p521(message: &[u8], spki: &[u8], der: &[u8]) -> Option<()> {
+   let PublicKey::Ecdsa {
+      curve: Curve::P521,
+      ref point,
+   } = PublicKey::from_spki(spki).ok()?
+   else {
+      return None;
+   };
+
+   let (&long, rest) = der.strip_prefix(&[0x30])?.split_first()?;
+   let (&length, mut body) = if long == 0x81 {
+      rest.split_first()?
+   } else {
+      (&long, rest)
+   };
+
+   if usize::from(length) != body.len() {
+      return None;
+   }
+
+   let mut joined = Vec::with_capacity(P521_WIDTH * 2);
+
+   for _ in 0..2 {
+      let (&size, tail) = body.strip_prefix(&[0x02])?.split_first()?;
+      let (number, after) = tail.split_at_checked(size.into())?;
+      let zeros = number.iter().take_while(|&&byte| byte == 0).count();
+      let digits = number.get(zeros..)?;
+
+      joined.resize(joined.len() + P521_WIDTH.checked_sub(digits.len())?, 0);
+      joined.extend_from_slice(digits);
+      body = after;
+   }
+
+   if !body.is_empty() {
+      return None;
+   }
+
+   VerifyingKey::from_sec1_bytes(point)
+      .ok()?
+      .verify(message, &Signature::from_slice(&joined).ok()?)
+      .ok()
 }
 
 /// # Errors
 ///
-/// Fails when `key` is not a valid private key document.
-pub fn signing_key(key: &PrivateKeyDer<'_>) -> Result<Arc<dyn SigningKey>, Error> {
-   any_supported_type(key).map_err(Error::Tls)
+/// Fails when `key` is not a valid private key.
+pub fn signing_key(key: &HostKey) -> Result<Arc<dyn SigningKey>, Error> {
+   match *key {
+      HostKey::Document(ref document) => any_supported_type(document).map_err(Error::Tls),
+      HostKey::P521 {
+         ref scalar,
+         ref point,
+      } => {
+         let public = PublicKey::Ecdsa {
+            curve: Curve::P521,
+            point: point.clone(),
+         };
+
+         Ok(Arc::new(P521Key {
+            key:    Arc::new(P521SigningKey::from_slice(scalar).map_err(|_| Error::PrivateKey)?),
+            public: public.to_spki()?,
+         }))
+      },
+   }
 }
 
 /// Presents the public half of `signer` as an RFC 7250 raw public key.
@@ -192,12 +333,22 @@ impl ServerCertVerifier for AcceptAnyKey {
       cert: &CertificateDer<'_>,
       dss: &DigitallySignedStruct,
    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+      if dss.scheme == SignatureScheme::ECDSA_NISTP521_SHA512 {
+         return verify_p521(message, cert.as_ref(), dss.signature())
+            .map(|()| HandshakeSignatureValid::assertion())
+            .ok_or(rustls::Error::InvalidCertificate(
+               CertificateError::BadSignature,
+            ));
+      }
+
       let key = SubjectPublicKeyInfoDer::from(cert.as_ref());
       verify_tls13_signature_with_raw_key(message, &key, dss, &self.0)
    }
 
    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-      self.0.supported_schemes()
+      let mut schemes = self.0.supported_schemes();
+      schemes.push(SignatureScheme::ECDSA_NISTP521_SHA512);
+      schemes
    }
 
    fn requires_raw_public_keys(&self) -> bool {
