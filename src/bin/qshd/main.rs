@@ -15,7 +15,10 @@ use std::{
    time::Duration,
 };
 
-use misstep::Result;
+use misstep::{
+   Result,
+   ensure,
+};
 use pound::Parse as _;
 use quicsh::{
    DEFAULT_PORT,
@@ -49,6 +52,20 @@ fn main() -> Result<()> {
 
    match options.stage {
       None => {
+         for pattern in &options.authorized_keys {
+            let rest = pattern
+               .to_string_lossy()
+               .replace("%%", "")
+               .replace("%u", "")
+               .replace("%h", "");
+
+            ensure!(
+               !rest.contains('%'),
+               "--authorized-keys {} has a % that is not %u, %h or %%",
+               pattern.display()
+            );
+         }
+
          monitor::run(Settings {
             listen:           options
                .listen

@@ -181,8 +181,8 @@ pub struct Settings {
    pub host_key:         PathBuf,
    /// Path of the host certificate.
    pub host_certificate: Option<PathBuf>,
-   /// File that replaces every account's own `authorized_keys`.
-   pub authorized_keys:  Option<PathBuf>,
+   /// Files that replace every account's own `authorized_keys`.
+   pub authorized_keys:  Vec<PathBuf>,
    /// File of the authorities whose certificates let an account in.
    pub authorities:      Option<PathBuf>,
    /// Program behind the `sftp` subsystem.
@@ -213,8 +213,8 @@ struct Monitor {
    listen:          SocketAddr,
    /// The listening socket, until the network process takes it.
    listener:        Option<OwnedFd>,
-   /// File that replaces every account's own `authorized_keys`.
-   authorized_keys: Option<PathBuf>,
+   /// Files that replace every account's own `authorized_keys`.
+   authorized_keys: Vec<PathBuf>,
    /// File of the authorities whose certificates let an account in.
    authorities:     Option<PathBuf>,
    /// Program behind the `sftp` subsystem.
@@ -285,8 +285,6 @@ impl Monitor {
          return Ok(Reply::Denied);
       }
 
-      let keys_file = self.authorized_keys.as_deref();
-
       // A clock that cannot be read makes every `expiry-time` count as past.
       let attempt = Attempt {
          remote,
@@ -297,7 +295,7 @@ impl Monitor {
          certificate: login.certificate.as_deref(),
       };
 
-      let listed = account.authorizes(&login.key, keys_file, &attempt)?;
+      let listed = account.authorizes(&login.key, &self.authorized_keys, &attempt)?;
 
       let trusted = match self.authorities {
          Some(ref authorities) if listed.is_none() => {

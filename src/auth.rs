@@ -9,11 +9,18 @@
 //!   agent.
 
 use std::{
+   ffi::OsString,
    fs,
    io,
    iter,
    net::IpAddr,
-   os::unix::fs::MetadataExt as _,
+   os::unix::{
+      ffi::{
+         OsStrExt as _,
+         OsStringExt as _,
+      },
+      fs::MetadataExt as _,
+   },
    path::{
       Path,
       PathBuf,
@@ -235,9 +242,12 @@ impl Account {
 
    /// Whether `key` may log in to this account.
    ///
-   /// The default file is `~/.ssh/authorized_keys`, and it is ignored unless
-   /// only the account or root can write it and its parent directories.
-   /// `keys_file` names a file the server operator vouches for instead.
+   /// `keys_files` are read in order, `~/.ssh/authorized_keys` without any.
+   /// `%u` in one stands for the account's name, `%h` for its home and `%%`
+   /// for `%`, as in sshd's `AuthorizedKeysFile`. A file inside the home is
+   /// ignored unless only the account or root can write it and every
+   /// directory up to the home, and one elsewhere is a file the server
+   /// operator vouches for.
    ///
    /// The answer is what the first line that lists `key` and applies to
    /// `attempt` permits. A `cert-authority` line lists every key that the
@@ -252,29 +262,69 @@ impl Account {
    pub fn authorizes(
       &self,
       key: &PublicKey,
-      keys_file: Option<&Path>,
+      keys_files: &[PathBuf],
       attempt: &Attempt<'_>,
    ) -> Result<Option<Permit>, Error> {
-      let default = self.home.join(".ssh/authorized_keys");
-
-      let guarded = [self.home.as_path(), &self.home.join(".ssh"), &default];
-
-      if keys_file.is_none() && !guarded.iter().all(|path| self.controls(path)) {
-         return Ok(None);
-      }
-
-      let path = keys_file.unwrap_or(&default);
-
-      let text = match fs::read_to_string(path) {
-         Ok(text) => text,
-         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-         Err(error) => return Err(Error::AuthorizedKeys(error)),
+      let default = [self.home.join(".ssh/authorized_keys")];
+      let patterns = if keys_files.is_empty() {
+         &default[..]
+      } else {
+         keys_files
       };
 
-      Ok(text
-         .lines()
-         .filter_map(entry)
-         .find_map(|(options, listed)| Permit::parse(options, &listed, (&self.name, key), attempt)))
+      for pattern in patterns {
+         let path = self.expand(pattern);
+
+         let guarded = path.starts_with(&self.home)
+            && !path
+               .ancestors()
+               .take_while(|dir| dir.starts_with(&self.home))
+               .all(|dir| self.controls(dir));
+
+         if guarded {
+            continue;
+         }
+
+         let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(Error::AuthorizedKeys(error)),
+         };
+
+         let permit = text
+            .lines()
+            .filter_map(entry)
+            .find_map(|(options, listed)| {
+               Permit::parse(options, &listed, (&self.name, key), attempt)
+            });
+
+         if permit.is_some() {
+            return Ok(permit);
+         }
+      }
+
+      Ok(None)
+   }
+
+   /// `pattern` with its `%u`, `%h` and `%%` filled in.
+   fn expand(&self, pattern: &Path) -> PathBuf {
+      let mut expanded = Vec::new();
+      let mut bytes = pattern.as_os_str().as_bytes().iter().copied();
+
+      while let Some(byte) = bytes.next() {
+         if byte != b'%' {
+            expanded.push(byte);
+            continue;
+         }
+
+         match bytes.next() {
+            Some(b'u') => expanded.extend_from_slice(self.name.as_bytes()),
+            Some(b'h') => expanded.extend_from_slice(self.home.as_os_str().as_bytes()),
+            _ => expanded.push(b'%'),
+         }
+      }
+
+      PathBuf::from(OsString::from_vec(expanded))
    }
 
    /// Whether one of the `authorities`, a file with a key on each line,
@@ -700,6 +750,7 @@ mod tests {
       net::IpAddr,
       path::PathBuf,
       process,
+      slice,
    };
 
    use ring::signature::{
@@ -793,7 +844,9 @@ mod tests {
             certificate: None,
          };
 
-         account.authorizes(key, Some(&path), &attempt).unwrap()
+         account
+            .authorizes(key, slice::from_ref(&path), &attempt)
+            .unwrap()
       };
       let check = |key, remote| at(key, remote, noon - 86_400 * 2);
 

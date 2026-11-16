@@ -65,12 +65,17 @@ in
       '';
     };
 
-    authorizedKeysFile = lib.mkOption {
-      type = lib.types.nullOr lib.types.path;
-      default = null;
+    authorizedKeysFiles = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [
+        "%h/.ssh/authorized_keys"
+        "/etc/ssh/authorized_keys.d/%u"
+      ];
       description = ''
-        Check every login against this file. By default each account's own
-        `~/.ssh/authorized_keys` decides.
+        The files that list who may log in, read in order. `%u` stands for the
+        account's name, `%h` for its home and `%%` for `%`. The default adds
+        the files `users.users.<name>.openssh.authorizedKeys` writes to each
+        account's own `~/.ssh/authorized_keys`, as sshd does on NixOS.
       '';
     };
 
@@ -171,10 +176,11 @@ in
             "--sftp-server"
             cfg.sftpServer
           ]
-          ++ lib.optionals (cfg.authorizedKeysFile != null) [
+          # systemd reads % in ExecStart as its own specifiers
+          ++ lib.concatMap (file: [
             "--authorized-keys"
-            cfg.authorizedKeysFile
-          ]
+            (lib.replaceStrings [ "%" ] [ "%%" ] file)
+          ]) cfg.authorizedKeysFiles
           ++ lib.optionals (cfg.authorities != null) [
             "--authorities"
             cfg.authorities

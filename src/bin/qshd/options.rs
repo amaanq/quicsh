@@ -27,9 +27,11 @@ pub struct Options {
    /// for this host.
    #[pound(long, value_name = "FILE")]
    pub host_certificate: Option<PathBuf>,
-   /// Check every login against FILE instead of each account's own key file.
+   /// Check logins against FILE instead of each account's own key file,
+   /// with %u for the account's name, %h for its home and %% for %. Every
+   /// FILE given is read in order.
    #[pound(long, value_name = "FILE")]
-   pub authorized_keys:  Option<PathBuf>,
+   pub authorized_keys:  Vec<PathBuf>,
    /// Let in every key with a certificate that names the account and that
    /// one of the authorities in FILE signed. sshd calls the file
    /// `TrustedUserCAKeys`.
