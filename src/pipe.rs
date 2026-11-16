@@ -335,17 +335,41 @@ pub fn receive_message(
    Ok(Some((bytes, descriptors)))
 }
 
+/// The thread of a [`writer`].
+pub struct Writing {
+   /// Ends with the bytes the sink is still owed.
+   thread: JoinHandle<Vec<u8>>,
+   /// Set before the wake that follows the last write.
+   done:   Arc<AtomicBool>,
+}
+
+impl Writing {
+   /// Whether the sink is closed. The thread still counts as running for
+   /// a moment after its last wake, so its handle cannot answer this.
+   #[must_use]
+   pub fn done(&self) -> bool {
+      self.done.load(Ordering::SeqCst)
+   }
+
+   /// Waits for the last write and returns what a sink that took no more
+   /// after [`halt`] is still owed.
+   #[must_use]
+   pub fn owed(self) -> Vec<u8> {
+      self.thread.join().unwrap_or_default()
+   }
+}
+
 /// Writes every chunk sent to it and closes `sink` once the sender is dropped.
-/// The handle finishes after the last write, with the bytes a sink that
-/// took no more after [`halt`] is still owed.
 #[must_use]
-pub fn writer<Sink>(mut sink: Sink, waker: Arc<Waker>) -> (SyncSender<Bytes>, JoinHandle<Vec<u8>>)
+pub fn writer<Sink>(mut sink: Sink, waker: Arc<Waker>) -> (SyncSender<Bytes>, Writing)
 where
    Sink: Write + AsFd + Send + 'static,
 {
    let (sender, chunks) = sync_channel::<Bytes>(QUEUE);
+   let done = Arc::new(AtomicBool::new(false));
+   let closed = Arc::clone(&done);
 
-   let handle = thread::spawn(move || {
+   let thread = thread::spawn(move || {
       let mut owed = Vec::new();
 
       'chunks: while let Ok(chunk) = chunks.recv() {
@@ -372,9 +396,10 @@ where
       }
 
       drop(sink);
+      closed.store(true, Ordering::SeqCst);
       waker.wake();
       owed
    });
 
-   (sender, handle)
+   (sender, Writing { thread, done })
 }

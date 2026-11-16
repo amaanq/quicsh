@@ -18,7 +18,6 @@ use std::{
          TrySendError,
       },
    },
-   thread::JoinHandle,
 };
 
 use bytes::{
@@ -46,6 +45,7 @@ use crate::{
    pipe::{
       SendHalf,
       Waker,
+      Writing,
       reader,
       writer,
    },
@@ -192,7 +192,7 @@ pub struct Relay {
    /// Kept so that dropping the relay unblocks the thread reading the socket.
    socket:    Option<OwnedFd>,
    /// The thread that writes to the socket.
-   writing:   Option<JoinHandle<Vec<u8>>>,
+   writing:   Option<Writing>,
 }
 
 impl Drop for Relay {
@@ -279,11 +279,7 @@ impl Relay {
       let mut tail = self.tail.take()?;
       let closed = self.inbound.take().is_none();
 
-      let mut owed = self
-         .writing
-         .take()
-         .and_then(|writing| writing.join().ok())
-         .unwrap_or_default();
+      let mut owed = self.writing.take().map_or_default(Writing::owed);
 
       for chunk in self.unwritten.drain(..) {
          owed.extend_from_slice(&chunk);

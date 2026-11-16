@@ -17,7 +17,6 @@ use std::{
          channel,
       },
    },
-   thread::JoinHandle,
 };
 
 use bytes::Bytes;
@@ -38,6 +37,7 @@ use quicsh::{
    pipe::{
       Filter,
       Waker,
+      Writing,
       reader_until,
       writer,
    },
@@ -224,7 +224,7 @@ pub struct Channel {
    /// The terminal size last sent to the server.
    size:     Option<Size>,
    /// Threads still writing to standard output and error.
-   writers:  Vec<JoinHandle<Vec<u8>>>,
+   writers:  Vec<Writing>,
    /// Exit status of the remote command.
    status:   Option<u32>,
    /// The escape character for a session on a terminal.
@@ -722,7 +722,7 @@ impl Channel {
       let flushed = self.relay.as_ref().is_none_or(Relay::received_all)
          && self.orphan.is_none()
          && self.errors.as_ref().is_none_or(Relay::received_all)
-         && self.writers.iter().all(JoinHandle::is_finished);
+         && self.writers.iter().all(Writing::done);
 
       self.status.filter(|_| flushed)
    }
