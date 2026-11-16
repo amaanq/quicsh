@@ -258,8 +258,8 @@ network, which leaves 1372 bytes per packet, and the CPU time is the client's.
 
 | Path            | Tool  | `true` | Upload      | Download    | CPU per GB   |
 | --------------- | ----- | ------ | ----------- | ----------- | ------------ |
-| LAN             | `qsh` | 41 ms  | 2.09 Gbit/s | 1.74 Gbit/s | 1.2 to 1.3 s |
-| LAN             | `ssh` | 108 ms | 1.80 Gbit/s | 1.92 Gbit/s | 1.0 to 1.1 s |
+| LAN             | `qsh` | 42 ms  | 1.64 Gbit/s | 1.73 Gbit/s | 1.2 to 1.4 s |
+| LAN             | `ssh` | 108 ms | 1.91 Gbit/s | 1.85 Gbit/s | 1.0 to 1.1 s |
 | VPS, 12 ms away | `qsh` | 98 ms  | 0.50 Gbit/s | 1.39 Gbit/s | 2.1 to 2.3 s |
 | VPS, 12 ms away | `ssh` | 279 ms | 0.60 Gbit/s | 0.73 Gbit/s | 1.2 to 1.4 s |
 
@@ -273,15 +273,14 @@ beside an upload, as the median and the 95th percentile.
 
 | Path            | Tool  | Alone   | Beside an upload | 95th percentile |
 | --------------- | ----- | ------- | ---------------- | --------------- |
-| LAN             | `qsh` | 0.4 ms  | 1.4 ms           | 4 ms            |
-| LAN             | `ssh` | 0.3 ms  | 5.4 ms           | 27 ms           |
+| LAN             | `qsh` | 0.5 ms  | 1.4 ms           | 9 ms            |
+| LAN             | `ssh` | 0.3 ms  | 6.1 ms           | 51 ms           |
 | VPS, 12 ms away | `qsh` | 12.4 ms | 14.0 ms          | 27 ms           |
 | VPS, 12 ms away | `ssh` | 12.1 ms | 29.7 ms          | 68 ms           |
 
 BBR is why a connection starts on Cubic. With it the same keystroke took 28
-to 59 ms beside the upload to the VPS. These rows predate the switch between
-the two. The VPS path rarely triggers it, and on the LAN both controllers
-measure the same.
+to 59 ms beside the upload to the VPS. The VPS rows predate the switch
+between the two, which that path rarely triggers.
 
 `bench.nu` takes those measurements between two machines. It runs `qsh` and
 `ssh` in turns against a host that has both servers and prints the medians.
