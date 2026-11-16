@@ -9,7 +9,10 @@
 
 use std::{
    fs::File,
-   net::SocketAddr,
+   net::{
+      IpAddr,
+      SocketAddr,
+   },
    os::fd::{
       AsFd as _,
       BorrowedFd,
@@ -138,9 +141,13 @@ pub enum Request {
    /// Asks for a new session.
    Spawn {
       /// The login the session runs as.
-      grant: u64,
+      grant:  u64,
       /// What the client asked to run.
-      open:  Open,
+      open:   Open,
+      /// Where the client is.
+      remote: SocketAddr,
+      /// The address the client reached, `None` when the kernel did not say.
+      local:  Option<IpAddr>,
    },
    /// Ends a login.
    Logout {
@@ -279,6 +286,29 @@ fn put_address(out: &mut Vec<u8>, address: SocketAddr) {
    put_string(out, address.to_string().as_bytes());
 }
 
+/// Writes an IP address that may be missing, as text or as nothing.
+fn put_ip(out: &mut Vec<u8>, ip: Option<IpAddr>) {
+   put_string(
+      out,
+      ip.map_or_else(String::new, |known| known.to_string())
+         .as_bytes(),
+   );
+}
+
+/// Reads what [`put_ip`] wrote.
+fn ip(reader: &mut Reader<'_>) -> Result<Option<IpAddr>, Error> {
+   match reader.string()? {
+      b"" => Ok(None),
+      text => {
+         str::from_utf8(text)
+            .ok()
+            .and_then(|known| known.parse().ok())
+            .map(Some)
+            .ok_or(Error::Frame)
+      },
+   }
+}
+
 /// Reads a 64-bit number.
 fn u64_from(reader: &mut Reader<'_>) -> Result<u64, Error> {
    Ok(u64::from_be_bytes(reader.array()?))
@@ -318,9 +348,16 @@ impl Request {
             put_address(&mut out, remote);
             out.extend_from_slice(&Message::Request(login).encode());
          },
-         Self::Spawn { grant, open } => {
+         Self::Spawn {
+            grant,
+            open,
+            remote,
+            local,
+         } => {
             out.push(SPAWN);
             put_u64(&mut out, grant);
+            put_address(&mut out, remote);
+            put_ip(&mut out, local);
             out.extend_from_slice(&Message::Open(open).encode());
          },
          Self::Logout { grant } => {
@@ -400,12 +437,19 @@ impl Request {
          },
          SPAWN => {
             let grant = u64_from(&mut reader)?;
+            let remote = address(&mut reader)?;
+            let local = ip(&mut reader)?;
 
             let Message::Open(open) = Message::decode(reader.string()?)? else {
                return Err(Error::Frame);
             };
 
-            Self::Spawn { grant, open }
+            Self::Spawn {
+               grant,
+               open,
+               remote,
+               local,
+            }
          },
          LOGOUT => {
             Self::Logout {
@@ -763,9 +807,20 @@ impl Helper {
 
    /// Asks the monitor to start a session, or for the terminal session that
    /// already has the name the client asked for.
-   pub fn spawn(&self, grant: u64, open: Open) -> Result<Held> {
+   pub fn spawn(
+      &self,
+      grant: u64,
+      open: Open,
+      remote: SocketAddr,
+      local: Option<IpAddr>,
+   ) -> Result<Held> {
       self
-         .held(Request::Spawn { grant, open })?
+         .held(Request::Spawn {
+            grant,
+            open,
+            remote,
+            local,
+         })?
          .context("the monitor started no session")
    }
 

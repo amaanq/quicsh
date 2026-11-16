@@ -525,6 +525,23 @@ impl Monitor {
       Ok(())
    }
 
+   /// Tells a holder where its client is, in sshd's `SSH_CLIENT` and
+   /// `SSH_CONNECTION`.
+   fn origin(&self, command: &mut Command, remote: SocketAddr, local: Option<IpAddr>) {
+      let (client, port) = (remote.ip().to_canonical(), self.listen.port());
+      let server = local.unwrap_or_else(|| self.listen.ip()).to_canonical();
+
+      command
+         .env(
+            format!("{SESSION_ENVIRONMENT}SSH_CLIENT"),
+            format!("{client} {} {port}", remote.port()),
+         )
+         .env(
+            format!("{SESSION_ENVIRONMENT}SSH_CONNECTION"),
+            format!("{client} {} {server} {port}", remote.port()),
+         );
+   }
+
    /// The command line the client asked for, or `None` for the shell alone.
    fn command(&self, program: &Program) -> Result<Option<String>> {
       Ok(match *program {
@@ -557,7 +574,13 @@ impl Monitor {
    /// Starts a holder process with a session for the grant's account. The
    /// holder listens on a socket made here, since it gives up root and could
    /// not make one in a directory only root can enter.
-   fn spawn(&self, id: u64, open: &Open) -> Result<(Reply, Vec<OwnedFd>)> {
+   fn spawn(
+      &self,
+      id: u64,
+      open: &Open,
+      remote: SocketAddr,
+      local: Option<IpAddr>,
+   ) -> Result<(Reply, Vec<OwnedFd>)> {
       let grant = self.grants.get(&id).context("unknown grant")?;
       ensure!(
          open.terminal.is_none() || grant.permit.terminal,
@@ -650,6 +673,10 @@ impl Monitor {
             command.env(format!("{SESSION_ENVIRONMENT}{name}"), value);
          }
       }
+
+      // After the client's own, as sshd sets them, so SetEnv cannot forge
+      // where a session came from.
+      self.origin(&mut command, remote, local);
 
       let mut child = command
          .stdin(listener)
@@ -897,7 +924,12 @@ impl Monitor {
             exporter,
             remote,
          } => plain(self.login(&login, &exporter, remote.ip().to_canonical())?),
-         Request::Spawn { grant, open } => self.spawn(grant, &open),
+         Request::Spawn {
+            grant,
+            open,
+            remote,
+            local,
+         } => self.spawn(grant, &open, remote, local),
          Request::Logout { grant } => {
             self.grants.remove(&grant);
             plain(Reply::Done)

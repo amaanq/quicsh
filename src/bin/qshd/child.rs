@@ -7,12 +7,16 @@
 use std::{
    convert::Infallible,
    env,
+   ffi::OsStr,
    io,
    os::{
       fd::AsFd as _,
-      unix::process::{
-         CommandExt as _,
-         ExitStatusExt as _,
+      unix::{
+         ffi::OsStrExt as _,
+         process::{
+            CommandExt as _,
+            ExitStatusExt as _,
+         },
       },
    },
    path::{
@@ -74,6 +78,7 @@ use rustix::{
       set_parent_process_death_signal,
       setsid,
    },
+   termios::ttyname,
    thread::{
       set_thread_gid,
       set_thread_groups,
@@ -276,6 +281,10 @@ impl Launch {
 
       if let Some(ref terminal) = self.terminal {
          shell.env("TERM", terminal);
+         shell.env(
+            "SSH_TTY",
+            OsStr::from_bytes(ttyname(io::stdin(), Vec::new())?.as_bytes()),
+         );
       }
 
       if let Some(ref agent) = self.agent {

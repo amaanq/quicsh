@@ -726,7 +726,7 @@ impl Server {
       let label = open.session;
       let size = open.terminal.as_ref().map(|terminal| terminal.size);
 
-      let held = match helper.spawn(grant, open) {
+      let held = match helper.spawn(grant, open, origin(connection), connection.local_ip()) {
          Ok(started) => started,
          Err(error) => {
             let reason = format!("{error}");
