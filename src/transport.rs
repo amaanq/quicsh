@@ -637,6 +637,12 @@ impl Session {
          return None;
       };
 
+      // The endpoint has forgotten a connection that timed out, and panics
+      // on the reset token a move to a new socket would hand it.
+      if self.connection.is_drained() {
+         return None;
+      }
+
       let patience = probe.patience.max(self.connection.rtt() * 3);
       let due = probe.unanswered? + patience;
 
