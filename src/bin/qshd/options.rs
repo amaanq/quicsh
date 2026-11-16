@@ -37,10 +37,14 @@ pub struct Options {
    /// `TrustedUserCAKeys`.
    #[pound(long, value_name = "FILE")]
    pub authorities:      Option<PathBuf>,
-   /// Let every account but root log in with a password, which the PAM
-   /// service NAME checks. Without the option only keys log in.
+   /// Ask the PAM service NAME whether an account may be used, and open
+   /// every session through it, as sshd does with `UsePAM`.
    #[pound(long, value_name = "NAME")]
    pub pam:              Option<String>,
+   /// Let every account but root log in with a password, which the
+   /// service of --pam checks. Without the option only keys log in.
+   #[pound(long)]
+   pub passwords:        bool,
    /// The program behind the sftp subsystem, which scp and sftp ask for.
    /// Without it, the usual places for OpenSSH's sftp-server are tried.
    #[pound(long, value_name = "FILE")]
@@ -99,6 +103,9 @@ pub enum Stage {
       /// Seconds a session on pipes waits for a client that went silent.
       #[pound(long)]
       patience:         Option<u64>,
+      /// The PAM service to open the session through.
+      #[pound(long)]
+      pam:              Option<String>,
    },
    /// Asks PAM whether an account may log in. Its questions leave on
    /// standard input, a socket, and the answers arrive there.
@@ -112,6 +119,9 @@ pub enum Stage {
       /// Where the client is.
       #[pound(long)]
       remote:  String,
+      /// Ask only whether the account may be used, and no questions.
+      #[pound(long)]
+      account: bool,
    },
    /// Connects to a Unix socket or listens on one as an account, and passes
    /// the result to standard input.

@@ -22,8 +22,14 @@ const SUCCESS: c_int = 0;
 const BUFFER_ERROR: c_int = 5;
 /// `PAM_CONV_ERR`.
 const CONVERSATION_ERROR: c_int = 19;
+/// `PAM_TTY`.
+const TERMINAL: c_int = 3;
 /// `PAM_RHOST`.
 const REMOTE_HOST: c_int = 4;
+/// `PAM_ESTABLISH_CRED`.
+const ESTABLISH: c_int = 2;
+/// `PAM_DELETE_CRED`.
+const DELETE: c_int = 4;
 /// `PAM_DISALLOW_NULL_AUTHTOK`, which keeps out an account with an empty
 /// password.
 const NO_EMPTY_PASSWORD: c_int = 1;
@@ -62,6 +68,10 @@ unsafe extern "C" {
    fn pam_set_item(handle: *mut c_void, item: c_int, value: *const c_void) -> c_int;
    fn pam_authenticate(handle: *mut c_void, flags: c_int) -> c_int;
    fn pam_acct_mgmt(handle: *mut c_void, flags: c_int) -> c_int;
+   fn pam_setcred(handle: *mut c_void, flags: c_int) -> c_int;
+   fn pam_open_session(handle: *mut c_void, flags: c_int) -> c_int;
+   fn pam_close_session(handle: *mut c_void, flags: c_int) -> c_int;
+   fn pam_getenvlist(handle: *mut c_void) -> *mut *mut c_char;
    fn pam_end(handle: *mut c_void, status: c_int) -> c_int;
    fn pam_strerror(handle: *mut c_void, code: c_int) -> *const c_char;
 }
@@ -163,29 +173,25 @@ unsafe fn put(ask: Ask<'_>, message: &Message) -> Option<*mut c_char> {
    (!copy.is_null()).then_some(copy)
 }
 
-/// PAM's conversation function, which hands each message to the [`Ask`]
-/// that `data` points to.
-extern "C" fn converse(
+/// Shows every message of one round and hands PAM the answers.
+///
+/// # Safety
+///
+/// `messages` and `responses` are what PAM passed to a conversation
+/// function along with `count`.
+unsafe fn exchange(
    count: c_int,
    messages: *const *const Message,
    responses: *mut *mut Response,
-   data: *mut c_void,
+   ask: Ask<'_>,
 ) -> c_int {
    let Ok(count) = usize::try_from(count) else {
       return CONVERSATION_ERROR;
    };
 
-   if !(1..=MAX_MESSAGES).contains(&count)
-      || messages.is_null()
-      || responses.is_null()
-      || data.is_null()
-   {
+   if !(1..=MAX_MESSAGES).contains(&count) || messages.is_null() || responses.is_null() {
       return CONVERSATION_ERROR;
    }
-
-   // SAFETY: `login` passes a pointer to an `Ask` that outlives the PAM
-   // handle, and PAM calls this function from the thread `login` runs on.
-   let ask = unsafe { &mut *data.cast::<Ask<'_>>() };
 
    // SAFETY: the call takes no pointers.
    let answers = unsafe { calloc(count, size_of::<Response>()) }.cast::<Response>();
@@ -200,7 +206,7 @@ extern "C" fn converse(
       let (message, slot) = unsafe { (&**messages.add(index), &mut *answers.add(index)) };
 
       // SAFETY: PAM ends each message's text in a zero byte.
-      if let Some(copy) = unsafe { put(&mut **ask, message) } {
+      if let Some(copy) = unsafe { put(&mut *ask, message) } {
          slot.text = copy;
          continue;
       }
@@ -222,6 +228,155 @@ extern "C" fn converse(
    SUCCESS
 }
 
+/// The conversation function of [`login`], which hands each message to the
+/// [`Ask`] that `data` points to.
+extern "C" fn converse(
+   count: c_int,
+   messages: *const *const Message,
+   responses: *mut *mut Response,
+   data: *mut c_void,
+) -> c_int {
+   if data.is_null() {
+      return CONVERSATION_ERROR;
+   }
+
+   // SAFETY: `login` passes a pointer to an `Ask` that outlives the PAM
+   // handle, and PAM calls this function from the thread `login` runs on.
+   let ask = unsafe { &mut *data.cast::<Ask<'_>>() };
+
+   // SAFETY: the three values are PAM's.
+   unsafe { exchange(count, messages, responses, &mut **ask) }
+}
+
+/// The conversation function where nobody can be asked. Notices pass
+/// unseen and a question fails.
+extern "C" fn quiet(
+   count: c_int,
+   messages: *const *const Message,
+   responses: *mut *mut Response,
+   _data: *mut c_void,
+) -> c_int {
+   // SAFETY: the three values are PAM's.
+   unsafe {
+      exchange(count, messages, responses, &mut |style, _| {
+         (!style.asks()).then(String::new)
+      })
+   }
+}
+
+/// One use of a PAM service for one user, which ends when this is dropped.
+struct Handle {
+   raw:    *mut c_void,
+   /// What the last PAM call returned, which PAM wants to hear at the end.
+   status: c_int,
+}
+
+impl Handle {
+   /// Starts on the service for `user` at `remote`. PAM copies the
+   /// conversation, and whatever its `data` points to must outlive the
+   /// handle.
+   fn start(
+      service: &str,
+      user: &str,
+      remote: &str,
+      conversation: &Conversation,
+   ) -> Result<Self, Refusal> {
+      let (service, user, remote) = (named(service)?, named(user)?, named(remote)?);
+      let mut raw = ptr::null_mut();
+
+      // SAFETY: the pointers are live and PAM copies what they point to.
+      let started =
+         unsafe { pam_start(service.as_ptr(), user.as_ptr(), conversation, &raw mut raw) };
+
+      if started != SUCCESS || raw.is_null() {
+         return Err(Refusal(format!("PAM did not start, code {started}")));
+      }
+
+      let mut handle = Self {
+         raw,
+         status: SUCCESS,
+      };
+
+      handle.set(REMOTE_HOST, &remote)?;
+      Ok(handle)
+   }
+
+   /// Gives PAM one of the strings it keeps about the user.
+   fn set(&mut self, item: c_int, value: &CStr) -> Result<(), Refusal> {
+      // SAFETY: the handle is live and PAM copies the string.
+      self.took(unsafe { pam_set_item(self.raw, item, value.as_ptr().cast()) })
+   }
+
+   /// Notes what a PAM call returned and turns a failure into its reason.
+   fn took(&mut self, code: c_int) -> Result<(), Refusal> {
+      self.status = code;
+
+      if code == SUCCESS {
+         return Ok(());
+      }
+
+      // SAFETY: PAM returns a string that lives as long as the library, or
+      // null.
+      let reason = unsafe { pam_strerror(self.raw, code) };
+
+      if reason.is_null() {
+         return Err(Refusal(format!("PAM code {code}")));
+      }
+
+      // SAFETY: the string ends in a zero byte.
+      let text = unsafe { CStr::from_ptr(reason) };
+      Err(Refusal(text.to_string_lossy().into_owned()))
+   }
+
+   /// The variables PAM's modules want in the user's environment.
+   fn environment(&self) -> Vec<(String, String)> {
+      // SAFETY: the handle is live.
+      let list = unsafe { pam_getenvlist(self.raw) };
+      let mut variables = Vec::new();
+
+      if list.is_null() {
+         return variables;
+      }
+
+      for index in 0.. {
+         // SAFETY: the list ends in a null pointer, and nothing reads past
+         // it.
+         let entry = unsafe { *list.add(index) };
+
+         if entry.is_null() {
+            break;
+         }
+
+         // SAFETY: each entry ends in a zero byte.
+         let text = unsafe { CStr::from_ptr(entry) }.to_string_lossy();
+
+         if let Some((name, value)) = text.split_once('=') {
+            variables.push((name.to_owned(), value.to_owned()));
+         }
+
+         // SAFETY: the caller of `pam_getenvlist` owns each entry.
+         unsafe { free(entry.cast()) };
+      }
+
+      // SAFETY: the caller of `pam_getenvlist` owns the list.
+      unsafe { free(list.cast()) };
+
+      variables
+   }
+}
+
+impl Drop for Handle {
+   fn drop(&mut self) {
+      // SAFETY: the handle is live and is not used again.
+      unsafe { pam_end(self.raw, self.status) };
+   }
+}
+
+/// A name as PAM takes it.
+fn named(text: &str) -> Result<CString, Refusal> {
+   CString::new(text).map_err(|_| Refusal("a name holds a zero byte".to_owned()))
+}
+
 /// Asks the PAM service whether `user` may log in from `remote`. `ask` gets
 /// every question and notice, and returning `None` to a question ends the
 /// login.
@@ -235,66 +390,88 @@ pub fn login(
    remote: &str,
    mut ask: impl FnMut(Style, &str) -> Option<String>,
 ) -> Result<(), Refusal> {
-   let named =
-      |text: &str| CString::new(text).map_err(|_| Refusal("a name holds a zero byte".to_owned()));
-   let (service, user, remote) = (named(service)?, named(user)?, named(remote)?);
-
    let mut asking: Ask<'_> = &mut ask;
    let conversation = Conversation {
       callback: converse,
       data:     (&raw mut asking).cast(),
    };
-   let mut handle = ptr::null_mut();
 
-   // SAFETY: the three pointers are live, and PAM copies the conversation.
-   let started = unsafe {
-      pam_start(
-         service.as_ptr(),
-         user.as_ptr(),
-         &raw const conversation,
-         &raw mut handle,
-      )
+   // `asking` is declared first, so it outlives the handle.
+   let mut handle = Handle::start(service, user, remote, &conversation)?;
+
+   // SAFETY: the handle is live.
+   handle.took(unsafe { pam_authenticate(handle.raw, NO_EMPTY_PASSWORD) })?;
+   // SAFETY: the handle is live.
+   handle.took(unsafe { pam_acct_mgmt(handle.raw, NO_EMPTY_PASSWORD) })
+}
+
+/// Asks the PAM service whether the account of `user`, who proved who they
+/// are in another way, may be used from `remote`.
+///
+/// # Errors
+///
+/// Fails when PAM refuses the account, which may be locked or past its
+/// end, or cannot start.
+pub fn permitted(service: &str, user: &str, remote: &str) -> Result<(), Refusal> {
+   let conversation = Conversation {
+      callback: quiet,
+      data:     ptr::null_mut(),
    };
 
-   if started != SUCCESS || handle.is_null() {
-      return Err(Refusal(format!("PAM did not start, code {started}")));
+   let mut handle = Handle::start(service, user, remote, &conversation)?;
+
+   // SAFETY: the handle is live.
+   handle.took(unsafe { pam_acct_mgmt(handle.raw, 0) })
+}
+
+/// A PAM session, which closes when this is dropped.
+pub struct Session(Handle);
+
+impl Session {
+   /// Opens a session for `user` in the calling process, which is where
+   /// modules set limits and which a login manager then counts as the
+   /// session. Returns it with the variables PAM wants in the session's
+   /// environment.
+   ///
+   /// # Errors
+   ///
+   /// Fails when a module refuses the session or PAM cannot start.
+   pub fn open(
+      service: &str,
+      user: &str,
+      remote: &str,
+      terminal: Option<&str>,
+   ) -> Result<(Self, Vec<(String, String)>), Refusal> {
+      let conversation = Conversation {
+         callback: quiet,
+         data:     ptr::null_mut(),
+      };
+
+      let mut handle = Handle::start(service, user, remote, &conversation)?;
+
+      if let Some(device) = terminal {
+         handle.set(TERMINAL, &named(device)?)?;
+      }
+
+      // The modules that hand out credentials are the ones that check
+      // passwords, and they refuse a user who logged in with a key. As in
+      // sshd, the session opens without them then.
+      // SAFETY: the handle is live.
+      unsafe { pam_setcred(handle.raw, ESTABLISH) };
+      // SAFETY: the handle is live.
+      handle.took(unsafe { pam_open_session(handle.raw, 0) })?;
+
+      let environment = handle.environment();
+      Ok((Self(handle), environment))
    }
+}
 
-   // SAFETY: `handle` is what `pam_start` returned, `remote` ends in a zero
-   // byte, and `asking` stays in place until `pam_end`.
-   let status = unsafe {
-      let mut code = pam_set_item(handle, REMOTE_HOST, remote.as_ptr().cast());
-
-      if code == SUCCESS {
-         code = pam_authenticate(handle, NO_EMPTY_PASSWORD);
-      }
-
-      if code == SUCCESS {
-         code = pam_acct_mgmt(handle, NO_EMPTY_PASSWORD);
-      }
-
-      code
-   };
-
-   let refusal = (status != SUCCESS).then(|| {
-      // SAFETY: PAM returns a string that lives as long as the library, or
-      // null.
-      let reason = unsafe { pam_strerror(handle, status) };
-
-      if reason.is_null() {
-         return Refusal(format!("PAM code {status}"));
-      }
-
-      // SAFETY: the string ends in a zero byte.
-      Refusal(
-         unsafe { CStr::from_ptr(reason) }
-            .to_string_lossy()
-            .into_owned(),
-      )
-   });
-
-   // SAFETY: `handle` is live and is not used again.
-   unsafe { pam_end(handle, status) };
-
-   refusal.map_or(Ok(()), Err)
+impl Drop for Session {
+   fn drop(&mut self) {
+      // SAFETY: the handle is live until the field is dropped after this.
+      self.0.status = unsafe {
+         pam_close_session(self.0.raw, 0);
+         pam_setcred(self.0.raw, DELETE)
+      };
+   }
 }

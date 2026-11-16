@@ -66,6 +66,11 @@ fn main() -> Result<()> {
             );
          }
 
+         ensure!(
+            !options.passwords || options.pam.is_some(),
+            "--passwords needs the PAM service that checks them, name it with --pam"
+         );
+
          monitor::run(Settings {
             listen:           options
                .listen
@@ -75,6 +80,7 @@ fn main() -> Result<()> {
             authorized_keys:  options.authorized_keys,
             authorities:      options.authorities,
             pam:              options.pam,
+            passwords:        options.passwords,
             sftp_server:      options.sftp_server,
             accept_env:       if options.accept_env.is_empty() {
                ACCEPTED_ENVIRONMENT.map(str::to_owned).to_vec()
@@ -91,7 +97,8 @@ fn main() -> Result<()> {
          service,
          user,
          remote,
-      }) => child::ask(&service, &user, &remote),
+         account,
+      }) => child::ask(&service, &user, &remote, account),
       Some(Stage::Hold {
          user,
          term,
@@ -101,9 +108,11 @@ fn main() -> Result<()> {
          agent,
          original_command,
          patience,
+         pam,
       }) => {
          let hold = Hold {
             user,
+            pam,
             terminal: term.map(|name| {
                Terminal {
                   name,

@@ -78,6 +78,7 @@ use quicsh::{
    relay::Tail,
    wire::Reader,
 };
+use quicsh_pam::Session;
 use ring::rand::{
    SecureRandom as _,
    SystemRandom,
@@ -123,12 +124,16 @@ use rustix::{
       openpt,
       unlockpt,
    },
-   termios::tcsetwinsize,
+   termios::{
+      tcsetwinsize,
+      ttyname,
+   },
    time::Timespec,
 };
 
 use crate::{
    child::{
+      SESSION_ENVIRONMENT,
       become_account,
       exit_code,
    },
@@ -449,6 +454,8 @@ pub struct Hold {
    pub agent:    bool,
    /// How long a session on pipes waits for a client that went silent.
    pub patience: Duration,
+   /// The PAM service to open the session through.
+   pub pam:      Option<String>,
 }
 
 /// The socket programs in the session open to reach the client's SSH agent.
@@ -1129,6 +1136,24 @@ fn open_terminal(size: Size, account: &Account) -> Result<(OwnedFd, OwnedFd)> {
 }
 
 impl Hold {
+   /// Opens the account's PAM session in this process, which the session
+   /// process inherits limits and membership from, and gives that process
+   /// what PAM wants in its environment. The session closes when the
+   /// result is dropped.
+   fn enroll(&self, service: &str, device: Option<&str>, command: &mut Command) -> Result<Session> {
+      let client = env::var(format!("{SESSION_ENVIRONMENT}SSH_CLIENT")).unwrap_or_default();
+      let remote = client.split(' ').next().unwrap_or_default();
+
+      let (session, environment) = Session::open(service, &self.user, remote, device)
+         .map_err(|refusal| report!("PAM opened no session for {}: {refusal}", self.user))?;
+
+      for (name, value) in environment {
+         command.env(format!("{SESSION_ENVIRONMENT}{name}"), value);
+      }
+
+      Ok(session)
+   }
+
    /// Starts the session on a new terminal or on pipes and serves it until
    /// it is over. Standard input is the listening socket.
    pub fn run(&self) -> Result<()> {
@@ -1152,8 +1177,11 @@ impl Hold {
          command.arg("--original-command").arg(text);
       }
 
+      let mut device = None;
+
       let master = if let Some(ref terminal) = self.terminal {
          let (master, slave) = open_terminal(terminal.size, &account)?;
+         device = ttyname(&slave, Vec::new())?.into_string().ok();
 
          command
             .arg("--term")
@@ -1171,6 +1199,12 @@ impl Hold {
 
          None
       };
+
+      let _session = self
+         .pam
+         .as_deref()
+         .map(|service| self.enroll(service, device.as_deref(), &mut command))
+         .transpose()?;
 
       let mut child = command.spawn().context("starting the session process")?;
       let group = Pid::from_child(&child);

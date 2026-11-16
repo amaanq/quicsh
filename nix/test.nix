@@ -28,20 +28,31 @@ in
 testers.runNixOSTest {
   name = "qshd";
 
-  containers.certified = {
-    imports = [ self.nixosModules.default ];
+  containers.certified =
+    { config, ... }:
+    {
+      imports = [ self.nixosModules.default ];
 
-    services.qshd = {
-      enable = true;
-      openFirewall = true;
-      hostKey = "${keys}/host";
-      hostCertificate = "${keys}/host-cert.pub";
-      acceptEnv = [ "PROBE_*" ];
-      authorities = "${keys}/authority.pub";
+      # The account check of pam_unix runs a setuid wrapper, which the test
+      # containers do not have.
+      security.pam.services.qshd.text = ''
+        account required pam_permit.so
+        session required pam_env.so conffile=/etc/pam/environment readenv=0
+        session optional ${config.systemd.package}/lib/security/pam_systemd.so
+      '';
+
+      services.qshd = {
+        enable = true;
+        openFirewall = true;
+        hostKey = "${keys}/host";
+        hostCertificate = "${keys}/host-cert.pub";
+        acceptEnv = [ "PROBE_*" ];
+        authorities = "${keys}/authority.pub";
+        pam = true;
+      };
+
+      users.users.alice.isNormalUser = true;
     };
-
-    users.users.alice.isNormalUser = true;
-  };
 
   containers.server = {
     imports = [ self.nixosModules.default ];
@@ -49,6 +60,7 @@ testers.runNixOSTest {
     services.qshd = {
       enable = true;
       openFirewall = true;
+      pam = true;
       passwordAuthentication = true;
     };
 
@@ -60,6 +72,7 @@ testers.runNixOSTest {
     security.pam.services.qshd.text = ''
       auth required pam_exec.so expose_authtok quiet ${password}
       account required pam_permit.so
+      session required pam_permit.so
     '';
 
     environment.systemPackages = [ socat ];
@@ -109,6 +122,11 @@ testers.runNixOSTest {
         client.succeed("install -m 600 ${keys}/user* ${keys}/other* /root/")
         assert "uid=1000(alice)" in client.succeed("qsh -o BatchMode=yes -i /root/user alice@certified id")
         client.fail("qsh -o BatchMode=yes -i /root/other alice@certified id")
+
+    with subtest("a session is a login session with a runtime directory"):
+        session = client.succeed("qsh -i /root/user alice@certified 'echo $XDG_RUNTIME_DIR; loginctl list-sessions'")
+        assert "/run/user/1000" in session
+        assert "alice" in session
 
     with subtest("only the listed environment patterns are accepted"):
         sent = client.succeed("qsh -i /root/user -o 'SetEnv PROBE_ONE=sent LC_PROBE=sent' alice@certified env")

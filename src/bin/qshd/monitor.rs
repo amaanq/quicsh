@@ -42,6 +42,7 @@ use std::{
       self,
       Child,
       Command,
+      Stdio,
    },
    sync::Arc,
    thread,
@@ -157,6 +158,8 @@ const SFTP_SERVERS: [&str; 4] = [
 const MAX_CONVERSATIONS: usize = 64;
 /// How long a PAM process may take to exit once it is done asking.
 const CONCLUDE_LIMIT: Duration = Duration::from_secs(2);
+/// How long PAM may take to say whether an account may be used.
+const ACCOUNT_LIMIT: Duration = Duration::from_secs(10);
 
 /// Most terminal sessions one account has at a time.
 const MAX_KEPT: usize = 64;
@@ -207,8 +210,10 @@ pub struct Settings {
    pub authorized_keys:  Vec<PathBuf>,
    /// File of the authorities whose certificates let an account in.
    pub authorities:      Option<PathBuf>,
-   /// The PAM service that checks passwords.
+   /// The PAM service that checks accounts and opens sessions.
    pub pam:              Option<String>,
+   /// Whether that service also checks passwords.
+   pub passwords:        bool,
    /// Program behind the `sftp` subsystem.
    pub sftp_server:      Option<PathBuf>,
    /// Patterns for the environment variables a client may set.
@@ -244,9 +249,10 @@ struct Monitor {
    authorized_keys: Vec<PathBuf>,
    /// File of the authorities whose certificates let an account in.
    authorities:     Option<PathBuf>,
-   /// The PAM service that checks passwords, and `None` when only keys log
-   /// in.
+   /// The PAM service that checks accounts and opens sessions.
    pam:             Option<String>,
+   /// Whether that service also checks passwords.
+   passwords:       bool,
    /// The processes that ask PAM about a login, each with the name it asks
    /// about.
    conversations:   HashMap<u64, (Child, String)>,
@@ -338,6 +344,10 @@ impl Monitor {
          return Ok(Reply::Denied);
       };
 
+      if !self.permitted(&account.name, remote)? {
+         return Ok(Reply::Denied);
+      }
+
       Ok(self.grant(account, permit, None))
    }
 
@@ -368,7 +378,7 @@ impl Monitor {
          return Ok((Reply::Denied, Vec::new()));
       };
 
-      if self.conversations.len() >= MAX_CONVERSATIONS {
+      if !self.passwords || self.conversations.len() >= MAX_CONVERSATIONS {
          return Ok((Reply::Denied, Vec::new()));
       }
 
@@ -400,29 +410,45 @@ impl Monitor {
    /// Ends a PAM process. A login that it allowed and that is still
    /// `wanted` passes for every account but root.
    fn conclude(&mut self, conversation: u64, wanted: bool) -> Result<Reply> {
-      let Some((mut child, user)) = self.conversations.remove(&conversation) else {
+      let Some((child, user)) = self.conversations.remove(&conversation) else {
          return Ok(Reply::Denied);
       };
 
-      let limit = Instant::now() + CONCLUDE_LIMIT;
-
-      let allowed = loop {
-         match child.try_wait()? {
-            Some(status) => break status.success(),
-            None if wanted && Instant::now() < limit => thread::sleep(Duration::from_millis(2)),
-            None => {
-               let _ = child.kill();
-               thread::spawn(move || child.wait());
-               break false;
-            },
-         }
-      };
+      let allowed = settled(
+         child,
+         if wanted {
+            CONCLUDE_LIMIT
+         } else {
+            Duration::ZERO
+         },
+      )?;
 
       if !(allowed && wanted) {
          return Ok(Reply::Denied);
       }
 
       self.admit(&user, clock())
+   }
+
+   /// Whether PAM lets an account be used whose owner logs in without a
+   /// password. A server without `--pam` asks nobody.
+   fn permitted(&self, user: &str, remote: IpAddr) -> Result<bool> {
+      let Some(ref service) = self.pam else {
+         return Ok(true);
+      };
+
+      let child = Command::new(env::current_exe()?)
+         .arg("ask")
+         .arg(service)
+         .arg(format!("--user={user}"))
+         .arg(format!("--remote={remote}"))
+         .arg("--account")
+         .stdin(Stdio::null())
+         .env_clear()
+         .spawn()
+         .context("starting the PAM process")?;
+
+      Ok(settled(child, ACCOUNT_LIMIT)?)
    }
 
    /// Logs in an account that a password or a ticket vouched for, unless
@@ -464,7 +490,7 @@ impl Monitor {
 
    /// Logs in the account that a ticket of this server names, while the
    /// ticket holds.
-   fn redeem(&mut self, user: &str, ticket: &[u8]) -> Result<Reply> {
+   fn redeem(&mut self, user: &str, ticket: &[u8], remote: IpAddr) -> Result<Reply> {
       let parts = ticket
          .len()
          .checked_sub(TICKET_TAG)
@@ -483,7 +509,7 @@ impl Monitor {
          && named == user.as_bytes()
          && seconds(ends) > clock();
 
-      if !holds {
+      if !holds || !self.permitted(user, remote)? {
          return Ok(Reply::Denied);
       }
 
@@ -723,6 +749,14 @@ impl Monitor {
 
       if let Some(limit) = open.patience {
          command.arg("--patience").arg(limit.as_secs().to_string());
+      }
+
+      // Most session modules need root, which a server for one account
+      // does not have.
+      if let Some(ref service) = self.pam
+         && geteuid().is_root()
+      {
+         command.arg("--pam").arg(service);
       }
 
       self.program(grant, open, &mut command)?;
@@ -986,7 +1020,11 @@ impl Monitor {
             conversation,
             wanted,
          } => plain(self.conclude(conversation, wanted)?),
-         Request::Redeem { user, ticket } => plain(self.redeem(&user, &ticket)?),
+         Request::Redeem {
+            user,
+            ticket,
+            remote,
+         } => plain(self.redeem(&user, &ticket, remote.ip().to_canonical())?),
          Request::Ticket { grant } => plain(self.ticket(grant)?),
          Request::Kept => Ok(self.kept()),
          Request::Socket { local, remote } => {
@@ -1048,6 +1086,24 @@ impl Monitor {
             path,
             listen,
          } => self.reach(grant, &path, listen),
+      }
+   }
+}
+
+/// Whether a PAM process ended with success within `patience`. One that
+/// takes longer is killed.
+fn settled(mut child: Child, patience: Duration) -> io::Result<bool> {
+   let limit = Instant::now() + patience;
+
+   loop {
+      match child.try_wait()? {
+         Some(status) => return Ok(status.success()),
+         None if Instant::now() < limit => thread::sleep(Duration::from_millis(1)),
+         None => {
+            let _ = child.kill();
+            thread::spawn(move || child.wait());
+            return Ok(false);
+         },
       }
    }
 }
@@ -1238,6 +1294,7 @@ pub fn run(settings: Settings) -> Result<()> {
       authorized_keys: settings.authorized_keys,
       authorities: settings.authorities,
       pam: settings.pam,
+      passwords: settings.passwords,
       conversations: HashMap::new(),
       sftp_server: settings.sftp_server,
       accept_env: settings.accept_env,

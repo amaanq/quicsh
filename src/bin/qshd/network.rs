@@ -356,7 +356,9 @@ impl Peer {
          return Ok(());
       }
 
-      let Some(Reply::Granted { grant, forwarding }) = helper.redeem(user, ticket)? else {
+      let Some(Reply::Granted { grant, forwarding }) =
+         helper.redeem(user, ticket, origin(connection))?
+      else {
          self.outbox.push(&Message::Rejected);
          return Ok(());
       };

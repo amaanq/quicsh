@@ -89,6 +89,16 @@ in
       '';
     };
 
+    pam = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Ask the PAM service `qshd` whether an account may be used, and open
+        every session through it, which gives a session its login session,
+        its limits and its runtime directory. `sshd` calls this `UsePAM`.
+      '';
+    };
+
     passwordAuthentication = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -153,7 +163,17 @@ in
 
     networking.firewall.allowedUDPPorts = lib.mkIf cfg.openFirewall [ cfg.port ];
 
-    security.pam.services.qshd = lib.mkIf cfg.passwordAuthentication { };
+    assertions = [
+      {
+        assertion = cfg.passwordAuthentication -> cfg.pam;
+        message = "services.qshd.passwordAuthentication needs services.qshd.pam";
+      }
+    ];
+
+    security.pam.services.qshd = lib.mkIf cfg.pam {
+      startSession = true;
+      unixAuth = cfg.passwordAuthentication;
+    };
 
     environment.systemPackages = [ cfg.package ];
 
@@ -196,10 +216,11 @@ in
             "--authorities"
             cfg.authorities
           ]
-          ++ lib.optionals cfg.passwordAuthentication [
+          ++ lib.optionals cfg.pam [
             "--pam"
             "qshd"
           ]
+          ++ lib.optional cfg.passwordAuthentication "--passwords"
           ++ lib.optionals (cfg.hostCertificate != null) [
             "--host-certificate"
             cfg.hostCertificate

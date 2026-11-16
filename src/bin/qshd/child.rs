@@ -53,6 +53,7 @@ use quicsh::{
 use quicsh_pam::{
    Style,
    login,
+   permitted,
 };
 use rustix::{
    net::{
@@ -88,9 +89,16 @@ use rustix::{
 
 /// Lets PAM decide whether `user` logs in from `remote`. Each question
 /// leaves on standard input as a [`Message::Prompt`] and its answer arrives
-/// there. The monitor reads the decision from the exit status.
-pub fn ask(service: &str, user: &str, remote: &str) -> Result<()> {
+/// there. With `account`, PAM is asked only whether the account may be
+/// used. The monitor reads the decision from the exit status.
+pub fn ask(service: &str, user: &str, remote: &str, account: bool) -> Result<()> {
    set_parent_process_death_signal(Some(Signal::TERM))?;
+
+   if account {
+      return permitted(service, user, remote)
+         .map_err(|refusal| report!("no login for {user:?} from {remote}: {refusal}"));
+   }
+
    let link = io::stdin().as_fd().try_clone_to_owned()?;
 
    let decided = login(service, user, remote, |style, text| {

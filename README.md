@@ -93,9 +93,13 @@ afford to lose :)
   `@cert-authority` line in `known_hosts` makes `qsh` take it in place of an
   entry for the host
 - `ed25519-sk` keys in the same way, with the PIN and the touch
-- Passwords, on a server that runs with `qshd --pam NAME`. The PAM service
-  of that name asks its questions through `qsh`, on the terminal or through
-  `SSH_ASKPASS`, and root never logs in this way. `qsh` forgets what was
+- PAM, with `qshd --pam NAME`. The service of that name decides whether an
+  account may be used, and every session opens through it, which is where
+  a login session, limits and `XDG_RUNTIME_DIR` come from. The NixOS module
+  has it as `services.qshd.pam`
+- Passwords, with `qshd --pam NAME --passwords`. The PAM service asks its
+  questions through `qsh`, on the terminal or through `SSH_ASKPASS`, and
+  root never logs in this way. `qsh` forgets what was
   typed. The server hands it a ticket that logs the account in again for an
   hour and renews it while connected, so a reconnect asks nothing. Tickets
   stop 24 hours after the password was typed.
@@ -311,8 +315,6 @@ nu bench.nu host --identity ~/.ssh/id_bench
 
 ## What's missing
 
-- PAM for anything but a password. A login by key skips the account
-  checks, and no session runs PAM's session modules.
 - X11 forwarding.
 - Most of `ssh_config`. Only `Host`, `Match`, `Include`, `HostName`,
   `User`, `IdentityFile`, `IdentityAgent`, `ProxyJump`, `ForwardAgent`,

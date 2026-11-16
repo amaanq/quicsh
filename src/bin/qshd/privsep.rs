@@ -217,6 +217,8 @@ pub enum Request {
       user:   String,
       /// What the client showed.
       ticket: Vec<u8>,
+      /// Where the client is.
+      remote: SocketAddr,
    },
    /// Asks for a ticket for a login that a password or a ticket started.
    Ticket {
@@ -365,6 +367,7 @@ impl Request {
             Self::Redeem {
                user:   named(reader)?,
                ticket: reader.string()?.to_vec(),
+               remote: address(reader)?,
             }
          },
          _ => {
@@ -440,10 +443,15 @@ impl Request {
             put_u64(&mut out, conversation);
             out.push(u8::from(wanted));
          },
-         Self::Redeem { user, ticket } => {
+         Self::Redeem {
+            user,
+            ticket,
+            remote,
+         } => {
             out.push(REDEEM);
             put_string(&mut out, user.as_bytes());
             put_string(&mut out, &ticket);
+            put_address(&mut out, remote);
          },
          Self::Ticket { grant } => {
             out.push(TICKET);
@@ -984,10 +992,11 @@ impl Helper {
 
    /// The monitor's [`Reply::Granted`] for a ticket it made and that still
    /// holds, or `None`.
-   pub fn redeem(&self, user: &str, ticket: &[u8]) -> Result<Option<Reply>> {
+   pub fn redeem(&self, user: &str, ticket: &[u8], remote: SocketAddr) -> Result<Option<Reply>> {
       let request = Request::Redeem {
-         user:   user.to_owned(),
+         user: user.to_owned(),
          ticket: ticket.to_vec(),
+         remote,
       };
 
       match self.call(request)? {
