@@ -7,6 +7,11 @@
 //! is drawn until the server echoed a character typed since the last key that
 //! is no character, so a password prompt and an editor's command keys show
 //! nothing.
+//!
+//! A place on the screen is one number here, the cells before it counted
+//! along the rows from the top left. A line that is longer than a row is
+//! then one run of places, and so is what a key does to it. Nothing is drawn
+//! past the last row, where the terminal would have to scroll.
 
 use std::{
    cmp::Ordering,
@@ -197,12 +202,10 @@ impl Key {
 /// with a known echo changed since.
 #[derive(Clone, Copy)]
 struct Line {
-   /// The row it is on.
-   row:   u16,
-   /// The column it starts at. A backspace and a left arrow there do
+   /// The place it starts at. A backspace and a left arrow there do
    /// nothing.
    floor: usize,
-   /// The column after its last character. A character typed before it
+   /// The place after its last character. A character typed before it
    /// moves the rest of the line.
    end:   usize,
 }
@@ -217,20 +220,20 @@ struct Guess {
    run:   u32,
 }
 
-/// What the cursor's row looks like once the server echoed some keys.
+/// What the screen looks like once the server echoed some keys.
 struct Outcome {
-   /// The cursor's column.
+   /// The cursor's place.
    column: usize,
-   /// The cells that changed, by column. `None` is an emptied cell, which
+   /// The cells that changed, by place. `None` is an emptied cell, which
    /// the server may fill with what stood to the right of it.
    cells:  BTreeMap<usize, Option<char>>,
-   /// The column after the line's last character, when the line is known.
+   /// The place after the line's last character, when the line is known.
    end:    Option<usize>,
 }
 
 /// What is drawn on the terminal ahead of the server.
 struct Shown {
-   /// The first column drawn over.
+   /// The first place drawn over.
    low:    usize,
    /// How many cells from there may be drawn over.
    width:  usize,
@@ -281,14 +284,16 @@ pub struct Predictor {
    terminal: Terminal,
    /// The terminal's width.
    columns:  u16,
+   /// The terminal's height.
+   rows:     u16,
    /// The terminal itself.
    screen:   File,
    /// When to draw.
    mode:     Mode,
    /// Keys waiting for their echo.
    pending:  VecDeque<Guess>,
-   /// Where the cursor was when the first of them was typed.
-   anchor:   (u16, u16),
+   /// The cursor's place when the first of them was typed.
+   anchor:   usize,
    /// The line being typed as it was then, when that is known.
    line:     Option<Line>,
    /// The characters of that line, which the pending keys move.
@@ -318,10 +323,11 @@ impl Predictor {
       Some(Self {
          terminal: Terminal::new(size.columns, size.rows, 0)?,
          columns: size.columns,
+         rows: size.rows,
          screen,
          mode,
          pending: VecDeque::new(),
-         anchor: (0, 0),
+         anchor: 0,
          line: None,
          text: Vec::new(),
          fresh: false,
@@ -348,7 +354,67 @@ impl Predictor {
    pub fn resize(&mut self, size: Size) {
       self.terminal.resize(size.columns, size.rows);
       self.columns = size.columns;
+      self.rows = size.rows;
       self.restart();
+   }
+
+   /// How many cells a row has.
+   fn width(&self) -> usize {
+      usize::from(self.columns).max(1)
+   }
+
+   /// The session's cursor as a row and a column. The column is the width
+   /// of the terminal while the cursor waits on a row's last cell for the
+   /// next character to wrap.
+   fn resting(&self) -> (usize, usize) {
+      let (column, row) = self.terminal.cursor();
+
+      (
+         usize::from(row),
+         usize::from(column) + usize::from(self.terminal.wrapping()),
+      )
+   }
+
+   /// The session's cursor as a place. A cursor that waits to wrap is at
+   /// the start of the next row.
+   fn cursor(&self) -> usize {
+      let (row, column) = self.resting();
+      row * self.width() + column
+   }
+
+   /// Where the terminal's cursor is once the cells before `place` were
+   /// written, in the form of [`Self::resting`].
+   fn after(&self, place: usize) -> (usize, usize) {
+      let width = self.width();
+
+      if place > 0 && place.is_multiple_of(width) {
+         (place / width - 1, width)
+      } else {
+         (place / width, place % width)
+      }
+   }
+
+   /// The escape sequences that take the terminal's cursor from `from`, in
+   /// the form of [`Self::resting`], to `place`. None of them scrolls.
+   fn go(&self, from: (usize, usize), place: usize) -> Vec<u8> {
+      let width = self.width();
+      let (row, column) = (place / width, place % width);
+
+      let mut moves = match row.cmp(&from.0) {
+         Ordering::Less => format!("\x1b[{}A", from.0 - row).into_bytes(),
+         Ordering::Equal => Vec::new(),
+         Ordering::Greater => format!("\x1b[{}B", row - from.0).into_bytes(),
+      };
+
+      // A cursor that waits to wrap may count as on either of two columns,
+      // so only a column by its number is safe from there.
+      if from.0 == row && from.1 < width {
+         moves.extend(shift(from.1, column));
+      } else {
+         moves.extend(format!("\x1b[{}G", column + 1).bytes());
+      }
+
+      moves
    }
 
    /// Notes what the known line and the cell after it hold, before any
@@ -379,15 +445,19 @@ impl Predictor {
    fn split(&self, column: usize) -> bool {
       column
          .checked_sub(1)
-         .is_some_and(|before| wide(self.cell(before)))
+         .is_some_and(|before| !column.is_multiple_of(self.width()) && wide(self.cell(before)))
    }
 
-   /// The row after the first `count` pending keys, unless they lead off
-   /// the row or move what this side cannot draw. A wide character is
-   /// guessed only at the end of a known line, where a terminal that draws
-   /// it narrower moves nothing else.
+   /// The screen after the first `count` pending keys, unless they lead
+   /// past the last row or move what this side cannot draw. A wide
+   /// character is guessed only at the end of a known line, where a
+   /// terminal that draws it narrower moves nothing else, and only where
+   /// the row has room for it.
    fn outcome(&self, count: usize) -> Option<Outcome> {
-      let line = self.line.filter(|line| line.row == self.anchor.1);
+      let edge = self.width();
+      let line = self
+         .line
+         .filter(|known| (known.floor..=known.end).contains(&self.anchor));
       let floor = line.map(|known| known.floor);
 
       // A shell that shows a suggestion after the line takes it when the
@@ -400,7 +470,7 @@ impl Predictor {
       });
 
       let mut end = line.map(|known| known.end);
-      let mut column = usize::from(self.anchor.0);
+      let mut column = self.anchor;
       let mut cells = BTreeMap::new();
       let mut widened = false;
 
@@ -411,7 +481,7 @@ impl Predictor {
             _ => 1,
          };
 
-         if width == 2 && end != Some(column) {
+         if width == 2 && (end != Some(column) || column % edge + 2 > edge) {
             return None;
          }
 
@@ -434,6 +504,12 @@ impl Predictor {
             Key::Delete if end.is_none_or(|last| column >= last) => {},
             key @ (Key::Erase | Key::Delete) => {
                if matches!(key, Key::Erase) {
+                  // The cell before a row's first belongs to this line
+                  // only if the line is known to start before it.
+                  if floor.is_none() && column.is_multiple_of(edge) {
+                     return None;
+                  }
+
                   column = column.checked_sub(1)?;
                }
 
@@ -471,7 +547,7 @@ impl Predictor {
          }
       }
 
-      (end.unwrap_or(column).max(column) + 1 < usize::from(self.columns)).then_some(Outcome {
+      (end.unwrap_or(column).max(column) < usize::from(self.rows) * edge).then_some(Outcome {
          column,
          cells,
          end,
@@ -496,14 +572,13 @@ impl Predictor {
 
          if let Some(known) = key.filter(|_| !self.blind && self.pending.len() < LIMIT) {
             if self.pending.is_empty() {
-               self.anchor = self.terminal.cursor();
+               self.anchor = self.cursor();
             }
 
             if take(&mut self.fresh) {
                self.line = Some(Line {
-                  row:   self.anchor.1,
-                  floor: usize::from(self.anchor.0),
-                  end:   usize::from(self.anchor.0),
+                  floor: self.anchor,
+                  end:   self.anchor,
                });
             }
 
@@ -548,9 +623,14 @@ impl Predictor {
       self.draw();
    }
 
-   /// The character in a cell of the cursor's row.
-   fn cell(&self, column: usize) -> u32 {
-      u16::try_from(column).map_or(0, |place| self.terminal.cell(place, self.anchor.1))
+   /// The character in the cell at a place, which is 0 past the screen.
+   fn cell(&self, place: usize) -> u32 {
+      let width = self.width();
+
+      u16::try_from(place % width)
+         .ok()
+         .zip(u16::try_from(place / width).ok())
+         .map_or(0, |(column, row)| self.terminal.cell(column, row))
    }
 
    /// Draws what the pending keys do, in the style the session writes in,
@@ -577,8 +657,8 @@ impl Predictor {
          return;
       };
 
-      let anchor = usize::from(self.anchor.0);
-      let mut place = anchor;
+      let edge = self.width();
+      let mut place = self.resting();
       let mut text = Vec::new();
 
       for (&column, &cell) in &outcome.cells {
@@ -589,21 +669,21 @@ impl Predictor {
             return;
          }
 
-         text.extend(shift(place, column));
+         text.extend(self.go(place, column));
          text.extend(character.encode_utf8(&mut [0; 4]).bytes());
-         place = column + width;
+         place = self.after(column + width);
 
          // The terminal may count the character's width another way, and
          // the moves that follow are relative.
-         if width == 2 {
-            text.extend(format!("\x1b[{}G", place + 1).bytes());
+         if width == 2 && place.1 < edge {
+            text.extend(format!("\x1b[{}G", place.1 + 1).bytes());
          }
       }
 
-      text.extend(shift(place, outcome.column));
+      text.extend(self.go(place, outcome.column));
       put(&self.screen, &text);
 
-      let low = outcome.cells.keys().next().copied().unwrap_or(anchor);
+      let low = outcome.cells.keys().next().copied().unwrap_or(self.anchor);
 
       self.shown = Some(Shown {
          low,
@@ -625,33 +705,54 @@ impl Predictor {
          return;
       };
 
-      let anchor = usize::from(self.anchor.0);
+      let edge = self.width();
       let high = shown.low + shown.width;
-      let last = (shown.low..high)
-         .rev()
-         .find(|&column| self.cell(column) != 0);
-
-      let held = u16::try_from(shown.low)
-         .ok()
-         .zip(u16::try_from(last.unwrap_or(shown.low)).ok())
-         .filter(|_| shown.width > 0);
+      let mut place = (shown.column / edge, shown.column % edge);
+      let mut first = shown.low;
+      let mut text = Vec::new();
 
       // The emulator leaves out the empty cells at the end, so all of the
-      // cells are emptied first. Its text ends with the session's style.
-      let text = match held {
-         Some((first, end)) => {
-            [
-               shift(shown.column, shown.low),
-               b"\x1b[0m".to_vec(),
-               vec![b' '; shown.width],
-               shift(high, shown.low),
-               self.terminal.cells(self.anchor.1, first, end),
-               shift(last.map_or(shown.low, |column| column + 1), anchor),
-            ]
-            .concat()
+      // cells are emptied first, a row at a time. Its text ends with the
+      // session's style.
+      while first < high {
+         let stop = high.min((first / edge + 1) * edge);
+         let last = (first..stop).rev().find(|&cell| self.cell(cell) != 0);
+         let held = last.unwrap_or(first);
+
+         text.extend(self.go(place, first));
+         text.extend(b"\x1b[0m");
+         text.extend(vec![b' '; stop - first]);
+         text.extend(self.go(self.after(stop), first));
+
+         let cells = u16::try_from(first / edge)
+            .ok()
+            .zip(u16::try_from(first % edge).ok())
+            .zip(u16::try_from(held % edge).ok());
+
+         if let Some(((row, from), to)) = cells {
+            text.extend(self.terminal.cells(row, from, to));
+         }
+
+         place = last.map_or((first / edge, first % edge), |end| self.after(end + 1));
+         first = stop;
+      }
+
+      let rest = self.resting();
+
+      // A cursor that waited to wrap does so again only once its cell is
+      // written again.
+      let waiting = u16::try_from(rest.0)
+         .ok()
+         .zip(self.columns.checked_sub(1))
+         .filter(|_| rest.1 == edge);
+
+      match waiting {
+         Some((row, column)) => {
+            text.extend(self.go(place, rest.0 * edge + edge - 1));
+            text.extend(self.terminal.cells(row, column, column));
          },
-         None => shift(shown.column, anchor),
-      };
+         None => text.extend(self.go(place, self.anchor)),
+      }
 
       put(&self.screen, &text);
    }
@@ -659,25 +760,24 @@ impl Predictor {
    /// Whether the terminal shows what the first `count` pending keys do.
    /// Keys that leave the cursor where it was and put no other character
    /// in a cell are not told from no echo.
-   fn echoed(&self, count: usize, cursor: (u16, u16)) -> bool {
+   fn echoed(&self, count: usize, cursor: usize) -> bool {
       let unchanged = BTreeMap::new();
 
-      cursor.1 == self.anchor.1
-         && self.outcome(count).is_some_and(|outcome| {
-            let mut placed = outcome
-               .cells
-               .iter()
-               .filter_map(|(&column, &cell)| Some((column, cell?)));
+      self.outcome(count).is_some_and(|outcome| {
+         let mut placed = outcome
+            .cells
+            .iter()
+            .filter_map(|(&column, &cell)| Some((column, cell?)));
 
-            outcome.column == usize::from(cursor.0)
-               && placed
-                  .clone()
-                  .all(|(column, character)| self.cell(column) == u32::from(character))
-               && (cursor.0 != self.anchor.0
-                  || placed.any(|(column, character)| {
-                     self.under(&unchanged, column) != Some(u32::from(character))
-                  }))
-         })
+         outcome.column == cursor
+            && placed
+               .clone()
+               .all(|(column, character)| self.cell(column) == u32::from(character))
+            && (cursor != self.anchor
+               || placed.any(|(column, character)| {
+                  self.under(&unchanged, column) != Some(u32::from(character))
+               }))
+      })
    }
 
    /// Follows session output that was written to the terminal, and settles
@@ -685,7 +785,7 @@ impl Predictor {
    fn output(&mut self, bytes: &[u8]) {
       self.terminal.write(bytes);
 
-      let cursor = self.terminal.cursor();
+      let cursor = self.cursor();
 
       let settled = (1..=self.pending.len())
          .rev()
@@ -709,7 +809,7 @@ impl Predictor {
          };
          self.slow = self.delay > SLOW || (self.slow && self.delay > FAST);
 
-         if cursor.0 > self.anchor.0 {
+         if cursor > self.anchor {
             self.echoed = Some(last.run);
          }
 
@@ -904,6 +1004,85 @@ mod tests {
          drawn(&mut screen),
          "\u{e9}\u{44f}".as_bytes(),
          "letters outside ASCII"
+      );
+   }
+
+   /// A line that reaches the right edge goes on in the row below, whether
+   /// the server moves the cursor there or leaves it waiting at the edge.
+   #[test]
+   fn lines_go_on_past_the_right_edge() {
+      let (mut screen, mut predictor) = started();
+
+      predictor.typed(b"\r");
+      predictor.output(b"\r\n$ ");
+
+      for _ in 0..77 {
+         predictor.typed(b"x");
+         predictor.hide();
+         predictor.output(b"x");
+         drawn(&mut screen);
+      }
+
+      predictor.typed(b"y");
+      assert_eq!(
+         drawn(&mut screen),
+         b"y\x1b[1B\x1b[1G",
+         "a character in the last cell of a row"
+      );
+
+      predictor.hide();
+      assert_eq!(
+         drawn(&mut screen),
+         b"\x1b[1A\x1b[80G\x1b[0m \x1b[80G\x1b[0m",
+         "taken back from the row below"
+      );
+
+      predictor.output(b"y");
+      predictor.typed(b"z");
+      assert_eq!(
+         drawn(&mut screen),
+         b"\x1b[1B\x1b[1Gz",
+         "after an echo that left the cursor at the edge"
+      );
+
+      predictor.hide();
+      let back = drawn(&mut screen);
+      assert!(
+         back.starts_with(b"\x1b[1D\x1b[0m \x1b[1D\x1b[0m\x1b[1A\x1b[80G") && back.contains(&b'y'),
+         "the cursor waits at the edge again, got {back:?}"
+      );
+
+      predictor.output(b"z");
+      predictor.typed(b"\x7f\x7f");
+      assert_eq!(
+         drawn(&mut screen),
+         b"\x1b[1A\x1b[80G \x1b[1B\x1b[1G \x1b[1A\x1b[80G",
+         "backspaces across the edge"
+      );
+
+      predictor.hide();
+      drawn(&mut screen);
+      predictor.output(b"\x08 \x08\x1b[1A\x1b[80G \x1b[80G");
+
+      for _ in 0..22 {
+         predictor.output(b"\r\n");
+      }
+
+      predictor.typed(b"\r");
+      predictor.output(b"\r\n$ ");
+
+      for _ in 0..77 {
+         predictor.typed(b"x");
+         predictor.hide();
+         predictor.output(b"x");
+         drawn(&mut screen);
+      }
+
+      predictor.typed(b"y");
+      assert_eq!(
+         drawn(&mut screen),
+         b"",
+         "nothing where the terminal would scroll"
       );
    }
 

@@ -45,6 +45,13 @@ bool qvt_alternate(GhosttyTerminal terminal) {
   return screen == GHOSTTY_TERMINAL_SCREEN_ALTERNATE;
 }
 
+bool qvt_wrapping(GhosttyTerminal terminal) {
+  bool waiting = false;
+
+  ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_CURSOR_PENDING_WRAP, &waiting);
+  return waiting;
+}
+
 size_t qvt_history(GhosttyTerminal terminal) {
   size_t rows = 0;
 

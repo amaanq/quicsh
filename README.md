@@ -57,7 +57,9 @@ afford to lose :)
   On a line that began after enter, the keys that move the cursor along the
   line and edits in the middle of it show early too. Latin, Greek and
   Cyrillic letters show early anywhere on the line, and Chinese, Japanese
-  and Korean characters at its end. Emoji wait for the server.
+  and Korean characters at its end. Emoji wait for the server. A line
+  longer than the terminal is wide goes on in the next row, except on the
+  last row, where the terminal has to scroll first.
   `--predict always` and `--predict never` change when it happens
 - Sessions that any of your machines can join. Every session on a terminal
   has a name, the one `--attach NAME` gives it or else a number, and runs

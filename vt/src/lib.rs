@@ -19,6 +19,7 @@ unsafe extern "C" {
    fn qvt_write(terminal: *mut c_void, bytes: *const u8, length: usize);
    fn qvt_resize(terminal: *mut c_void, columns: u16, rows: u16) -> bool;
    fn qvt_alternate(terminal: *mut c_void) -> bool;
+   fn qvt_wrapping(terminal: *mut c_void) -> bool;
    fn qvt_history(terminal: *mut c_void) -> usize;
    fn qvt_cursor(terminal: *mut c_void, column: *mut u16, row: *mut u16);
    fn qvt_cell(terminal: *mut c_void, column: u16, row: u16) -> u32;
@@ -76,6 +77,14 @@ impl Terminal {
    pub fn alternate(&self) -> bool {
       // SAFETY: the handle is live until drop.
       unsafe { qvt_alternate(self.0.as_ptr()) }
+   }
+
+   /// Whether the cursor stands on the last cell of a row that a character
+   /// was written to, so that the next character goes to the row below.
+   #[must_use]
+   pub fn wrapping(&self) -> bool {
+      // SAFETY: the handle is live until drop.
+      unsafe { qvt_wrapping(self.0.as_ptr()) }
    }
 
    /// How many rows of history are above the screen.
