@@ -3,6 +3,7 @@
   rustPlatform,
   pkg-config,
   libghostty-vt,
+  pam,
 }:
 let
   cargoTOML = (lib.importTOML ../Cargo.toml).package;
@@ -19,6 +20,7 @@ rustPlatform.buildRustPackage {
     fs.toSource {
       root = s;
       fileset = fs.unions [
+        (s + /pam)
         (s + /src)
         (s + /vendor)
         (s + /vt)
@@ -30,7 +32,10 @@ rustPlatform.buildRustPackage {
   cargoLock.lockFile = ../Cargo.lock;
 
   nativeBuildInputs = [ pkg-config ];
-  buildInputs = [ libghostty-vt ];
+  buildInputs = [
+    libghostty-vt
+    pam
+  ];
 
   strictDeps = true;
   enableParallelBuilding = true;

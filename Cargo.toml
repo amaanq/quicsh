@@ -9,7 +9,7 @@ keywords    = [ "port-forwarding", "quic", "remote-shell", "ssh", "tunnel" ]
 categories  = [ "command-line-utilities", "network-programming" ]
 
 [workspace]
-members = [ "vt" ]
+members = [ "pam", "vt" ]
 
 [dependencies]
 bytes       = "1.12.1"
@@ -19,6 +19,7 @@ misstep     = { version = "0.4.1", features = [ "pretty" ] }
 ml-kem      = { version = "0.3.4", features = [ "getrandom", "zeroize" ] }
 p521        = { version = "0.14.0", default-features = false, features = [ "ecdsa" ] }
 pound       = "0.6.1"
+quicsh-pam  = { version = "0.1.0", path = "pam" }
 quinn-proto = { version = "0.11.19", default-features = false, features = [ "rustls-ring" ] }
 quicsh-vt   = { version = "0.1.0", path = "vt" }
 quinn-udp   = { version = "0.6.3", default-features = false }

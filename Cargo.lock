@@ -534,6 +534,7 @@ dependencies = [
  "ml-kem",
  "p521",
  "pound",
+ "quicsh-pam",
  "quicsh-vt",
  "quinn-proto",
  "quinn-udp",
@@ -542,6 +543,10 @@ dependencies = [
  "rustls",
  "zeroize",
 ]
+
+[[package]]
+name = "quicsh-pam"
+version = "0.1.0"
 
 [[package]]
 name = "quicsh-vt"

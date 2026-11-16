@@ -31,11 +31,24 @@ use misstep::{
    Result,
    ResultExt as _,
    bail,
+   report,
 };
 use quicsh::{
    auth::Account,
+   control::{
+      Asks,
+      MAX_DIALOGUE,
+      Message,
+   },
    forward::Bound,
-   pipe::send_message,
+   pipe::{
+      receive_message,
+      send_message,
+   },
+};
+use quicsh_pam::{
+   Style,
+   login,
 };
 use rustix::{
    net::{
@@ -67,6 +80,39 @@ use rustix::{
       set_thread_uid,
    },
 };
+
+/// Lets PAM decide whether `user` logs in from `remote`. Each question
+/// leaves on standard input as a [`Message::Prompt`] and its answer arrives
+/// there. The monitor reads the decision from the exit status.
+pub fn ask(service: &str, user: &str, remote: &str) -> Result<()> {
+   set_parent_process_death_signal(Some(Signal::TERM))?;
+   let link = io::stdin().as_fd().try_clone_to_owned()?;
+
+   let decided = login(service, user, remote, |style, text| {
+      let prompt = Message::Prompt {
+         asks: match style {
+            Style::Hidden => Asks::Hidden,
+            Style::Shown => Asks::Shown,
+            Style::Failure | Style::Notice => Asks::Nothing,
+         },
+         text: text
+            .get(..text.floor_char_boundary(MAX_DIALOGUE))
+            .unwrap_or_default()
+            .to_owned(),
+      };
+
+      send_message(&link, &prompt.encode(), &[]).ok()?;
+
+      if !style.asks() {
+         return Some(String::new());
+      }
+
+      let (answer, _) = receive_message(&link, MAX_DIALOGUE).ok()??;
+      String::from_utf8(answer).ok()
+   });
+
+   decided.map_err(|refusal| report!("no login for {user:?} from {remote}: {refusal}"))
+}
 
 /// Starts the name of each variable in a holder's environment that the
 /// session gets under the rest of the name. They travel there because a

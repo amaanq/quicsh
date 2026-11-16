@@ -21,6 +21,9 @@
 !nix/
 !nix/**
 
+!pam/
+!pam/**
+
 !src/
 !src/**
 

@@ -83,6 +83,8 @@ pub struct Host {
    pub give_up:         Option<String>,
    /// `BatchMode`, as written.
    pub batch:           Option<String>,
+   /// `PasswordAuthentication`, as written.
+   pub passwords:       Option<String>,
    /// `ExitOnForwardFailure`, as written.
    pub exacting:        Option<String>,
    /// `UserKnownHostsFile`, as written.
@@ -310,6 +312,7 @@ impl Host {
             "connecttimeout" => Some(&mut self.connect_timeout),
             "qshgiveup" => Some(&mut self.give_up),
             "batchmode" => Some(&mut self.batch),
+            "passwordauthentication" => Some(&mut self.passwords),
             "exitonforwardfailure" => Some(&mut self.exacting),
             "escapechar" => Some(&mut self.escape),
             "addressfamily" => Some(&mut self.family),

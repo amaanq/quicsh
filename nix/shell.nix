@@ -7,6 +7,7 @@
   wild,
   pkg-config,
   libghostty-vt,
+  pam,
   extraPackages ? [ ],
 }:
 mkShell {
@@ -24,7 +25,10 @@ mkShell {
   ]
   ++ extraPackages;
 
-  buildInputs = [ libghostty-vt ];
+  buildInputs = [
+    libghostty-vt
+    pam
+  ];
 
   env = {
     RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";

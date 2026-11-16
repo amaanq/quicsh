@@ -40,11 +40,14 @@ use std::{
    },
    process::{
       self,
+      Child,
       Command,
    },
    sync::Arc,
    thread,
    time::{
+      Duration,
+      Instant,
       SystemTime,
       UNIX_EPOCH,
    },
@@ -147,6 +150,11 @@ const SFTP_SERVERS: [&str; 4] = [
    "/usr/libexec/sftp-server",
 ];
 
+/// Most logins PAM decides at a time.
+const MAX_CONVERSATIONS: usize = 64;
+/// How long a PAM process may take to exit once it is done asking.
+const CONCLUDE_LIMIT: Duration = Duration::from_secs(2);
+
 /// Most terminal sessions one account has at a time.
 const MAX_KEPT: usize = 64;
 
@@ -185,6 +193,8 @@ pub struct Settings {
    pub authorized_keys:  Vec<PathBuf>,
    /// File of the authorities whose certificates let an account in.
    pub authorities:      Option<PathBuf>,
+   /// The PAM service that checks passwords.
+   pub pam:              Option<String>,
    /// Program behind the `sftp` subsystem.
    pub sftp_server:      Option<PathBuf>,
    /// Patterns for the environment variables a client may set.
@@ -217,6 +227,12 @@ struct Monitor {
    authorized_keys: Vec<PathBuf>,
    /// File of the authorities whose certificates let an account in.
    authorities:     Option<PathBuf>,
+   /// The PAM service that checks passwords, and `None` when only keys log
+   /// in.
+   pam:             Option<String>,
+   /// The processes that ask PAM about a login, each with the name it asks
+   /// about.
+   conversations:   HashMap<u64, (Child, String)>,
    /// Program behind the `sftp` subsystem.
    sftp_server:     Option<PathBuf>,
    /// Patterns for the environment variables a client may set.
@@ -308,6 +324,11 @@ impl Monitor {
          return Ok(Reply::Denied);
       };
 
+      Ok(self.grant(account, permit))
+   }
+
+   /// Records a login that passed.
+   fn grant(&mut self, account: Account, permit: Permit) -> Reply {
       // The network process opens and accepts forwards on ports. The ones
       // on Unix sockets are checked here.
       let reply = Reply::Granted {
@@ -319,7 +340,77 @@ impl Monitor {
          self.grants.insert(grant, Grant { account, permit });
       }
 
-      Ok(reply)
+      reply
+   }
+
+   /// Starts a process that asks PAM whether `user` logs in, and answers
+   /// with the socket it asks on.
+   fn converse(&mut self, user: String, remote: IpAddr) -> Result<(Reply, Vec<OwnedFd>)> {
+      let Some(ref service) = self.pam else {
+         return Ok((Reply::Denied, Vec::new()));
+      };
+
+      if self.conversations.len() >= MAX_CONVERSATIONS {
+         return Ok((Reply::Denied, Vec::new()));
+      }
+
+      let (near, far) = socketpair(
+         AddressFamily::UNIX,
+         SocketType::SEQPACKET,
+         SocketFlags::CLOEXEC,
+         None,
+      )?;
+
+      // PAM modules run in that process, so none of their code is ever
+      // part of this one.
+      let child = Command::new(env::current_exe()?)
+         .arg("ask")
+         .arg(service)
+         .arg(format!("--user={user}"))
+         .arg(format!("--remote={remote}"))
+         .stdin(far)
+         .env_clear()
+         .spawn()
+         .context("starting the PAM process")?;
+
+      let conversation = self.issue();
+      self.conversations.insert(conversation, (child, user));
+
+      Ok((Reply::Asking(conversation), vec![near]))
+   }
+
+   /// Ends a PAM process. A login that it allowed and that is still
+   /// `wanted` passes for every account but root.
+   fn conclude(&mut self, conversation: u64, wanted: bool) -> Result<Reply> {
+      let Some((mut child, user)) = self.conversations.remove(&conversation) else {
+         return Ok(Reply::Denied);
+      };
+
+      let limit = Instant::now() + CONCLUDE_LIMIT;
+
+      let allowed = loop {
+         match child.try_wait()? {
+            Some(status) => break status.success(),
+            None if wanted && Instant::now() < limit => thread::sleep(Duration::from_millis(2)),
+            None => {
+               let _ = child.kill();
+               thread::spawn(move || child.wait());
+               break false;
+            },
+         }
+      };
+
+      let Some(account) = Account::lookup(&user)?.filter(|_| allowed && wanted) else {
+         return Ok(Reply::Denied);
+      };
+
+      let monitor = geteuid();
+
+      if account.uid == 0 || (!monitor.is_root() && monitor.as_raw() != account.uid) {
+         return Ok(Reply::Denied);
+      }
+
+      Ok(self.grant(account, Permit::whole()))
    }
 
    /// Where the socket of the holder for `token` and `uid` lives. The uid in
@@ -787,6 +878,11 @@ impl Monitor {
          },
          Request::Sign(message) => plain(self.sign(&message)?),
          Request::Keep => self.keeper(),
+         Request::Converse { user, remote } => self.converse(user, remote.ip().to_canonical()),
+         Request::Conclude {
+            conversation,
+            wanted,
+         } => plain(self.conclude(conversation, wanted)?),
          Request::Kept => Ok(self.kept()),
          Request::Socket { local, remote } => {
             ensure!(
@@ -1023,6 +1119,8 @@ pub fn run(settings: Settings) -> Result<()> {
       listener: Some(listener),
       authorized_keys: settings.authorized_keys,
       authorities: settings.authorities,
+      pam: settings.pam,
+      conversations: HashMap::new(),
       sftp_server: settings.sftp_server,
       accept_env: settings.accept_env,
       grants: HashMap::new(),

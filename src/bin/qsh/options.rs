@@ -13,6 +13,10 @@ use std::{
       Path,
       PathBuf,
    },
+   sync::{
+      Arc,
+      Mutex,
+   },
    time::Duration,
 };
 
@@ -42,6 +46,7 @@ use ring::digest::{
    digest,
 };
 use rustix::process::getuid;
+use zeroize::Zeroizing;
 
 use crate::{
    forward::{
@@ -74,6 +79,13 @@ pub struct Login {
    pub exacting:     bool,
    /// Whether nothing may be asked on the terminal, from `BatchMode`.
    pub batch:        bool,
+   /// Whether to answer a server that asks for a password, from
+   /// `PasswordAuthentication`.
+   pub passwords:    bool,
+   /// What was typed at the server's questions when a login passed that
+   /// way. Every copy of this login shares them, and a reconnect gives
+   /// them again, since by then the terminal belongs to the session.
+   pub answers:      Arc<Mutex<Vec<Zeroizing<String>>>>,
    /// Which of the host's addresses to try, from `AddressFamily`.
    pub family:       Family,
    /// The name to look the host key up under, in place of the host's.
@@ -745,6 +757,8 @@ impl Options {
          strict,
          exacting: agreed(host.exacting.as_deref()),
          batch: agreed(host.batch.as_deref()),
+         passwords: host.passwords.is_none_or(|written| agreed(Some(&written))),
+         answers: Arc::default(),
          alias: host.alias,
       })
    }

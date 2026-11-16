@@ -93,6 +93,11 @@ afford to lose :)
   `@cert-authority` line in `known_hosts` makes `qsh` take it in place of an
   entry for the host
 - `ed25519-sk` keys in the same way, with the PIN and the touch
+- Passwords, on a server that runs with `qshd --pam NAME`. The PAM service
+  of that name asks its questions through `qsh`, on the terminal or through
+  `SSH_ASKPASS`, and root never logs in this way. `qsh` keeps what was typed
+  in memory, so a reconnect logs in again without asking.
+  `PasswordAuthentication no` keeps `qsh` from answering
 
 ## Usage
 
@@ -304,7 +309,8 @@ nu bench.nu host --identity ~/.ssh/id_bench
 
 ## What's missing
 
-- Passwords and PAM. Keys only.
+- PAM for anything but a password. A login by key skips the account
+  checks, and no session runs PAM's session modules.
 - X11 forwarding.
 - Most of `ssh_config`. Only `Host`, `Match`, `Include`, `HostName`,
   `User`, `IdentityFile`, `IdentityAgent`, `ProxyJump`, `ForwardAgent`,
@@ -313,6 +319,7 @@ nu bench.nu host --identity ~/.ssh/id_bench
   `ControlMaster`, `ControlPath`, `ControlPersist`, `ConnectTimeout`,
   `EscapeChar`, `AddressFamily`, `SendEnv`, `SetEnv`, `CertificateFile`,
   `UserKnownHostsFile`, `GlobalKnownHostsFile`, `BatchMode`,
+  `PasswordAuthentication`,
   `ExitOnForwardFailure`, `QshPort` and `QshGiveUp` are read.
   `ControlPath` takes `%h`, `%n`, `%p`, `%r`, `%u`, `%i` and `%C`, and `%C`
   is not the hash `ssh` computes. `StrictHostKeyChecking no` behaves like

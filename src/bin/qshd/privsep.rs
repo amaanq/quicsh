@@ -89,6 +89,10 @@ const FIND: u8 = 12;
 const KEEP: u8 = 13;
 /// Tag of [`Request::Kept`].
 const KEPT: u8 = 14;
+/// Tag of [`Request::Converse`].
+const CONVERSE: u8 = 15;
+/// Tag of [`Request::Conclude`].
+const CONCLUDE: u8 = 16;
 /// How long a network process that was told to stop may go on asking.
 const STOP_LIMIT: Duration = Duration::from_secs(5);
 
@@ -106,6 +110,8 @@ const FAILED: u8 = 8;
 const HELD: u8 = 9;
 /// Tag of [`Reply::Named`].
 const NAMED: u8 = 10;
+/// Tag of [`Reply::Asking`].
+const ASKING: u8 = 11;
 
 /// What the network process asks of the monitor.
 pub enum Request {
@@ -178,6 +184,22 @@ pub enum Request {
    /// Asks for the link to the process an earlier server left its forwarded
    /// connections with.
    Kept,
+   /// Asks for a process that lets PAM decide a login. The answer is the
+   /// socket that process asks its questions on.
+   Converse {
+      /// Who wants to log in.
+      user:   String,
+      /// Where the client is.
+      remote: SocketAddr,
+   },
+   /// Ends what [`Request::Converse`] started.
+   Conclude {
+      /// The number from [`Reply::Asking`].
+      conversation: u64,
+      /// Whether the network process wants the login that PAM allowed. It
+      /// does not when the client left.
+      wanted:       bool,
+   },
 }
 
 /// The monitor's answer to one request.
@@ -215,6 +237,9 @@ pub enum Reply {
    },
    /// The names of the account's terminal sessions.
    Named(Vec<String>),
+   /// Comes with the socket of a process that asks PAM's questions, and
+   /// names it in [`Request::Conclude`].
+   Asking(u64),
    /// Success with nothing to say, or with one descriptor that the request
    /// asked for.
    Done,
@@ -313,6 +338,19 @@ impl Request {
          },
          Self::Keep => out.push(KEEP),
          Self::Kept => out.push(KEPT),
+         Self::Converse { user, remote } => {
+            out.push(CONVERSE);
+            put_string(&mut out, user.as_bytes());
+            put_address(&mut out, remote);
+         },
+         Self::Conclude {
+            conversation,
+            wanted,
+         } => {
+            out.push(CONCLUDE);
+            put_u64(&mut out, conversation);
+            out.push(u8::from(wanted));
+         },
          Self::Find { grant, name } => {
             out.push(FIND);
             put_u64(&mut out, grant);
@@ -387,6 +425,20 @@ impl Request {
          },
          KEEP => Self::Keep,
          KEPT => Self::Kept,
+         CONVERSE => {
+            Self::Converse {
+               user:   str::from_utf8(reader.string()?)
+                  .map_err(|_| Error::Frame)?
+                  .to_owned(),
+               remote: address(&mut reader)?,
+            }
+         },
+         CONCLUDE => {
+            Self::Conclude {
+               conversation: u64_from(&mut reader)?,
+               wanted:       reader.byte()? != 0,
+            }
+         },
          FIND => {
             Self::Find {
                grant: u64_from(&mut reader)?,
@@ -462,6 +514,10 @@ impl Reply {
             out.push(NAMED);
             put_list(&mut out, names);
          },
+         Self::Asking(conversation) => {
+            out.push(ASKING);
+            put_u64(&mut out, conversation);
+         },
          Self::Done => out.push(DONE),
          Self::Failed(ref text) => {
             out.push(FAILED);
@@ -505,6 +561,7 @@ impl Reply {
             }
          },
          NAMED => Self::Named(list(&mut reader)?),
+         ASKING => Self::Asking(u64_from(&mut reader)?),
          DONE => Self::Done,
          FAILED => Self::Failed(String::from_utf8_lossy(reader.string()?).into_owned()),
          _ => return Err(Error::Frame),
@@ -779,6 +836,39 @@ impl Helper {
    pub fn kept(&self) -> Result<Option<OwnedFd>> {
       match self.call(Request::Kept)? {
          (Reply::Done, descriptors) => Ok(descriptors.into_iter().next()),
+         (Reply::Denied, _) => Ok(None),
+         _ => bail!("unexpected reply from the monitor"),
+      }
+   }
+
+   /// Asks for a process that lets PAM decide whether `user` logs in.
+   /// Returns its number and the socket it asks on, or `None` when the
+   /// server takes no passwords.
+   pub fn converse(&self, user: String, remote: SocketAddr) -> Result<Option<(u64, OwnedFd)>> {
+      match self.call(Request::Converse { user, remote })? {
+         (Reply::Asking(conversation), descriptors) => {
+            let link = descriptors
+               .into_iter()
+               .next()
+               .context("monitor sent no socket to ask on")?;
+
+            Ok(Some((conversation, link)))
+         },
+         (Reply::Denied, _) => Ok(None),
+         _ => bail!("unexpected reply from the monitor"),
+      }
+   }
+
+   /// Ends a conversation. The answer is the monitor's [`Reply::Granted`]
+   /// when the login was `wanted` and PAM allowed it.
+   pub fn conclude(&self, conversation: u64, wanted: bool) -> Result<Option<Reply>> {
+      let request = Request::Conclude {
+         conversation,
+         wanted,
+      };
+
+      match self.call(request)? {
+         (granted @ Reply::Granted { .. }, _) => Ok(Some(granted)),
          (Reply::Denied, _) => Ok(None),
          _ => bail!("unexpected reply from the monitor"),
       }

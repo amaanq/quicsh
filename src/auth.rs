@@ -470,6 +470,20 @@ pub struct Permit {
 }
 
 impl Permit {
+   /// What a login without limits may do.
+   #[must_use]
+   pub fn whole() -> Self {
+      Self {
+         command:    None,
+         terminal:   true,
+         agent:      true,
+         forwarding: Forwarding {
+            allowed: true,
+            ..Forwarding::default()
+         },
+      }
+   }
+
    /// Takes on the limits of the certificate that let the key in. `None`
    /// means it has one this server cannot enforce, or one that keeps this
    /// login out.
@@ -522,15 +536,7 @@ impl Permit {
       let mut authority = false;
       let mut principals = None;
 
-      let mut permit = Self {
-         command:    None,
-         terminal:   true,
-         agent:      true,
-         forwarding: Forwarding {
-            allowed: true,
-            ..Forwarding::default()
-         },
-      };
+      let mut permit = Self::whole();
 
       for option in split(options, ',').filter(|option| !option.is_empty()) {
          let (name, value) = match option.split_once('=') {

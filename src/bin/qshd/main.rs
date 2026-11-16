@@ -74,6 +74,7 @@ fn main() -> Result<()> {
             host_certificate: options.host_certificate,
             authorized_keys:  options.authorized_keys,
             authorities:      options.authorities,
+            pam:              options.pam,
             sftp_server:      options.sftp_server,
             accept_env:       if options.accept_env.is_empty() {
                ACCEPTED_ENVIRONMENT.map(str::to_owned).to_vec()
@@ -86,6 +87,11 @@ fn main() -> Result<()> {
       },
       Some(Stage::Network) => network::run(options.congestion),
       Some(Stage::Keep) => monitor::keep(),
+      Some(Stage::Ask {
+         service,
+         user,
+         remote,
+      }) => child::ask(&service, &user, &remote),
       Some(Stage::Hold {
          user,
          term,

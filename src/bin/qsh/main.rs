@@ -104,6 +104,7 @@ use quicsh::{
       Kind,
    },
    control::{
+      Asks,
       DETACH_LIMIT,
       Deframer,
       Handle,
@@ -178,8 +179,14 @@ use rustix::{
       dup2_stdin,
       dup2_stdout,
    },
-   termios::isatty,
+   termios::{
+      OptionalActions,
+      isatty,
+      tcgetattr,
+      tcsetattr,
+   },
 };
+use zeroize::Zeroizing;
 
 use crate::{
    channel::{
@@ -325,8 +332,204 @@ fn trust_host(login: &Login, key: &PublicKey) -> Result<()> {
    Ok(())
 }
 
-/// A signed login, or `None` once every agent key has been tried.
-type Attempt = Result<Option<Request>>;
+/// What the authentication thread wants sent to the server.
+enum Offer {
+   /// A signed login.
+   Key(Request),
+   /// A login by answering what the server asks.
+   Converse,
+   /// What was typed at one of the server's questions.
+   Answer(String),
+}
+
+/// What the server made of an [`Offer`].
+enum Heard {
+   /// The login did not pass.
+   Rejected,
+   /// Something to show, and to answer unless it asks nothing.
+   Prompt(Asks, String),
+}
+
+/// The next thing to send, or `None` once nothing is left to try.
+type Attempt = Result<Option<Offer>>;
+
+/// Most times a login by password is tried.
+const PASSWORD_ROUNDS: usize = 3;
+
+/// Shows a question on the terminal and reads a line there, which stays
+/// off the screen when `hidden`. Without a terminal, or when
+/// `SSH_ASKPASS_REQUIRE` is `force`, the program in `SSH_ASKPASS` gets the
+/// question, as it does from `ssh`.
+fn ask(question: &str, hidden: bool) -> Result<String> {
+   let forced = env::var_os("SSH_ASKPASS_REQUIRE").is_some_and(|rule| rule == "force");
+
+   let opened = (!forced)
+      .then(|| {
+         OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+            .ok()
+      })
+      .flatten();
+
+   let Some(mut terminal) = opened else {
+      let program = env::var_os("SSH_ASKPASS")
+         .context("the server asks for a password, and there is no terminal to type it on")?;
+
+      let output = Command::new(&program)
+         .arg(question)
+         .stdin(Stdio::null())
+         .stderr(Stdio::inherit())
+         .output()
+         .with_context(|| format!("running {}", Path::new(&program).display()))?;
+
+      ensure!(
+         output.status.success(),
+         "the SSH_ASKPASS program gave no answer"
+      );
+
+      let answer = String::from_utf8(output.stdout)
+         .map_err(|_| report!("the SSH_ASKPASS program's answer is not text"))?;
+
+      return Ok(answer.trim_end_matches(['\r', '\n']).to_owned());
+   };
+
+   terminal.write_all(question.as_bytes())?;
+
+   // The terminal's own line editing would leave the echo off when a
+   // signal ends this program at the prompt.
+   let saved = tcgetattr(&terminal)?;
+   let mut raw = saved.clone();
+   raw.make_raw();
+   tcsetattr(&terminal, OptionalActions::Flush, &raw)?;
+
+   let answer = typed(&mut terminal, hidden);
+   tcsetattr(&terminal, OptionalActions::Now, &saved)?;
+   terminal.write_all(b"\r\n")?;
+
+   answer
+}
+
+/// Reads a line a key at a time from a raw terminal, and shows it unless
+/// `hidden`.
+fn typed(terminal: &mut File, hidden: bool) -> Result<String> {
+   const INTERRUPT: u8 = 3;
+   const END: u8 = 4;
+   const BACKSPACE: u8 = 8;
+   const KILL: u8 = 21;
+   const DELETE: u8 = 127;
+
+   let mut line = Vec::new();
+   let mut key = [0];
+
+   loop {
+      ensure!(terminal.read(&mut key)? == 1, "the terminal closed");
+
+      match key[0] {
+         b'\r' | b'\n' => break,
+         INTERRUPT | END => bail!("interrupted"),
+         erase @ (BACKSPACE | DELETE | KILL) => {
+            while let Some(last) = line.pop() {
+               // The bytes after the first of a character start with 10.
+               if last & 0xC0 == 0x80 {
+                  continue;
+               }
+
+               if !hidden {
+                  terminal.write_all(b"\x08 \x08")?;
+               }
+
+               if erase != KILL {
+                  break;
+               }
+            }
+         },
+         byte => {
+            line.push(byte);
+
+            if !hidden {
+               terminal.write_all(&key)?;
+            }
+         },
+      }
+   }
+
+   String::from_utf8(line).map_err(|_| report!("what was typed is not text"))
+}
+
+/// Logs in by answering what the server asks, which is a password in most
+/// cases. `false` means the server asked nothing, so it takes no passwords.
+fn converse(
+   login: &Login,
+   attempts: &Sender<Attempt>,
+   next: &Receiver<Heard>,
+   waker: &Waker,
+) -> Result<bool> {
+   let send = |offer| {
+      let sent = attempts.send(Ok(Some(offer))).is_ok();
+      waker.wake();
+      sent
+   };
+
+   let mut remembered = login
+      .answers
+      .lock()
+      .map_or_else(|_| Vec::new(), |mut kept| mem::take(&mut *kept))
+      .into_iter();
+
+   for round in 1..=PASSWORD_ROUNDS {
+      if !send(Offer::Converse) {
+         return Ok(true);
+      }
+
+      let mut given = Vec::new();
+
+      loop {
+         let (asks, text) = match next.recv() {
+            Ok(Heard::Prompt(asks, text)) => (asks, text),
+            Ok(Heard::Rejected) => break,
+            Err(_) => {
+               if let Ok(mut kept) = login.answers.lock() {
+                  *kept = given;
+               }
+
+               return Ok(true);
+            },
+         };
+
+         if asks == Asks::Nothing {
+            eprintln!("{text}\r");
+            continue;
+         }
+
+         let answer = if let Some(kept) = remembered.next() {
+            kept
+         } else {
+            let question = format!("({}@{}) {text}", login.user, login.host);
+            Zeroizing::new(ask(&question, asks == Asks::Hidden)?)
+         };
+
+         if !send(Offer::Answer(String::clone(&answer))) {
+            return Ok(true);
+         }
+
+         given.push(answer);
+      }
+
+      if given.is_empty() {
+         return Ok(false);
+      }
+
+      remembered = Vec::new().into_iter();
+
+      if round < PASSWORD_ROUNDS {
+         eprintln!("Permission denied, please try again.\r");
+      }
+   }
+
+   bail!("permission denied")
+}
 
 /// Checks a host that no certificate authority vouched for, then yields one
 /// signed login per usable agent key, each time the main loop asks for the
@@ -336,7 +539,7 @@ fn authenticate(
    host: Option<&PublicKey>,
    secret: &[u8; 32],
    attempts: &Sender<Attempt>,
-   next: &Receiver<()>,
+   next: &Receiver<Heard>,
    waker: &Waker,
 ) -> Result<()> {
    if let Some(host_key) = host {
@@ -346,10 +549,10 @@ fn authenticate(
    // The main loop takes one login and asks for the next when the server
    // refuses it. It sleeps until a packet arrives unless it is woken.
    let offer = |request| {
-      let sent = attempts.send(Ok(Some(request))).is_ok();
+      let sent = attempts.send(Ok(Some(Offer::Key(request)))).is_ok();
       waker.wake();
 
-      sent && next.recv().is_ok()
+      sent && matches!(next.recv(), Ok(Heard::Rejected))
    };
    let mut tried = Vec::new();
 
@@ -421,9 +624,7 @@ fn authenticate(
          .collect::<Vec<PathBuf>>()
    };
 
-   if files.is_empty() && tried.is_empty() {
-      bail!("no key to log in with, start ssh-agent or name a key file with -i");
-   }
+   let keyless = files.is_empty() && tried.is_empty();
 
    for file in files {
       let signed = sign_with_file(&file, &message(secret, &login.user), login.batch);
@@ -446,6 +647,14 @@ fn authenticate(
       if !offer(request) {
          return Ok(());
       }
+   }
+
+   if login.passwords && !login.batch && converse(login, attempts, next, waker)? {
+      return Ok(());
+   }
+
+   if keyless {
+      bail!("no key to log in with, start ssh-agent or name a key file with -i");
    }
 
    let _ = attempts.send(Ok(None));
@@ -636,8 +845,8 @@ struct Client {
    vouching: Option<(PublicKey, Vec<PublicKey>)>,
    /// Signed logins from the authentication thread.
    attempts: Option<Receiver<Attempt>>,
-   /// Asks the authentication thread for the next key.
-   next:     Option<Sender<()>>,
+   /// Tells the authentication thread what the server said.
+   next:     Option<Sender<Heard>>,
    /// Stderr streams of the server, until their four byte session header
    /// arrived.
    headings: HashMap<StreamId, Vec<u8>>,
@@ -1012,6 +1221,13 @@ impl Client {
       }
    }
 
+   /// Tells the authentication thread what the server made of its offer.
+   fn told(&self, heard: Heard) {
+      if let Some(ref next) = self.next {
+         let _ = next.send(heard);
+      }
+   }
+
    /// Handles what arrived on the control stream.
    fn control(&mut self, connection: &mut Connection, id: StreamId) -> Result<()> {
       for bytes in drain(connection, id)?.0 {
@@ -1072,11 +1288,8 @@ impl Client {
                }
             },
             heard @ (Message::Listing(_) | Message::Failed { .. }) => self.heard(heard),
-            Message::Rejected => {
-               if let Some(ref next) = self.next {
-                  let _ = next.send(());
-               }
-            },
+            Message::Rejected => self.told(Heard::Rejected),
+            Message::Prompt { asks, text } => self.told(Heard::Prompt(asks, text)),
             Message::Exit { session, status } => {
                if let Some(channel) = self.channels.get_mut(&session) {
                   channel.exit(status);
@@ -1219,7 +1432,7 @@ impl Client {
       };
 
       match attempts.try_recv() {
-         Ok(Ok(Some(request))) => {
+         Ok(Ok(Some(offer))) => {
             if self.control.is_none() {
                let control = connection
                   .streams()
@@ -1228,7 +1441,15 @@ impl Client {
                self.control = Some(control);
             }
 
-            self.outbox.push(&Message::Request(request));
+            self.outbox.push(&match offer {
+               Offer::Key(request) => Message::Request(request),
+               Offer::Converse => {
+                  Message::Converse {
+                     user: self.login.user.clone(),
+                  }
+               },
+               Offer::Answer(text) => Message::Answer(text),
+            });
 
             if let Some(control) = self.control {
                self.outbox.flush(connection, control)?;

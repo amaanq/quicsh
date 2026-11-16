@@ -21,8 +21,10 @@ use std::{
       mpsc::{
          Receiver,
          TryRecvError,
+         channel,
       },
    },
+   thread,
    time::{
       Duration,
       Instant,
@@ -49,6 +51,7 @@ use quicsh::{
       DETACH_LIMIT,
       Deframer,
       Handle,
+      MAX_DIALOGUE,
       Message,
       Open,
       Outbox,
@@ -65,7 +68,11 @@ use quicsh::{
       take_over,
    },
    key::PublicKey,
-   pipe::Waker,
+   pipe::{
+      Waker,
+      receive_message,
+      send_message,
+   },
    relay::{
       Relay,
       following,
@@ -124,6 +131,9 @@ use crate::{
    },
 };
 
+/// Most bytes in what a PAM process sends, which is a [`Message::Prompt`]
+/// in its frame.
+const MAX_QUESTION: usize = MAX_DIALOGUE + 64;
 /// How long a client may take to log in.
 const LOGIN_GRACE: Duration = Duration::from_secs(120);
 /// Login attempts allowed on one connection.
@@ -301,9 +311,52 @@ struct Peer {
    listeners: BTreeMap<u32, (Acceptor, Option<OwnedFd>)>,
    /// Unix sockets that a process is still making for a listener.
    binding:   Vec<Binding>,
+   /// The login that PAM is deciding.
+   asking:    Option<Conversation>,
 }
 
 impl Peer {
+   /// Tells the client that its login passed and takes on what it may do.
+   fn accept(
+      &mut self,
+      id: u64,
+      forwarding: Forwarding,
+      helper: &Helper,
+      connection: &mut Connection,
+   ) {
+      self.outbox.push(&Message::Accepted);
+      connection.set_receive_window(VarInt::from_u32(RECEIVE_WINDOW));
+
+      self.grant = Some(Grant {
+         id,
+         forwarding,
+         helper: helper.clone(),
+      });
+   }
+
+   /// Counts a login attempt. `true` means it was one too many and the
+   /// connection is closed.
+   fn spent(&mut self, now: Instant, connection: &mut Connection) -> Result<bool> {
+      if self.grant.is_some() || self.asking.is_some() {
+         bail!("login on a connection that is past it or in one");
+      }
+
+      self.attempts += 1;
+
+      if self.attempts > MAX_ATTEMPTS {
+         connection.close(now, AUTH_FAILED, Bytes::from_static(b"too many attempts"));
+      }
+
+      Ok(self.attempts > MAX_ATTEMPTS)
+   }
+
+   /// Gives PAM what the client typed at its question.
+   fn answer(&self, text: &str) {
+      if let Some(ref conversation) = self.asking {
+         let _ = send_message(&conversation.link, text.as_bytes(), &[]);
+      }
+   }
+
    /// Asks for a listener on the Unix socket at `path`, or tells the client
    /// that there will be none.
    fn listen(&mut self, listener: u32, path: String, waker: &Arc<Waker>) -> Result<()> {
@@ -405,6 +458,74 @@ impl Peer {
    }
 }
 
+/// A login that PAM decides, in a process that asks its questions here.
+struct Conversation {
+   /// The monitor's number for the process.
+   id:     u64,
+   /// Who wants to log in.
+   user:   String,
+   /// Takes the client's answers.
+   link:   OwnedFd,
+   /// Yields each question, and `None` once the process is done.
+   heard:  Receiver<Option<Message>>,
+   /// Reaches the monitor.
+   helper: Helper,
+}
+
+impl Conversation {
+   /// Starts the process, which is `None` when the server takes no
+   /// passwords.
+   fn start(
+      helper: &Helper,
+      user: String,
+      remote: SocketAddr,
+      waker: &Arc<Waker>,
+   ) -> Result<Option<Self>> {
+      let Some((id, link)) = helper.converse(user.clone(), remote)? else {
+         return Ok(None);
+      };
+
+      let (questions, heard) = channel();
+
+      let conversation = Self {
+         id,
+         user,
+         link,
+         heard,
+         helper: helper.clone(),
+      };
+
+      let source = conversation.link.try_clone()?;
+      let notifier = Arc::clone(waker);
+
+      thread::spawn(move || {
+         loop {
+            let prompt = receive_message(&source, MAX_QUESTION)
+               .ok()
+               .flatten()
+               .and_then(|(frame, _)| Message::decode(frame.get(4..)?).ok())
+               .filter(|message| matches!(*message, Message::Prompt { .. }));
+
+            let last = prompt.is_none();
+            let dropped = questions.send(prompt).is_err();
+            notifier.wake();
+
+            if last || dropped {
+               return;
+            }
+         }
+      });
+
+      Ok(Some(conversation))
+   }
+}
+
+impl Drop for Conversation {
+   fn drop(&mut self) {
+      let _ = self.helper.conclude(self.id, false);
+   }
+}
+
 /// A remote listener on a Unix socket that does not exist yet.
 struct Binding {
    /// The client's number for the listener.
@@ -468,14 +589,7 @@ impl Server {
       while let Some(message) = peer.deframer.pop()? {
          match message {
             Message::Request(request) => {
-               if peer.grant.is_some() {
-                  bail!("second login on an authenticated connection");
-               }
-
-               peer.attempts += 1;
-
-               if peer.attempts > MAX_ATTEMPTS {
-                  connection.close(now, AUTH_FAILED, Bytes::from_static(b"too many attempts"));
+               if peer.spent(now, connection)? {
                   return Ok(());
                }
 
@@ -496,15 +610,21 @@ impl Server {
                };
 
                println!("accepted {label} from {}", origin(connection));
-               peer.outbox.push(&Message::Accepted);
-               connection.set_receive_window(VarInt::from_u32(RECEIVE_WINDOW));
-
-               peer.grant = Some(Grant {
-                  id,
-                  forwarding,
-                  helper: self.helper.clone(),
-               });
+               peer.accept(id, forwarding, &self.helper, connection);
             },
+            Message::Converse { user } => {
+               if peer.spent(now, connection)? {
+                  return Ok(());
+               }
+
+               peer.asking =
+                  Conversation::start(&self.helper, user, origin(connection), &self.waker)?;
+
+               if peer.asking.is_none() {
+                  peer.outbox.push(&Message::Rejected);
+               }
+            },
+            Message::Answer(text) => peer.answer(&text),
             Message::Resize { session, size } => {
                if let Some(resized) = peer.sessions.get(&session) {
                   resized.resize(size)?;
@@ -862,6 +982,7 @@ impl Server {
                named:     0,
                listeners: BTreeMap::new(),
                binding:   Vec::new(),
+               asking:    None,
             });
          },
          Event::Stream(StreamEvent::Opened { dir: Dir::Bi }) => {
@@ -919,6 +1040,42 @@ impl Server {
       Ok(())
    }
 
+   /// Passes on what PAM asks and tells the client what it decided.
+   fn converse(&mut self, handle: ConnectionHandle, connection: &mut Connection) -> Result<()> {
+      let Some(peer) = self.peers.get_mut(&handle) else {
+         return Ok(());
+      };
+      let Some(ref conversation) = peer.asking else {
+         return Ok(());
+      };
+
+      loop {
+         match conversation.heard.try_recv() {
+            Ok(Some(prompt)) => peer.outbox.push(&prompt),
+            Ok(None) | Err(TryRecvError::Disconnected) => break,
+            Err(TryRecvError::Empty) => return Ok(()),
+         }
+      }
+
+      let granted = conversation.helper.conclude(conversation.id, true)?;
+
+      if granted.is_some() {
+         let user = &conversation.user;
+         println!("accepted a password for {user} from {}", origin(connection));
+      }
+
+      peer.asking = None;
+
+      match granted {
+         Some(Reply::Granted { grant, forwarding }) => {
+            peer.accept(grant, forwarding, &self.helper, connection);
+         },
+         _ => peer.outbox.push(&Message::Rejected),
+      }
+
+      self.admit(handle, connection)
+   }
+
    /// Moves session and forward data and reports finished sessions. Returns
    /// the next instant this connection needs attention.
    fn pump(
@@ -926,6 +1083,8 @@ impl Server {
       handle: ConnectionHandle,
       connection: &mut Connection,
    ) -> Result<Option<Instant>> {
+      self.converse(handle, connection)?;
+
       let Some(peer) = self.peers.get_mut(&handle) else {
          return Ok(None);
       };

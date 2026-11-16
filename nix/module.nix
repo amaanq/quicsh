@@ -89,6 +89,15 @@ in
       '';
     };
 
+    passwordAuthentication = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Let every account but root log in with a password, which the PAM
+        service `qshd` checks. Keys log in either way.
+      '';
+    };
+
     sftpServer = lib.mkOption {
       type = lib.types.path;
       default = "${pkgs.openssh}/libexec/sftp-server";
@@ -144,6 +153,8 @@ in
 
     networking.firewall.allowedUDPPorts = lib.mkIf cfg.openFirewall [ cfg.port ];
 
+    security.pam.services.qshd = lib.mkIf cfg.passwordAuthentication { };
+
     environment.systemPackages = [ cfg.package ];
 
     systemd.services.qshd = {
@@ -184,6 +195,10 @@ in
           ++ lib.optionals (cfg.authorities != null) [
             "--authorities"
             cfg.authorities
+          ]
+          ++ lib.optionals cfg.passwordAuthentication [
+            "--pam"
+            "qshd"
           ]
           ++ lib.optionals (cfg.hostCertificate != null) [
             "--host-certificate"

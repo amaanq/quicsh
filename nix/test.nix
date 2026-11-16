@@ -1,12 +1,18 @@
 {
   testers,
+  coreutils,
   openssh,
   rsync,
   runCommand,
   self,
   socat,
+  writeShellScript,
 }:
 let
+  password = writeShellScript "qshd-test-password" ''
+    [ "$(${coreutils}/bin/tr -d '\0')" = hunter2 ]
+  '';
+
   keys = runCommand "qshd-test-keys" { nativeBuildInputs = [ openssh ]; } ''
     mkdir $out
     ssh-keygen -q -t ed25519 -N "" -f $out/authority
@@ -43,9 +49,18 @@ testers.runNixOSTest {
     services.qshd = {
       enable = true;
       openFirewall = true;
+      passwordAuthentication = true;
     };
 
     users.users.alice.isNormalUser = true;
+    users.users.bob.isNormalUser = true;
+
+    # pam_unix checks a password through a setuid wrapper, which the test
+    # containers do not have.
+    security.pam.services.qshd.text = ''
+      auth required pam_exec.so expose_authtok quiet ${password}
+      account required pam_permit.so
+    '';
 
     environment.systemPackages = [ socat ];
   };
@@ -99,6 +114,16 @@ testers.runNixOSTest {
         sent = client.succeed("qsh -i /root/user -o 'SetEnv PROBE_ONE=sent LC_PROBE=sent' alice@certified env")
         assert "PROBE_ONE=sent" in sent
         assert "LC_PROBE" not in sent
+
+    with subtest("a password logs in where the server takes one"):
+        client.succeed("printf '#!/bin/sh\\necho hunter2\\n' > /tmp/right")
+        client.succeed("printf '#!/bin/sh\\necho wrong\\n' > /tmp/wrong")
+        client.succeed("chmod +x /tmp/right /tmp/wrong")
+        asked = "SSH_ASKPASS_REQUIRE=force SSH_ASKPASS=/tmp/"
+        assert "(bob)" in client.succeed(asked + "right qsh bob@server id")
+        client.fail(asked + "wrong qsh bob@server id")
+        client.fail(asked + "right qsh -o PasswordAuthentication=no bob@server id")
+        client.fail(asked + "right qsh bob@certified id")
 
     with subtest("a forwarded Unix socket belongs to the account"):
         client.succeed("(qsh -N -R /home/alice/forward.sock:localhost:1 alice@server >/dev/null 2>&1 &)")

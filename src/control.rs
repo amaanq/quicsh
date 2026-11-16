@@ -93,6 +93,14 @@ const LISTING: u8 = 27;
 const END: u8 = 28;
 /// Tag of [`Message::Stay`].
 const STAY: u8 = 29;
+/// Tag of [`Message::Converse`].
+const CONVERSE: u8 = 30;
+/// Tag of [`Message::Prompt`].
+const PROMPT: u8 = 31;
+/// Tag of [`Message::Answer`].
+const ANSWER: u8 = 32;
+/// Most bytes in a [`Message::Prompt`] or a [`Message::Answer`].
+pub const MAX_DIALOGUE: usize = 1024;
 
 /// Most names one [`Message::Listing`] carries.
 const MAX_NAMES: u32 = 1024;
@@ -291,6 +299,58 @@ pub enum Message {
    Certify,
    /// The server's host certificate, which is empty when it has none.
    HostCertificate(Vec<u8>),
+   /// Asks to log in by answering what the server asks, which is how a
+   /// password gets there. The server sends each [`Message::Prompt`] and
+   /// then accepts or rejects. It rejects at once when it takes no
+   /// passwords.
+   Converse {
+      user: String,
+   },
+   /// Something the server wants shown to whoever logs in.
+   Prompt {
+      asks: Asks,
+      text: String,
+   },
+   /// What was typed at a [`Message::Prompt`] that asks.
+   Answer(String),
+}
+
+/// What the client does with the text of a [`Message::Prompt`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Asks {
+   /// Shows it and reads an answer that stays off the screen.
+   Hidden,
+   /// Shows it and reads an answer.
+   Shown,
+   /// Shows it.
+   Nothing,
+}
+
+/// Appends a [`Message::Converse`], [`Message::Prompt`] or
+/// [`Message::Answer`].
+fn put_dialogue(out: &mut Vec<u8>, message: &Message) {
+   match *message {
+      Message::Converse { ref user } => {
+         out.push(CONVERSE);
+         put_string(out, user.as_bytes());
+      },
+      Message::Prompt { asks, ref text } => {
+         out.push(PROMPT);
+
+         out.push(match asks {
+            Asks::Hidden => 0,
+            Asks::Shown => 1,
+            Asks::Nothing => 2,
+         });
+
+         put_string(out, text.as_bytes());
+      },
+      Message::Answer(ref text) => {
+         out.push(ANSWER);
+         put_string(out, text.as_bytes());
+      },
+      _ => {},
+   }
 }
 
 /// Appends everything an [`Open`] holds.
@@ -606,6 +666,9 @@ impl Message {
          Self::Resumable { .. } | Self::Sessions | Self::Listing(_) | Self::End(_) => {
             put_session(&mut payload, self);
          },
+         Self::Converse { .. } | Self::Prompt { .. } | Self::Answer(_) => {
+            put_dialogue(&mut payload, self);
+         },
          Self::Failed {
             session,
             ref reason,
@@ -684,6 +747,40 @@ impl Message {
             Self::Listing(names)
          },
          _ => Self::End(text(reader)?),
+      })
+   }
+
+   /// Reads the rest of a message that [`put_dialogue`] started.
+   fn dialogue(tag: u8, reader: &mut Reader<'_>) -> Result<Self, Error> {
+      let bounded = |limit: usize, source: &mut Reader<'_>| {
+         let read = text(source)?;
+         (read.len() <= limit).then_some(read).ok_or(Error::Frame)
+      };
+
+      Ok(match tag {
+         CONVERSE => {
+            let user = bounded(MAX_USER, reader)?;
+
+            if user.is_empty() {
+               return Err(Error::Frame);
+            }
+
+            Self::Converse { user }
+         },
+         PROMPT => {
+            let asks = match reader.byte()? {
+               0 => Asks::Hidden,
+               1 => Asks::Shown,
+               2 => Asks::Nothing,
+               _ => return Err(Error::Frame),
+            };
+
+            Self::Prompt {
+               asks,
+               text: bounded(MAX_DIALOGUE, reader)?,
+            }
+         },
+         _ => Self::Answer(bounded(MAX_DIALOGUE, reader)?),
       })
    }
 
@@ -785,6 +882,7 @@ impl Message {
          },
          GONE => Self::Gone,
          tag @ (RESUMABLE | SESSIONS | LISTING | END) => Self::session(tag, &mut reader)?,
+         tag @ (CONVERSE | PROMPT | ANSWER) => Self::dialogue(tag, &mut reader)?,
          FAILED => {
             Self::Failed {
                session: reader.u32()?,
@@ -879,7 +977,9 @@ mod tests {
 
    use crate::{
       control::{
+         Asks,
          Deframer,
+         MAX_DIALOGUE,
          MAX_FRAME,
          Message,
          Open,
@@ -890,6 +990,38 @@ mod tests {
       },
       error::Error,
    };
+
+   /// A prompt survives the wire, and the limits on a login by answers hold.
+   #[test]
+   fn dialogue_keeps_its_limits() {
+      let prompt = Message::Prompt {
+         asks: Asks::Hidden,
+         text: "Password: ".to_owned(),
+      };
+      let frame = prompt.encode();
+
+      assert!(
+         matches!(
+            Message::decode(&frame[4..]),
+            Ok(Message::Prompt { asks: Asks::Hidden, ref text }) if text == "Password: "
+         ),
+         "a prompt survives the wire"
+      );
+
+      let long = Message::Answer("x".repeat(MAX_DIALOGUE + 1)).encode();
+      assert!(
+         Message::decode(&long[4..]).is_err(),
+         "an answer over the limit"
+      );
+
+      let nobody = Message::Converse {
+         user: String::new(),
+      };
+      assert!(
+         Message::decode(&nobody.encode()[4..]).is_err(),
+         "an empty user"
+      );
+   }
 
    /// A frame that arrives in pieces decodes once it is whole, and the bytes
    /// after it are kept.

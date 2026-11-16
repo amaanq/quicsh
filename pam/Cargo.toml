@@ -1,0 +1,9 @@
+[package]
+name        = "quicsh-pam"
+version     = "0.1.0"
+edition     = "2024"
+description = "Password logins through PAM, as much of it as quicsh uses"
+repository  = "https://github.com/amaanq/quicsh"
+license     = "EUPL-1.2"
+keywords    = [ "authentication", "pam", "password" ]
+categories  = [ "authentication", "external-ffi-bindings" ]
