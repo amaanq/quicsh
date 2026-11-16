@@ -772,6 +772,33 @@ fn ecdsa(curve: Curve, private: &mut Reader<'_>) -> Result<HostKey, Error> {
    )))
 }
 
+/// Reads the public half that an OpenSSH private key file carries in the
+/// clear, encrypted or not.
+///
+/// # Errors
+///
+/// Fails when the file is malformed or holds an unsupported key type.
+pub fn public_from_openssh(text: &str) -> Result<PublicKey, Error> {
+   let body = text
+      .trim()
+      .strip_prefix(PRIVATE_BEGIN)
+      .and_then(|rest| rest.strip_suffix(PRIVATE_END))
+      .ok_or(Error::PrivateKey)?;
+
+   let file = decode(body)?;
+   let mut reader = Reader::new(file.strip_prefix(PRIVATE_MAGIC).ok_or(Error::PrivateKey)?);
+
+   let _cipher = reader.string()?;
+   let _kdf = reader.string()?;
+   let _kdf_options = reader.string()?;
+
+   if reader.u32()? != 1 {
+      return Err(Error::PrivateKey);
+   }
+
+   PublicKey::from_blob(reader.string()?)
+}
+
 /// Reads an unencrypted OpenSSH private key file.
 ///
 /// # Errors

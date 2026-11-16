@@ -8,6 +8,7 @@ use std::{
    env,
    fmt::Write as _,
    fs,
+   io,
    net::SocketAddr,
    path::{
       Path,
@@ -34,7 +35,10 @@ use quicsh::{
       expand,
    },
    control::Message,
-   key::PublicKey,
+   key::{
+      PublicKey,
+      public_from_openssh,
+   },
    known_hosts::glob,
    transport::{
       Congestion,
@@ -219,10 +223,11 @@ pub fn beside(path: &Path) -> Option<Certificate> {
 }
 
 impl Identity {
-   /// Reads the public half that sits beside a key file. `path` may name
-   /// either half.
+   /// Reads the public half that sits beside a key file, or the copy inside
+   /// the private key file when there is none, as `ssh` does. `path` may
+   /// name either half.
    fn load(path: &Path) -> Result<Self> {
-      let (public, file) = if path.extension().is_some_and(|extension| extension == "pub") {
+      let (half, file) = if path.extension().is_some_and(|extension| extension == "pub") {
          (path.to_owned(), path.with_extension(""))
       } else {
          let mut name = path.to_owned().into_os_string();
@@ -230,13 +235,21 @@ impl Identity {
          (PathBuf::from(name), path.to_owned())
       };
 
-      let text = fs::read_to_string(&public)
-         .with_context(|| format!("reading public key {}", public.display()))?;
+      let public = match fs::read_to_string(&half) {
+         Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let text = fs::read_to_string(&file)
+               .with_context(|| format!("reading key {}", file.display()))?;
 
-      Ok(Self {
-         public: text.parse()?,
-         file,
-      })
+            public_from_openssh(&text)?
+         },
+         read => {
+            read
+               .with_context(|| format!("reading public key {}", half.display()))?
+               .parse()?
+         },
+      };
+
+      Ok(Self { public, file })
    }
 }
 
