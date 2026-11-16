@@ -313,7 +313,11 @@ pub fn wait(socket: &OwnedFd, signals: &File, interactive: bool) -> Result<u32> 
       match Notice::decode(&bytes) {
          Some(Notice::Exit(status)) => return Ok(status),
          Some(Notice::Lost) => raw = None,
-         Some(Notice::Resumed) if interactive => raw = Some(RawMode::enable()?),
+         // A second guard would save the raw mode as the one to restore,
+         // and the first would put the terminal back as it is dropped.
+         Some(Notice::Resumed) if interactive && raw.is_none() => {
+            raw = Some(RawMode::enable()?);
+         },
          Some(Notice::Resumed) | None => {},
       }
    }

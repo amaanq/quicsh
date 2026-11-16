@@ -352,6 +352,7 @@ impl Channel {
       }
 
       match self.owner {
+         Owner::Process(ref mut raw) if enabled == raw.is_some() => {},
          Owner::Process(ref mut raw) => {
             *raw = enabled.then(RawMode::enable).transpose()?;
          },
