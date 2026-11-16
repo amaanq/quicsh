@@ -1281,7 +1281,9 @@ impl Server {
       connection.close(
          now,
          PROTOCOL_ERROR,
-         Bytes::from_static(b"unreadable message, qsh may be another version"),
+         Bytes::from_static(
+            b"error on this connection, see the server's log, qsh may be another version",
+         ),
       );
       self.peers.remove(&handle);
    }

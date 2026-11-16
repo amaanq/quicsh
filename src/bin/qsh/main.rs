@@ -1544,7 +1544,10 @@ impl App for Client {
          Event::ConnectionLost {
             reason: ConnectionError::ApplicationClosed(ref close),
          } if close.error_code == PROTOCOL_ERROR => {
-            bail!("the server could not read what this qsh sent, qshd may be another version");
+            bail!(
+               "the server gave up on this connection and its log says why, qshd may be another \
+                version than this qsh"
+            );
          },
          Event::ConnectionLost { reason } => {
             let silent = match reason {
