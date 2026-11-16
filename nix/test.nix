@@ -2,11 +2,34 @@
   testers,
   openssh,
   rsync,
+  runCommand,
   self,
   socat,
 }:
+let
+  keys = runCommand "qshd-test-keys" { nativeBuildInputs = [ openssh ]; } ''
+    mkdir $out
+    ssh-keygen -q -t ed25519 -N "" -f $out/authority
+    ssh-keygen -q -t ed25519 -N "" -f $out/host
+    ssh-keygen -q -s $out/authority -h -I certified -n certified $out/host.pub
+  '';
+in
 testers.runNixOSTest {
   name = "qshd";
+
+  containers.certified = {
+    imports = [ self.nixosModules.default ];
+
+    services.qshd = {
+      enable = true;
+      openFirewall = true;
+      hostKey = "${keys}/host";
+      hostCertificate = "${keys}/host-cert.pub";
+      acceptEnv = [ "PROBE_*" ];
+    };
+
+    users.users.alice.isNormalUser = true;
+  };
 
   containers.server = {
     imports = [ self.nixosModules.default ];
@@ -35,14 +58,16 @@ testers.runNixOSTest {
   testScript = /* py */ ''
     start_all()
     server.wait_for_unit("qshd.service")
+    certified.wait_for_unit("qshd.service")
     client.wait_for_unit("multi-user.target")
 
     client.succeed("mkdir -p /root/.ssh && ssh-keygen -q -t ed25519 -N ''' -f /root/.ssh/id_ed25519")
     key = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
 
-    server.succeed("install -d -m 700 -o alice /home/alice/.ssh")
-    server.succeed(f"echo '{key}' > /home/alice/.ssh/authorized_keys")
-    server.succeed("chown alice /home/alice/.ssh/authorized_keys")
+    for machine in [server, certified]:
+        machine.succeed("install -d -m 700 -o alice /home/alice/.ssh")
+        machine.succeed(f"echo '{key}' > /home/alice/.ssh/authorized_keys")
+        machine.succeed("chown alice /home/alice/.ssh/authorized_keys")
 
     host = server.succeed("cat /etc/ssh/ssh_host_ed25519_key.pub").split()
     client.succeed(f"echo 'server {host[0]} {host[1]}' > /root/.ssh/known_hosts")
@@ -58,6 +83,15 @@ testers.runNixOSTest {
 
     with subtest("an accepted environment variable reaches the session"):
         assert "LC_PROBE=sent" in client.succeed("qsh -o 'SetEnv LC_PROBE=sent' alice@server env")
+
+    with subtest("a host certificate stands in for a known host key"):
+        client.succeed("echo '@cert-authority certified '$(cat ${keys}/authority.pub) >> /root/.ssh/known_hosts")
+        assert "uid=1000(alice)" in client.succeed("qsh -o BatchMode=yes alice@certified id")
+
+    with subtest("only the listed environment patterns are accepted"):
+        sent = client.succeed("qsh -o 'SetEnv PROBE_ONE=sent LC_PROBE=sent' alice@certified env")
+        assert "PROBE_ONE=sent" in sent
+        assert "LC_PROBE" not in sent
 
     with subtest("a forwarded Unix socket belongs to the account"):
         client.succeed("(qsh -N -R /home/alice/forward.sock:localhost:1 alice@server >/dev/null 2>&1 &)")
