@@ -99,9 +99,12 @@ use quicsh::{
       udp_socket,
    },
 };
-use ring::rand::{
-   SecureRandom as _,
-   SystemRandom,
+use ring::{
+   hmac,
+   rand::{
+      SecureRandom as _,
+      SystemRandom,
+   },
 };
 use rustix::{
    event::{
@@ -161,6 +164,17 @@ const MAX_KEPT: usize = 64;
 /// File in the holders directory with the keys a restarted server shares
 /// with the old one. It sits on a runtime directory, so a reboot replaces it.
 const RESTART_SECRET: &str = "restart-secret";
+/// File in the holders directory with the key that signs login tickets.
+/// The network process gets the restart secret and never this one.
+const TICKET_SECRET: &str = "ticket-secret";
+/// How long a ticket logs its account in, which is as long as a session
+/// waits for its client.
+const TICKET_LIFE: Duration = DETACH_LIMIT;
+/// How long after its password was typed a login still gets tickets and
+/// its tickets still log in. Renewing a ticket does not move that time.
+const TICKET_SPAN: Duration = Duration::from_hours(24);
+/// Bytes in the signature that ends a ticket.
+const TICKET_TAG: usize = 32;
 /// Socket in the holders directory of the process that keeps forwarded
 /// connections for the next server.
 const KEPT: &str = "forwards";
@@ -211,6 +225,9 @@ struct Grant {
    account: Account,
    /// What the key that logged in may do.
    permit:  Permit,
+   /// When the password behind the login was typed, in seconds since
+   /// 1970. A login by key has none and gets no tickets.
+   typed:   Option<u64>,
 }
 
 /// State of the privileged process.
@@ -301,13 +318,10 @@ impl Monitor {
          return Ok(Reply::Denied);
       }
 
-      // A clock that cannot be read makes every `expiry-time` count as past.
       let attempt = Attempt {
          remote,
          presence,
-         now: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(u64::MAX, |since| since.as_secs()),
+         now: clock(),
          certificate: login.certificate.as_deref(),
       };
 
@@ -324,11 +338,11 @@ impl Monitor {
          return Ok(Reply::Denied);
       };
 
-      Ok(self.grant(account, permit))
+      Ok(self.grant(account, permit, None))
    }
 
    /// Records a login that passed.
-   fn grant(&mut self, account: Account, permit: Permit) -> Reply {
+   fn grant(&mut self, account: Account, permit: Permit, typed: Option<u64>) -> Reply {
       // The network process opens and accepts forwards on ports. The ones
       // on Unix sockets are checked here.
       let reply = Reply::Granted {
@@ -337,7 +351,11 @@ impl Monitor {
       };
 
       if let Reply::Granted { grant, .. } = reply {
-         self.grants.insert(grant, Grant { account, permit });
+         self.grants.insert(grant, Grant {
+            account,
+            permit,
+            typed,
+         });
       }
 
       reply
@@ -400,7 +418,17 @@ impl Monitor {
          }
       };
 
-      let Some(account) = Account::lookup(&user)?.filter(|_| allowed && wanted) else {
+      if !(allowed && wanted) {
+         return Ok(Reply::Denied);
+      }
+
+      self.admit(&user, clock())
+   }
+
+   /// Logs in an account that a password or a ticket vouched for, unless
+   /// it is root. The password was typed at `typed`.
+   fn admit(&mut self, user: &str, typed: u64) -> Result<Reply> {
+      let Some(account) = Account::lookup(user)? else {
          return Ok(Reply::Denied);
       };
 
@@ -410,7 +438,56 @@ impl Monitor {
          return Ok(Reply::Denied);
       }
 
-      Ok(self.grant(account, Permit::whole()))
+      Ok(self.grant(account, Permit::whole(), Some(typed)))
+   }
+
+   /// A ticket for the account of a login that gets them. It holds when it
+   /// ends, when the password was typed, the account's name and a
+   /// signature over the three.
+   fn ticket(&self, grant: u64) -> Result<Reply> {
+      let held = self.grants.get(&grant).context("unknown grant")?;
+      let typed = held.typed.context("a login by key gets no ticket")?;
+      let last = typed.saturating_add(TICKET_SPAN.as_secs());
+      ensure!(clock() < last, "the password was typed too long ago");
+
+      let ends = clock().saturating_add(TICKET_LIFE.as_secs()).min(last);
+      let mut ticket = ends.to_be_bytes().to_vec();
+      ticket.extend_from_slice(&typed.to_be_bytes());
+      ticket.extend_from_slice(held.account.name.as_bytes());
+
+      let key = hmac::Key::new(hmac::HMAC_SHA256, &self.secret(TICKET_SECRET)?);
+      let tag = hmac::sign(&key, &ticket);
+      ticket.extend_from_slice(tag.as_ref());
+
+      Ok(Reply::Ticket(ticket))
+   }
+
+   /// Logs in the account that a ticket of this server names, while the
+   /// ticket holds.
+   fn redeem(&mut self, user: &str, ticket: &[u8]) -> Result<Reply> {
+      let parts = ticket
+         .len()
+         .checked_sub(TICKET_TAG)
+         .and_then(|length| ticket.split_at_checked(length))
+         .and_then(|(body, tag)| Some((body.split_first_chunk::<16>()?, body, tag)));
+
+      let Some(((times, named), body, tag)) = parts else {
+         return Ok(Reply::Denied);
+      };
+
+      let (ends, typed) = times.split_at(8);
+      let seconds = |bytes: &[u8]| bytes.try_into().map_or(0, u64::from_be_bytes);
+      let key = hmac::Key::new(hmac::HMAC_SHA256, &self.secret(TICKET_SECRET)?);
+
+      let holds = hmac::verify(&key, body, tag).is_ok()
+         && named == user.as_bytes()
+         && seconds(ends) > clock();
+
+      if !holds {
+         return Ok(Reply::Denied);
+      }
+
+      self.admit(user, seconds(typed))
    }
 
    /// Where the socket of the holder for `token` and `uid` lives. The uid in
@@ -751,9 +828,10 @@ impl Monitor {
       Ok((Reply::Done, vec![near]))
    }
 
-   /// Reads the restart secret, making one when this boot has none yet.
-   fn secret(&self) -> Result<Vec<u8>> {
-      let path = self.holders.join(RESTART_SECRET);
+   /// Reads one of the secrets that outlast a restart, making it when this
+   /// boot has none yet.
+   fn secret(&self, name: &str) -> Result<Vec<u8>> {
+      let path = self.holders.join(name);
       let whole = || {
          fs::read(&path)
             .ok()
@@ -769,9 +847,7 @@ impl Monitor {
          .fill(&mut secret)
          .map_err(|_| report!("system random source failed"))?;
 
-      let draft = self
-         .holders
-         .join(format!("{RESTART_SECRET}.{}", process::id()));
+      let draft = self.holders.join(format!("{name}.{}", process::id()));
 
       OpenOptions::new()
          .write(true)
@@ -897,7 +973,7 @@ impl Monitor {
             let reply = Reply::Hello {
                key:         key.to_vec(),
                listen:      self.listen,
-               secret:      self.secret()?,
+               secret:      self.secret(RESTART_SECRET)?,
                certificate: self.certificate.clone(),
             };
 
@@ -910,6 +986,8 @@ impl Monitor {
             conversation,
             wanted,
          } => plain(self.conclude(conversation, wanted)?),
+         Request::Redeem { user, ticket } => plain(self.redeem(&user, &ticket)?),
+         Request::Ticket { grant } => plain(self.ticket(grant)?),
          Request::Kept => Ok(self.kept()),
          Request::Socket { local, remote } => {
             ensure!(
@@ -972,6 +1050,14 @@ impl Monitor {
          } => self.reach(grant, &path, listen),
       }
    }
+}
+
+/// Seconds since 1970. A clock that cannot be read makes every ticket and
+/// every `expiry-time` count as past.
+fn clock() -> u64 {
+   SystemTime::now()
+      .duration_since(UNIX_EPOCH)
+      .map_or(u64::MAX, |since| since.as_secs())
 }
 
 /// Makes the directory for holder sockets, which only this user can enter,

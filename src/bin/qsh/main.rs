@@ -340,6 +340,8 @@ enum Offer {
    Converse,
    /// What was typed at one of the server's questions.
    Answer(String),
+   /// What the server sent after an earlier login by password.
+   Ticket(Zeroizing<Vec<u8>>),
 }
 
 /// What the server made of an [`Offer`].
@@ -472,30 +474,18 @@ fn converse(
       sent
    };
 
-   let mut remembered = login
-      .answers
-      .lock()
-      .map_or_else(|_| Vec::new(), |mut kept| mem::take(&mut *kept))
-      .into_iter();
-
    for round in 1..=PASSWORD_ROUNDS {
       if !send(Offer::Converse) {
          return Ok(true);
       }
 
-      let mut given = Vec::new();
+      let mut asked = false;
 
       loop {
          let (asks, text) = match next.recv() {
             Ok(Heard::Prompt(asks, text)) => (asks, text),
             Ok(Heard::Rejected) => break,
-            Err(_) => {
-               if let Ok(mut kept) = login.answers.lock() {
-                  *kept = given;
-               }
-
-               return Ok(true);
-            },
+            Err(_) => return Ok(true),
          };
 
          if asks == Asks::Nothing {
@@ -503,25 +493,17 @@ fn converse(
             continue;
          }
 
-         let answer = if let Some(kept) = remembered.next() {
-            kept
-         } else {
-            let question = format!("({}@{}) {text}", login.user, login.host);
-            Zeroizing::new(ask(&question, asks == Asks::Hidden)?)
-         };
+         let question = format!("({}@{}) {text}", login.user, login.host);
+         asked = true;
 
-         if !send(Offer::Answer(String::clone(&answer))) {
+         if !send(Offer::Answer(ask(&question, asks == Asks::Hidden)?)) {
             return Ok(true);
          }
-
-         given.push(answer);
       }
 
-      if given.is_empty() {
+      if !asked {
          return Ok(false);
       }
-
-      remembered = Vec::new().into_iter();
 
       if round < PASSWORD_ROUNDS {
          eprintln!("Permission denied, please try again.\r");
@@ -548,12 +530,26 @@ fn authenticate(
 
    // The main loop takes one login and asks for the next when the server
    // refuses it. It sleeps until a packet arrives unless it is woken.
-   let offer = |request| {
-      let sent = attempts.send(Ok(Some(Offer::Key(request)))).is_ok();
+   let offer = |offered| {
+      let sent = attempts.send(Ok(Some(offered))).is_ok();
       waker.wake();
 
       sent && matches!(next.recv(), Ok(Heard::Rejected))
    };
+
+   let ticket = login.ticket.lock().ok().and_then(|mut kept| kept.take());
+
+   // A ticket exists only after a login by password, so no key logs in
+   // here, and a session reads the terminal that a password would be
+   // typed on.
+   if let Some(kept) = ticket {
+      if !offer(Offer::Ticket(kept)) {
+         return Ok(());
+      }
+
+      bail!("the server no longer takes this login's ticket, log in again with the password");
+   }
+
    let mut tried = Vec::new();
 
    let certified = |key: &PublicKey| {
@@ -595,7 +591,7 @@ fn authenticate(
             key:         identity.key,
          };
 
-         if !offer(request) {
+         if !offer(Offer::Key(request)) {
             return Ok(());
          }
       }
@@ -644,7 +640,7 @@ fn authenticate(
          signature,
       };
 
-      if !offer(request) {
+      if !offer(Offer::Key(request)) {
          return Ok(());
       }
    }
@@ -1228,6 +1224,13 @@ impl Client {
       }
    }
 
+   /// Keeps what logs this account in again without its password.
+   fn keep(&self, ticket: Vec<u8>) {
+      if let Ok(mut kept) = self.login.ticket.lock() {
+         *kept = Some(Zeroizing::new(ticket));
+      }
+   }
+
    /// Handles what arrived on the control stream.
    fn control(&mut self, connection: &mut Connection, id: StreamId) -> Result<()> {
       for bytes in drain(connection, id)?.0 {
@@ -1290,6 +1293,7 @@ impl Client {
             heard @ (Message::Listing(_) | Message::Failed { .. }) => self.heard(heard),
             Message::Rejected => self.told(Heard::Rejected),
             Message::Prompt { asks, text } => self.told(Heard::Prompt(asks, text)),
+            Message::Ticket(ticket) => self.keep(ticket),
             Message::Exit { session, status } => {
                if let Some(channel) = self.channels.get_mut(&session) {
                   channel.exit(status);
@@ -1449,6 +1453,12 @@ impl Client {
                   }
                },
                Offer::Answer(text) => Message::Answer(text),
+               Offer::Ticket(ticket) => {
+                  Message::Redeem {
+                     user:   self.login.user.clone(),
+                     ticket: ticket.to_vec(),
+                  }
+               },
             });
 
             if let Some(control) = self.control {

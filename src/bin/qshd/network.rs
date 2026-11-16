@@ -134,6 +134,9 @@ use crate::{
 /// Most bytes in what a PAM process sends, which is a [`Message::Prompt`]
 /// in its frame.
 const MAX_QUESTION: usize = MAX_DIALOGUE + 64;
+/// How often a login that gets tickets gets a new one, which leaves each
+/// with most of its hour when the connection is lost.
+const TICKET_REFRESH: Duration = Duration::from_mins(10);
 /// How long a client may take to log in.
 const LOGIN_GRACE: Duration = Duration::from_secs(120);
 /// Login attempts allowed on one connection.
@@ -222,6 +225,9 @@ struct Grant {
    forwarding: Forwarding,
    /// Reaches the monitor.
    helper:     Helper,
+   /// When the client gets its next ticket, for a login that a password
+   /// or a ticket started.
+   renew:      Option<Instant>,
 }
 
 impl Grant {
@@ -323,6 +329,7 @@ impl Peer {
       forwarding: Forwarding,
       helper: &Helper,
       connection: &mut Connection,
+      ticketed: bool,
    ) {
       self.outbox.push(&Message::Accepted);
       connection.set_receive_window(VarInt::from_u32(RECEIVE_WINDOW));
@@ -331,7 +338,73 @@ impl Peer {
          id,
          forwarding,
          helper: helper.clone(),
+         renew: ticketed.then(Instant::now),
       });
+   }
+
+   /// Logs in a client that shows a ticket, or tells it that the ticket
+   /// is no good.
+   fn redeem(
+      &mut self,
+      now: Instant,
+      user: &str,
+      ticket: &[u8],
+      helper: &Helper,
+      connection: &mut Connection,
+   ) -> Result<()> {
+      if self.spent(now, connection)? {
+         return Ok(());
+      }
+
+      let Some(Reply::Granted { grant, forwarding }) = helper.redeem(user, ticket)? else {
+         self.outbox.push(&Message::Rejected);
+         return Ok(());
+      };
+
+      println!("accepted a ticket for {user} from {}", origin(connection));
+      self.accept(grant, forwarding, helper, connection, true);
+
+      Ok(())
+   }
+
+   /// Starts a login that PAM decides, or tells the client that this
+   /// server takes no passwords.
+   fn ask(
+      &mut self,
+      now: Instant,
+      user: String,
+      helper: &Helper,
+      waker: &Arc<Waker>,
+      connection: &mut Connection,
+   ) -> Result<()> {
+      if self.spent(now, connection)? {
+         return Ok(());
+      }
+
+      self.asking = Conversation::start(helper, user, origin(connection), waker)?;
+
+      if self.asking.is_none() {
+         self.outbox.push(&Message::Rejected);
+      }
+
+      Ok(())
+   }
+
+   /// Sends a login that gets tickets its next one when that is due.
+   fn renew(&mut self) {
+      let Some(ref mut grant) = self.grant else {
+         return;
+      };
+
+      if grant.renew.is_none_or(|due| Instant::now() < due) {
+         return;
+      }
+
+      if let Ok(ticket) = grant.helper.ticket(grant.id) {
+         self.outbox.push(&Message::Ticket(ticket));
+      }
+
+      grant.renew = Some(Instant::now() + TICKET_REFRESH);
    }
 
    /// Counts a login attempt. `true` means it was one too many and the
@@ -610,19 +683,13 @@ impl Server {
                };
 
                println!("accepted {label} from {}", origin(connection));
-               peer.accept(id, forwarding, &self.helper, connection);
+               peer.accept(id, forwarding, &self.helper, connection, false);
+            },
+            Message::Redeem { user, ticket } => {
+               peer.redeem(now, &user, &ticket, &self.helper, connection)?;
             },
             Message::Converse { user } => {
-               if peer.spent(now, connection)? {
-                  return Ok(());
-               }
-
-               peer.asking =
-                  Conversation::start(&self.helper, user, origin(connection), &self.waker)?;
-
-               if peer.asking.is_none() {
-                  peer.outbox.push(&Message::Rejected);
-               }
+               peer.ask(now, user, &self.helper, &self.waker, connection)?;
             },
             Message::Answer(text) => peer.answer(&text),
             Message::Resize { session, size } => {
@@ -1068,7 +1135,7 @@ impl Server {
 
       match granted {
          Some(Reply::Granted { grant, forwarding }) => {
-            peer.accept(grant, forwarding, &self.helper, connection);
+            peer.accept(grant, forwarding, &self.helper, connection, true);
          },
          _ => peer.outbox.push(&Message::Rejected),
       }
@@ -1119,6 +1186,7 @@ impl Server {
       peer.turn = following(&peer.sessions, peer.turn);
 
       peer.bind(&self.waker);
+      peer.renew();
       peer.forwards.report(&mut peer.outbox);
 
       if let Some(control) = peer.control {
@@ -1164,7 +1232,10 @@ impl Server {
 
       peer.forwards.pump(connection, &self.waker)?;
 
-      Ok(peer.grant.is_none().then_some(peer.deadline))
+      Ok(peer
+         .grant
+         .as_ref()
+         .map_or(Some(peer.deadline), |grant| grant.renew))
    }
 
    /// Hands every forwarded connection to a process that keeps it for the

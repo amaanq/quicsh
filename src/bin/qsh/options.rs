@@ -86,10 +86,10 @@ pub struct Login {
    /// Whether to answer a server that asks for a password, from
    /// `PasswordAuthentication`.
    pub passwords:    bool,
-   /// What was typed at the server's questions when a login passed that
-   /// way. Every copy of this login shares them, and a reconnect gives
-   /// them again, since by then the terminal belongs to the session.
-   pub answers:      Arc<Mutex<Vec<Zeroizing<String>>>>,
+   /// What the server sent after a login by password, which logs in again
+   /// for a while. Every copy of this login shares it, and a reconnect
+   /// shows it, since by then the terminal belongs to the session.
+   pub ticket:       Arc<Mutex<Option<Zeroizing<Vec<u8>>>>>,
    /// Which of the host's addresses to try, from `AddressFamily`.
    pub family:       Family,
    /// The name to look the host key up under, in place of the host's.
@@ -771,7 +771,7 @@ impl Options {
          exacting: agreed(host.exacting.as_deref()),
          batch: agreed(host.batch.as_deref()),
          passwords: host.passwords.is_none_or(|written| agreed(Some(&written))),
-         answers: Arc::default(),
+         ticket: Arc::default(),
          alias: host.alias,
       })
    }

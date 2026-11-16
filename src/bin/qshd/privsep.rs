@@ -96,6 +96,10 @@ const KEPT: u8 = 14;
 const CONVERSE: u8 = 15;
 /// Tag of [`Request::Conclude`].
 const CONCLUDE: u8 = 16;
+/// Tag of [`Request::Redeem`].
+const REDEEM: u8 = 17;
+/// Tag of [`Request::Ticket`] and [`Reply::Ticket`].
+const TICKET: u8 = 18;
 /// How long a network process that was told to stop may go on asking.
 const STOP_LIMIT: Duration = Duration::from_secs(5);
 
@@ -207,6 +211,18 @@ pub enum Request {
       /// does not when the client left.
       wanted:       bool,
    },
+   /// Asks whether a ticket logs its account in.
+   Redeem {
+      /// Who wants to log in.
+      user:   String,
+      /// What the client showed.
+      ticket: Vec<u8>,
+   },
+   /// Asks for a ticket for a login that a password or a ticket started.
+   Ticket {
+      /// The login.
+      grant: u64,
+   },
 }
 
 /// The monitor's answer to one request.
@@ -247,6 +263,8 @@ pub enum Reply {
    /// Comes with the socket of a process that asks PAM's questions, and
    /// names it in [`Request::Conclude`].
    Asking(u64),
+   /// Something a client shows to log its account in again.
+   Ticket(Vec<u8>),
    /// Success with nothing to say, or with one descriptor that the request
    /// asked for.
    Done,
@@ -323,6 +341,40 @@ fn address(reader: &mut Reader<'_>) -> Result<SocketAddr, Error> {
 }
 
 impl Request {
+   /// Reads the rest of a request about a login by password or by ticket.
+   fn unkeyed(tag: u8, reader: &mut Reader<'_>) -> Result<Self, Error> {
+      let named = |source: &mut Reader<'_>| {
+         let user = str::from_utf8(source.string()?).map_err(|_| Error::Frame)?;
+         Ok::<String, Error>(user.to_owned())
+      };
+
+      Ok(match tag {
+         CONVERSE => {
+            Self::Converse {
+               user:   named(reader)?,
+               remote: address(reader)?,
+            }
+         },
+         CONCLUDE => {
+            Self::Conclude {
+               conversation: u64_from(reader)?,
+               wanted:       reader.byte()? != 0,
+            }
+         },
+         REDEEM => {
+            Self::Redeem {
+               user:   named(reader)?,
+               ticket: reader.string()?.to_vec(),
+            }
+         },
+         _ => {
+            Self::Ticket {
+               grant: u64_from(reader)?,
+            }
+         },
+      })
+   }
+
    /// The bytes of one channel message.
    fn encode(self) -> Vec<u8> {
       let mut out = Vec::new();
@@ -387,6 +439,15 @@ impl Request {
             out.push(CONCLUDE);
             put_u64(&mut out, conversation);
             out.push(u8::from(wanted));
+         },
+         Self::Redeem { user, ticket } => {
+            out.push(REDEEM);
+            put_string(&mut out, user.as_bytes());
+            put_string(&mut out, &ticket);
+         },
+         Self::Ticket { grant } => {
+            out.push(TICKET);
+            put_u64(&mut out, grant);
          },
          Self::Find { grant, name } => {
             out.push(FIND);
@@ -469,20 +530,7 @@ impl Request {
          },
          KEEP => Self::Keep,
          KEPT => Self::Kept,
-         CONVERSE => {
-            Self::Converse {
-               user:   str::from_utf8(reader.string()?)
-                  .map_err(|_| Error::Frame)?
-                  .to_owned(),
-               remote: address(&mut reader)?,
-            }
-         },
-         CONCLUDE => {
-            Self::Conclude {
-               conversation: u64_from(&mut reader)?,
-               wanted:       reader.byte()? != 0,
-            }
-         },
+         tag @ (CONVERSE | CONCLUDE | REDEEM | TICKET) => Self::unkeyed(tag, &mut reader)?,
          FIND => {
             Self::Find {
                grant: u64_from(&mut reader)?,
@@ -562,6 +610,10 @@ impl Reply {
             out.push(ASKING);
             put_u64(&mut out, conversation);
          },
+         Self::Ticket(ref ticket) => {
+            out.push(TICKET);
+            put_string(&mut out, ticket);
+         },
          Self::Done => out.push(DONE),
          Self::Failed(ref text) => {
             out.push(FAILED);
@@ -606,6 +658,7 @@ impl Reply {
          },
          NAMED => Self::Named(list(&mut reader)?),
          ASKING => Self::Asking(u64_from(&mut reader)?),
+         TICKET => Self::Ticket(reader.string()?.to_vec()),
          DONE => Self::Done,
          FAILED => Self::Failed(String::from_utf8_lossy(reader.string()?).into_owned()),
          _ => return Err(Error::Frame),
@@ -925,6 +978,29 @@ impl Helper {
       match self.call(request)? {
          (granted @ Reply::Granted { .. }, _) => Ok(Some(granted)),
          (Reply::Denied, _) => Ok(None),
+         _ => bail!("unexpected reply from the monitor"),
+      }
+   }
+
+   /// The monitor's [`Reply::Granted`] for a ticket it made and that still
+   /// holds, or `None`.
+   pub fn redeem(&self, user: &str, ticket: &[u8]) -> Result<Option<Reply>> {
+      let request = Request::Redeem {
+         user:   user.to_owned(),
+         ticket: ticket.to_vec(),
+      };
+
+      match self.call(request)? {
+         (granted @ Reply::Granted { .. }, _) => Ok(Some(granted)),
+         (Reply::Denied, _) => Ok(None),
+         _ => bail!("unexpected reply from the monitor"),
+      }
+   }
+
+   /// A fresh ticket for a login that a password or a ticket started.
+   pub fn ticket(&self, grant: u64) -> Result<Vec<u8>> {
+      match self.call(Request::Ticket { grant })? {
+         (Reply::Ticket(ticket), _) => Ok(ticket),
          _ => bail!("unexpected reply from the monitor"),
       }
    }

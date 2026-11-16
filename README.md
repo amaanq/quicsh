@@ -95,8 +95,10 @@ afford to lose :)
 - `ed25519-sk` keys in the same way, with the PIN and the touch
 - Passwords, on a server that runs with `qshd --pam NAME`. The PAM service
   of that name asks its questions through `qsh`, on the terminal or through
-  `SSH_ASKPASS`, and root never logs in this way. `qsh` keeps what was typed
-  in memory, so a reconnect logs in again without asking.
+  `SSH_ASKPASS`, and root never logs in this way. `qsh` forgets what was
+  typed. The server hands it a ticket that logs the account in again for an
+  hour and renews it while connected, so a reconnect asks nothing. Tickets
+  stop 24 hours after the password was typed.
   `PasswordAuthentication no` keeps `qsh` from answering
 
 ## Usage

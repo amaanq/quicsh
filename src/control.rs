@@ -99,6 +99,12 @@ const CONVERSE: u8 = 30;
 const PROMPT: u8 = 31;
 /// Tag of [`Message::Answer`].
 const ANSWER: u8 = 32;
+/// Tag of [`Message::Ticket`].
+const TICKET: u8 = 33;
+/// Tag of [`Message::Redeem`].
+const REDEEM: u8 = 34;
+/// Most bytes in a ticket.
+const MAX_TICKET: usize = 128;
 /// Most bytes in a [`Message::Prompt`] or a [`Message::Answer`].
 pub const MAX_DIALOGUE: usize = 1024;
 
@@ -313,6 +319,15 @@ pub enum Message {
    },
    /// What was typed at a [`Message::Prompt`] that asks.
    Answer(String),
+   /// Something that logs the account in again for a while. The server
+   /// sends one after a login by password and renews it, so that a client
+   /// that reconnects need not keep the password.
+   Ticket(Vec<u8>),
+   /// Logs in with what a [`Message::Ticket`] carried.
+   Redeem {
+      user:   String,
+      ticket: Vec<u8>,
+   },
 }
 
 /// What the client does with the text of a [`Message::Prompt`].
@@ -326,8 +341,7 @@ pub enum Asks {
    Nothing,
 }
 
-/// Appends a [`Message::Converse`], [`Message::Prompt`] or
-/// [`Message::Answer`].
+/// Appends one of the messages of a login by password or by ticket.
 fn put_dialogue(out: &mut Vec<u8>, message: &Message) {
    match *message {
       Message::Converse { ref user } => {
@@ -348,6 +362,18 @@ fn put_dialogue(out: &mut Vec<u8>, message: &Message) {
       Message::Answer(ref text) => {
          out.push(ANSWER);
          put_string(out, text.as_bytes());
+      },
+      Message::Ticket(ref ticket) => {
+         out.push(TICKET);
+         put_string(out, ticket);
+      },
+      Message::Redeem {
+         ref user,
+         ref ticket,
+      } => {
+         out.push(REDEEM);
+         put_string(out, user.as_bytes());
+         put_string(out, ticket);
       },
       _ => {},
    }
@@ -666,9 +692,11 @@ impl Message {
          Self::Resumable { .. } | Self::Sessions | Self::Listing(_) | Self::End(_) => {
             put_session(&mut payload, self);
          },
-         Self::Converse { .. } | Self::Prompt { .. } | Self::Answer(_) => {
-            put_dialogue(&mut payload, self);
-         },
+         Self::Converse { .. }
+         | Self::Prompt { .. }
+         | Self::Answer(_)
+         | Self::Ticket(_)
+         | Self::Redeem { .. } => put_dialogue(&mut payload, self),
          Self::Failed {
             session,
             ref reason,
@@ -757,15 +785,22 @@ impl Message {
          (read.len() <= limit).then_some(read).ok_or(Error::Frame)
       };
 
+      let named = |source: &mut Reader<'_>| {
+         let user = bounded(MAX_USER, source)?;
+         (!user.is_empty()).then_some(user).ok_or(Error::Frame)
+      };
+      let sealed = |source: &mut Reader<'_>| {
+         let ticket = source.string()?;
+         (ticket.len() <= MAX_TICKET)
+            .then(|| ticket.to_vec())
+            .ok_or(Error::Frame)
+      };
+
       Ok(match tag {
          CONVERSE => {
-            let user = bounded(MAX_USER, reader)?;
-
-            if user.is_empty() {
-               return Err(Error::Frame);
+            Self::Converse {
+               user: named(reader)?,
             }
-
-            Self::Converse { user }
          },
          PROMPT => {
             let asks = match reader.byte()? {
@@ -780,7 +815,14 @@ impl Message {
                text: bounded(MAX_DIALOGUE, reader)?,
             }
          },
-         _ => Self::Answer(bounded(MAX_DIALOGUE, reader)?),
+         ANSWER => Self::Answer(bounded(MAX_DIALOGUE, reader)?),
+         TICKET => Self::Ticket(sealed(reader)?),
+         _ => {
+            Self::Redeem {
+               user:   named(reader)?,
+               ticket: sealed(reader)?,
+            }
+         },
       })
    }
 
@@ -882,7 +924,7 @@ impl Message {
          },
          GONE => Self::Gone,
          tag @ (RESUMABLE | SESSIONS | LISTING | END) => Self::session(tag, &mut reader)?,
-         tag @ (CONVERSE | PROMPT | ANSWER) => Self::dialogue(tag, &mut reader)?,
+         tag @ (CONVERSE | PROMPT | ANSWER | TICKET | REDEEM) => Self::dialogue(tag, &mut reader)?,
          FAILED => {
             Self::Failed {
                session: reader.u32()?,
