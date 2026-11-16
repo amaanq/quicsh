@@ -38,7 +38,10 @@ use std::{
       Path,
       PathBuf,
    },
-   process::Command,
+   process::{
+      self,
+      Command,
+   },
    sync::Arc,
    thread,
    time::{
@@ -622,10 +625,13 @@ impl Monitor {
    /// Reads the restart secret, making one when this boot has none yet.
    fn secret(&self) -> Result<Vec<u8>> {
       let path = self.holders.join(RESTART_SECRET);
+      let whole = || {
+         fs::read(&path)
+            .ok()
+            .filter(|secret| secret.len() == RESTART_SECRET_LEN)
+      };
 
-      if let Ok(secret) = fs::read(&path)
-         && secret.len() == RESTART_SECRET_LEN
-      {
+      if let Some(secret) = whole() {
          return Ok(secret);
       }
 
@@ -634,17 +640,30 @@ impl Monitor {
          .fill(&mut secret)
          .map_err(|_| report!("system random source failed"))?;
 
-      let _ = fs::remove_file(&path);
+      let draft = self
+         .holders
+         .join(format!("{RESTART_SECRET}.{}", process::id()));
 
       OpenOptions::new()
          .write(true)
          .create_new(true)
          .mode(0o600)
-         .open(&path)
+         .open(&draft)
          .and_then(|mut file| file.write_all(&secret))
-         .with_context(|| format!("writing {}", path.display()))?;
+         .with_context(|| format!("writing {}", draft.display()))?;
 
-      Ok(secret)
+      // A link appears whole or not at all, so a server that starts at the
+      // same moment either reads this secret or wins with its own.
+      let chosen = match (fs::hard_link(&draft, &path), whole()) {
+         (Ok(()), _) | (Err(_), None) => {
+            fs::rename(&draft, &path).with_context(|| format!("writing {}", path.display()))?;
+            secret
+         },
+         (Err(_), Some(other)) => other,
+      };
+
+      let _ = fs::remove_file(&draft);
+      Ok(chosen)
    }
 
    /// Starts a process that keeps what the network process hands it until
