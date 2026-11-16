@@ -2087,6 +2087,45 @@ fn divert(
    Ok(Some(0))
 }
 
+/// The socket that later runs share this connection through, when this
+/// run is the one to hold it.
+fn hosting(
+   options: &Options,
+   login: &Login,
+   waker: &Arc<Waker>,
+   relaying: bool,
+) -> Result<Option<Master>> {
+   let Some(ref control) = login.control else {
+      return Ok(None);
+   };
+
+   if options.master {
+      return Master::listen(control, waker).map(Some);
+   }
+
+   let wanted = options.forward && control.create && !relaying;
+
+   if !wanted || mux::connect(&control.path).is_ok() {
+      return Ok(None);
+   }
+
+   // A run that only forwards has no session whose end ControlPersist
+   // could count from, and no other run waits to hear of its login.
+   match Master::listen(control, waker) {
+      Ok(master) => {
+         Ok(Some(Master {
+            persist: None,
+            ready: None,
+            ..master
+         }))
+      },
+      Err(error) => {
+         eprintln!("qsh: not sharing this connection, {error:#}");
+         Ok(None)
+      },
+   }
+}
+
 /// The session this process runs for itself, when it runs one.
 fn first(options: &Options, login: &Login, relaying: bool) -> Result<BTreeMap<u32, Channel>> {
    let mut channels = BTreeMap::new();
@@ -2175,10 +2214,7 @@ fn main() -> Result<()> {
 
    let waker = Arc::new(Waker::new()?);
 
-   let master = match login.control {
-      Some(ref control) if options.master => Some(Master::listen(control, &waker)?),
-      Some(_) | None => None,
-   };
+   let master = hosting(&options, &login, &waker, relay.is_some())?;
 
    let channels = first(&options, &login, relay.is_some())?;
    let ask = options.ask();
