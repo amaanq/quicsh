@@ -78,8 +78,9 @@ afford to lose :)
 - Connection sharing with `ControlMaster`, `ControlPath` and `ControlPersist`,
   or `-S`. The first `qsh` leaves one in the background that holds the
   connection, and later runs, `rsync`, `scp` and `sftp` included, go through
-  it without a handshake or a login. `qsh -O check` and `qsh -O exit` talk to
-  it
+  it without a handshake or a login. `qsh -O check` asks whether it runs,
+  `qsh -O exit` ends it with its sessions and `qsh -O stop` lets them finish
+  first
 - `ed25519`, ECDSA (P-256, P-384 and P-521) and RSA keys, signed through
   `ssh-agent` or `ssh-keygen`
 - User certificates. A `cert-authority` line in `authorized_keys` lets in

@@ -27,6 +27,7 @@ use std::{
       Write as _,
    },
    iter,
+   mem,
    net::{
       Ipv4Addr,
       SocketAddr,
@@ -775,6 +776,16 @@ impl Client {
                }
             },
             Arrival::Stop => master.stopped = true,
+            Arrival::End => {
+               master.stopped = true;
+               master.peers.clear();
+
+               for (session, mut channel) in mem::take(&mut self.channels) {
+                  channel.notice("the shared connection was told to exit");
+                  self.outbox.push(&Message::Close { session });
+                  channel.close(255, connection);
+               }
+            },
          }
       }
 
@@ -1814,9 +1825,16 @@ fn divert(
 
    match options.order.as_deref() {
       Some("check") => println!("Master running (pid={})", mux::check(&control.path)?),
-      Some("exit" | "stop") => {
-         mux::stop(&control.path)?;
-         println!("Exit request sent.");
+      Some(order @ ("exit" | "stop")) => {
+         mux::stop(&control.path, order == "exit")?;
+         println!(
+            "{}",
+            if order == "exit" {
+               "Exit request sent."
+            } else {
+               "Stop request sent."
+            }
+         );
       },
       Some(other) => bail!("-O takes check, exit or stop, not {other}"),
       None => {

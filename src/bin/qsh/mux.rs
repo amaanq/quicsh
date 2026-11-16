@@ -83,8 +83,10 @@ const BACKLOG: i32 = 16;
 const OPEN: u8 = 1;
 /// Tag of the question whether the holder runs.
 const CHECK: u8 = 2;
-/// Tag of the request that the holder exits.
+/// Tag of the request that the holder exits once its sessions are over.
 const STOP: u8 = 3;
+/// Tag of the request that the holder ends its sessions and exits.
+const END: u8 = 4;
 
 /// Tag of [`Notice::Exit`].
 const EXIT: u8 = 1;
@@ -146,8 +148,10 @@ pub enum Arrival {
       /// The number from [`Arrival::Open`].
       peer: u64,
    },
-   /// The holder should exit.
+   /// The holder should exit once its sessions are over.
    Stop,
+   /// The holder should end its sessions and exit.
+   End,
 }
 
 /// Makes the socket at `path`, which only this user may connect to.
@@ -205,6 +209,10 @@ fn serve(socket: &OwnedFd, peer: u64, arrivals: &Sender<Arrival>, waker: &Waker)
       },
       Some((&STOP, _)) => {
          let _ = arrivals.send(Arrival::Stop);
+         waker.wake();
+      },
+      Some((&END, _)) => {
+         let _ = arrivals.send(Arrival::End);
          waker.wake();
       },
       Some((&OPEN, frame)) => {
@@ -338,10 +346,11 @@ pub fn check(path: &Path) -> Result<u32> {
    }
 }
 
-/// Tells the holder at `path` to exit.
-pub fn stop(path: &Path) -> Result<()> {
+/// Tells the holder at `path` to exit, at once with `ending` and else once
+/// its sessions are over.
+pub fn stop(path: &Path, ending: bool) -> Result<()> {
    let socket =
       connect(path).with_context(|| format!("no shared connection at {}", path.display()))?;
-   send_message(&socket, &[STOP], &[])?;
+   send_message(&socket, &[if ending { END } else { STOP }], &[])?;
    Ok(())
 }
