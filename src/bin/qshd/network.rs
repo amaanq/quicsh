@@ -795,20 +795,32 @@ impl Server {
       let label = open.session;
       let size = open.terminal.as_ref().map(|terminal| terminal.size);
 
+      let mut refuse = |reason: String, ended: &mut Connection| {
+         peer.outbox.push(&Message::Failed {
+            session: label,
+            reason,
+         });
+         let _ = ended.send_stream(stream).finish();
+      };
+
       let held = match helper.spawn(grant, open, origin(connection), connection.local_ip()) {
          Ok(started) => started,
          Err(error) => {
-            let reason = format!("{error}");
-            peer.outbox.push(&Message::Failed {
-               session: label,
-               reason,
-            });
-            let _ = connection.send_stream(stream).finish();
+            refuse(format!("{error}"), connection);
             return Ok(());
          },
       };
 
-      let session = Session::attach(held.link, label, None, stream, pending, connection, waker)?;
+      // A holder that could not start its session is gone by now, and it
+      // told only the server's log why.
+      let Ok(session) = Session::attach(held.link, label, None, stream, pending, connection, waker)
+      else {
+         refuse(
+            "the session did not start, the server's log says why".to_owned(),
+            connection,
+         );
+         return Ok(());
+      };
 
       // A program that draws the whole screen draws it again for a client
       // that joins, once the size changes and changes back.
