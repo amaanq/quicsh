@@ -120,6 +120,12 @@ const fn plain(code: u32) -> bool {
    matches!(code, 0 | 0x20..=0x7E | 0xA1..=0xAC | 0xAE..=0x24F | 0x370..=0x482 | 0x48A..=0x52F)
 }
 
+/// Whether `code` is a character every terminal draws two cells wide, which
+/// leaves out emoji.
+const fn wide(code: u32) -> bool {
+   matches!(code, 0x3041..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xAC00..=0xD7A3 | 0xFF01..=0xFF60)
+}
+
 /// A key this side knows the usual echo of.
 #[derive(Clone, Copy)]
 enum Key {
@@ -152,6 +158,20 @@ impl Key {
 
             match char::from_u32(code) {
                Some(character) if plain(code) => (Self::Character(character), 2),
+               _ => return None,
+            }
+         },
+         [
+            lead @ 0xE0..=0xEF,
+            next @ 0x80..=0xBF,
+            last @ 0x80..=0xBF,
+            ..,
+         ] => {
+            let code =
+               ((lead as u32 & 0x0F) << 12) | ((next as u32 & 0x3F) << 6) | (last as u32 & 0x3F);
+
+            match char::from_u32(code) {
+               Some(character) if wide(code) => (Self::Character(character), 3),
                _ => return None,
             }
          },
@@ -340,8 +360,18 @@ impl Predictor {
       }
    }
 
+   /// Whether `column` is the right half of a wide character, an empty cell
+   /// that no key stops on.
+   fn split(&self, column: usize) -> bool {
+      column
+         .checked_sub(1)
+         .is_some_and(|before| wide(self.cell(before)))
+   }
+
    /// The row after the first `count` pending keys, unless they lead off
-   /// the row or move what this side cannot draw.
+   /// the row or move what this side cannot draw. A wide character is
+   /// guessed only at the end of a known line, where a terminal that draws
+   /// it narrower moves nothing else.
    fn outcome(&self, count: usize) -> Option<Outcome> {
       let line = self.line.filter(|line| line.row == self.anchor.1);
       let floor = line.map(|known| known.floor);
@@ -358,8 +388,19 @@ impl Predictor {
       let mut end = line.map(|known| known.end);
       let mut column = usize::from(self.anchor.0);
       let mut cells = BTreeMap::new();
+      let mut widened = false;
 
       for guess in self.pending.iter().take(count) {
+         let width = match guess.key {
+            Key::Character(character) => 1 + usize::from(wide(u32::from(character))),
+            _ if widened => return None,
+            _ => 1,
+         };
+
+         if width == 2 && end != Some(column) {
+            return None;
+         }
+
          match guess.key {
             Key::Character(character) => {
                for place in (column..end.unwrap_or(column)).rev() {
@@ -371,14 +412,19 @@ impl Predictor {
                }
 
                cells.insert(column, Some(character));
-               column += 1;
+               column += width;
                end = end.map(|last| (last + 1).max(column));
+               widened |= width == 2;
             },
             Key::Erase if floor == Some(column) => {},
             Key::Delete if end.is_none_or(|last| column >= last) => {},
             key @ (Key::Erase | Key::Delete) => {
                if matches!(key, Key::Erase) {
                   column = column.checked_sub(1)?;
+               }
+
+               if wide(self.cell(column)) || self.split(column) {
+                  return None;
                }
 
                let last = end.unwrap_or(column + 1).max(column + 1);
@@ -404,6 +450,10 @@ impl Predictor {
             Key::Right => {},
             Key::Home => column = floor.unwrap_or(column),
             Key::End => column = end.unwrap_or(column),
+         }
+
+         if !widened && self.split(column) {
+            return None;
          }
       }
 
@@ -518,13 +568,22 @@ impl Predictor {
       let mut text = Vec::new();
 
       for (&column, &cell) in &outcome.cells {
-         if !plain(self.cell(column)) {
+         let character = cell.unwrap_or(' ');
+         let width = 1 + usize::from(wide(u32::from(character)));
+
+         if !(column..column + width).all(|covered| plain(self.cell(covered))) {
             return;
          }
 
          text.extend(shift(place, column));
-         text.extend(cell.unwrap_or(' ').encode_utf8(&mut [0; 4]).bytes());
-         place = column + 1;
+         text.extend(character.encode_utf8(&mut [0; 4]).bytes());
+         place = column + width;
+
+         // The terminal may count the character's width another way, and
+         // the moves that follow are relative.
+         if width == 2 {
+            text.extend(format!("\x1b[{}G", place + 1).bytes());
+         }
       }
 
       text.extend(shift(place, outcome.column));
@@ -536,9 +595,11 @@ impl Predictor {
          low,
          width: outcome
             .cells
-            .keys()
+            .iter()
             .next_back()
-            .map_or(0, |&last| last + 1 - low),
+            .map_or(0, |(&last, &cell)| {
+               last + 1 + usize::from(cell.is_some_and(|held| wide(u32::from(held)))) - low
+            }),
          column: outcome.column,
       });
    }
@@ -722,19 +783,26 @@ mod tests {
       bytes
    }
 
-   /// A character shows early only after the server echoed one typed since
-   /// the last key that is no character, and is taken back for the output.
-   #[test]
-   fn characters_show_once_the_server_echoes() {
-      let (mut screen, sink) = io::pipe().expect("a pipe");
+   /// A predictor that always draws, and what it draws on.
+   fn started() -> (PipeReader, Predictor) {
+      let (screen, sink) = io::pipe().expect("a pipe");
       ioctl_fionbio(&screen, true).expect("a pipe that does not block");
 
       let size = Size {
          columns: 80,
          rows:    24,
       };
-      let mut predictor =
+      let predictor =
          Predictor::new(Mode::Always, size, File::from(OwnedFd::from(sink))).expect("an emulator");
+
+      (screen, predictor)
+   }
+
+   /// A character shows early only after the server echoed one typed since
+   /// the last key that is no character, and is taken back for the output.
+   #[test]
+   fn characters_show_once_the_server_echoes() {
+      let (mut screen, mut predictor) = started();
 
       predictor.output(b"$ ");
       predictor.typed(b"l");
@@ -823,5 +891,35 @@ mod tests {
          "\u{e9}\u{44f}".as_bytes(),
          "letters outside ASCII"
       );
+   }
+
+   /// A character two cells wide shows early at the end of a line, and a
+   /// backspace over one waits for the server.
+   #[test]
+   fn wide_characters_show_at_the_end_of_a_line() {
+      let (mut screen, mut predictor) = started();
+
+      predictor.typed(b"\r");
+      predictor.output(b"\r\n$ ");
+      predictor.typed(b"a");
+      predictor.output(b"a");
+      drawn(&mut screen);
+      predictor.typed("\u{65e5}".as_bytes());
+      assert_eq!(
+         drawn(&mut screen),
+         "\u{65e5}\x1b[6G".as_bytes(),
+         "a wide character at the end of the line"
+      );
+
+      predictor.hide();
+      assert_eq!(
+         drawn(&mut screen),
+         b"\x1b[2D\x1b[0m  \x1b[2D\x1b[0m",
+         "both of its cells taken back"
+      );
+
+      predictor.output("\u{65e5}".as_bytes());
+      predictor.typed(b"\x7f");
+      assert_eq!(drawn(&mut screen), b"", "no guess for a backspace over it");
    }
 }

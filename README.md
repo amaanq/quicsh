@@ -56,8 +56,9 @@ afford to lose :)
   the last enter, escape or control key, so a password prompt stays blank.
   On a line that began after enter, the keys that move the cursor along the
   line and edits in the middle of it show early too. Latin, Greek and
-  Cyrillic letters show early, and a character two cells wide waits for the
-  server. `--predict always` and `--predict never` change when it happens
+  Cyrillic letters show early anywhere on the line, and Chinese, Japanese
+  and Korean characters at its end. Emoji wait for the server.
+  `--predict always` and `--predict never` change when it happens
 - Sessions that any of your machines can join. Every session on a terminal
   has a name, the one `--attach NAME` gives it or else a number, and runs
   until its shell exits, its `qsh` exits or `--end NAME` ends it. A session
