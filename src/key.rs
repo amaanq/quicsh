@@ -657,6 +657,11 @@ fn rsa(private: &mut Reader<'_>) -> Result<HostKey, Error> {
    let secret = private.string()?;
    let inverse = private.string()?;
    let primes = [private.string()?, private.string()?];
+   let bits = unsigned(modulus).len() * 8;
+
+   if !(2048..=4096).contains(&bits) {
+      return Err(Error::RsaSize(bits));
+   }
 
    // A prime is odd, so clearing its last bit takes one away.
    let reduced = primes.map(|prime| {

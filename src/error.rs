@@ -44,8 +44,10 @@ pub enum Error {
    Base64,
    #[error("unsupported key type")]
    KeyType,
-   #[error("not an unencrypted OpenSSH ed25519, P-256 or P-384 private key")]
+   #[error("not an unencrypted OpenSSH ed25519, ECDSA or RSA private key")]
    PrivateKey,
+   #[error("an RSA host key has 2048 to 4096 bits, and this one has {0}")]
+   RsaSize(usize),
    #[error("signature does not verify")]
    Signature,
    #[error("talking to the SSH agent failed")]
