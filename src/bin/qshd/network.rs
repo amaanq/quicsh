@@ -74,6 +74,7 @@ use quicsh::{
    transport::{
       App,
       Congestion,
+      PROTOCOL_ERROR,
       RECEIVE_WINDOW,
       RESTARTING,
       Transport,
@@ -137,8 +138,6 @@ const MAX_FORWARDS: usize = 256;
 const TITLE_LIMIT: usize = 80;
 /// Lowest port a client may ask the server to listen on.
 const FIRST_UNPRIVILEGED_PORT: u16 = 1024;
-/// Close code for a client that broke the protocol.
-const PROTOCOL_ERROR: VarInt = VarInt::from_u32(1);
 /// Close code for a client that failed to log in.
 const AUTH_FAILED: VarInt = VarInt::from_u32(2);
 
@@ -1047,7 +1046,11 @@ impl Server {
 
    /// Closes a connection and forgets its state.
    fn drop_peer(&mut self, now: Instant, handle: ConnectionHandle, connection: &mut Connection) {
-      connection.close(now, PROTOCOL_ERROR, Bytes::from_static(b"protocol error"));
+      connection.close(
+         now,
+         PROTOCOL_ERROR,
+         Bytes::from_static(b"unreadable message, qsh may be another version"),
+      );
       self.peers.remove(&handle);
    }
 }

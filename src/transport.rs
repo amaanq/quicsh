@@ -147,6 +147,8 @@ pub const IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 /// What a server that stops closes its connections with. The client then
 /// looks for the next server at once.
 pub const RESTARTING: VarInt = VarInt::from_u32(3);
+/// What a server closes a connection with whose messages it cannot read.
+pub const PROTOCOL_ERROR: VarInt = VarInt::from_u32(1);
 /// Gap between keep-alive packets.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
 /// The round trip a connection assumes until it has measured one. A lost

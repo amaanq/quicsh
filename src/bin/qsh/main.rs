@@ -136,6 +136,7 @@ use quicsh::{
    transport::{
       App,
       INTERACTIVE_WINDOW,
+      PROTOCOL_ERROR,
       RESTARTING,
       Transport,
       drain,
@@ -1297,6 +1298,11 @@ impl App for Client {
          },
          Event::ConnectionLost { .. } if self.dialed.is_some() && self.spares > 0 => {
             self.current = None;
+         },
+         Event::ConnectionLost {
+            reason: ConnectionError::ApplicationClosed(ref close),
+         } if close.error_code == PROTOCOL_ERROR => {
+            bail!("the server could not read what this qsh sent, qshd may be another version");
          },
          Event::ConnectionLost { reason } => {
             let silent = match reason {
