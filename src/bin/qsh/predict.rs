@@ -261,6 +261,20 @@ fn answer(input: &[u8]) -> bool {
    }
 }
 
+/// How many bytes at the start of `input` are such an answer in the form
+/// that ends with a letter, or 0.
+pub fn answered(input: &[u8]) -> usize {
+   match *input {
+      [0x1B, b'[', ref rest @ ..] if answer(input) => {
+         rest
+            .iter()
+            .position(|&byte| matches!(byte, 0x40..=0x7E))
+            .map_or(0, |last| last + 3)
+      },
+      _ => 0,
+   }
+}
+
 /// Follows a session's terminal and draws typed characters on it early.
 pub struct Predictor {
    /// What the terminal shows without the early characters.

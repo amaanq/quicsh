@@ -75,6 +75,7 @@ use crate::{
       Mode,
       Predictor,
       Screen,
+      answered,
    },
 };
 
@@ -139,11 +140,24 @@ struct Escapes {
 }
 
 impl Escapes {
-   /// What of `input` goes to the session.
+   /// What of `input` goes to the session. A shell may ask the terminal
+   /// where the cursor is at every prompt, and the answer is no key, so the
+   /// line is as fresh after it as before.
    fn filter(&mut self, input: &[u8]) -> Bytes {
       let mut passed = Vec::with_capacity(input.len() + 1);
+      let mut answer = 0;
 
-      for &byte in input {
+      for (index, &byte) in input.iter().enumerate() {
+         if answer == 0 {
+            answer = answered(input.get(index..).unwrap_or_default());
+         }
+
+         if answer > 0 {
+            answer -= 1;
+            passed.push(byte);
+            continue;
+         }
+
          if self.armed {
             self.armed = false;
 
@@ -780,11 +794,14 @@ mod tests {
 
       let mut passed = Vec::new();
 
-      for input in ["~", "?a~.\r~~b\n~", "x\r", "~."] {
+      for input in ["~", "?a~.\r~~b\n~", "x\r", "~.", "\r\x1b[24;1R", "~?"] {
          passed.extend_from_slice(&escapes.filter(input.as_bytes()));
       }
 
-      assert_eq!(passed, b"a~.\r~b\n~x\r", "what the session gets");
+      assert_eq!(
+         passed, b"a~.\r~b\n~x\r\r\x1b[24;1R",
+         "what the session gets"
+      );
       assert!(
          matches!(given.try_recv(), Ok(Order::Help)),
          "split over two reads"
@@ -792,6 +809,10 @@ mod tests {
       assert!(
          matches!(given.try_recv(), Ok(Order::Disconnect)),
          "at the start of a line"
+      );
+      assert!(
+         matches!(given.try_recv(), Ok(Order::Help)),
+         "after the terminal answered the shell"
       );
       assert!(given.try_recv().is_err(), "not in the middle of a line");
    }
