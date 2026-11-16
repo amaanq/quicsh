@@ -516,6 +516,10 @@ impl Monitor {
          command.arg("--agent");
       }
 
+      if let Some(limit) = open.patience {
+         command.arg("--patience").arg(limit.as_secs().to_string());
+      }
+
       self.program(grant, open, &mut command)?;
 
       if let Some(ref chosen) = label {

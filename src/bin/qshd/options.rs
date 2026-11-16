@@ -85,6 +85,9 @@ pub enum Stage {
       /// What the client asked for when the key forces another command.
       #[pound(long, allow_hyphen_values)]
       original_command: Option<String>,
+      /// Seconds a session on pipes waits for a client that went silent.
+      #[pound(long)]
+      patience:         Option<u64>,
    },
    /// Connects to a Unix socket or listens on one as an account, and passes
    /// the result to standard input.

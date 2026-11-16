@@ -163,6 +163,9 @@ pub struct Open {
    /// The name of the terminal session to join, or to start under that
    /// name when none has it. Without one the server picks a name.
    pub name:        Option<String>,
+   /// How long the client looks for a lost server before it exits. A
+   /// session on pipes is not kept longer than that.
+   pub patience:    Option<Duration>,
 }
 
 pub enum Message {
@@ -288,6 +291,39 @@ pub enum Message {
    Certify,
    /// The server's host certificate, which is empty when it has none.
    HostCertificate(Vec<u8>),
+}
+
+/// Appends everything an [`Open`] holds.
+fn put_open(out: &mut Vec<u8>, open: &Open) {
+   put_u32(out, open.session);
+
+   out.push(u8::from(open.terminal.is_some()));
+   if let Some(ref terminal) = open.terminal {
+      put_string(out, terminal.name.as_bytes());
+      put_size(out, terminal.size);
+   }
+
+   match open.program {
+      Program::Shell => out.push(0),
+      Program::Command(ref line) => {
+         out.push(1);
+         put_string(out, line.as_bytes());
+      },
+      Program::Subsystem(ref name) => {
+         out.push(2);
+         put_string(out, name.as_bytes());
+      },
+   }
+
+   out.push(u8::from(open.agent));
+   put_environment(out, &open.environment);
+   put_string(out, open.name.as_deref().unwrap_or_default().as_bytes());
+   put_u32(
+      out,
+      open.patience.map_or(0, |limit| {
+         u32::try_from(limit.as_secs()).unwrap_or(u32::MAX)
+      }),
+   );
 }
 
 /// Appends a count and that many pairs of a name and a value.
@@ -487,6 +523,9 @@ fn open(reader: &mut Reader<'_>) -> Result<Open, Error> {
    }
 
    let name = Some(text(reader)?).filter(|name| !name.is_empty());
+   let patience = Some(reader.u32()?)
+      .filter(|&seconds| seconds > 0)
+      .map(|seconds| Duration::from_secs(seconds.into()));
 
    Ok(Open {
       session,
@@ -495,6 +534,7 @@ fn open(reader: &mut Reader<'_>) -> Result<Open, Error> {
       agent,
       environment,
       name,
+      patience,
    })
 }
 
@@ -510,32 +550,7 @@ impl Message {
          Self::Rejected => payload.push(REJECTED),
          Self::Open(ref open) => {
             payload.push(OPEN);
-            put_u32(&mut payload, open.session);
-
-            payload.push(u8::from(open.terminal.is_some()));
-            if let Some(ref terminal) = open.terminal {
-               put_string(&mut payload, terminal.name.as_bytes());
-               put_size(&mut payload, terminal.size);
-            }
-
-            match open.program {
-               Program::Shell => payload.push(0),
-               Program::Command(ref line) => {
-                  payload.push(1);
-                  put_string(&mut payload, line.as_bytes());
-               },
-               Program::Subsystem(ref name) => {
-                  payload.push(2);
-                  put_string(&mut payload, name.as_bytes());
-               },
-            }
-
-            payload.push(u8::from(open.agent));
-            put_environment(&mut payload, &open.environment);
-            put_string(
-               &mut payload,
-               open.name.as_deref().unwrap_or_default().as_bytes(),
-            );
+            put_open(&mut payload, open);
          },
          Self::Resize { session, size } => {
             payload.push(RESIZE);
@@ -860,6 +875,8 @@ impl Deframer {
 
 #[cfg(test)]
 mod tests {
+   use std::time::Duration;
+
    use crate::{
       control::{
          Deframer,
@@ -942,6 +959,7 @@ mod tests {
          agent:       true,
          environment: vec![("LANG".to_owned(), "C.UTF-8".to_owned())],
          name:        Some("work".to_owned()),
+         patience:    Some(Duration::from_secs(30)),
       }));
 
       let mut deframer = Deframer::default();

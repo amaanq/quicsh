@@ -71,7 +71,6 @@ use misstep::{
 use quicsh::{
    auth::Account,
    control::{
-      DETACH_LIMIT,
       Size,
       Terminal,
    },
@@ -448,6 +447,8 @@ pub struct Hold {
    pub original: Option<String>,
    /// Whether the session gets a socket to the client's SSH agent.
    pub agent:    bool,
+   /// How long a session on pipes waits for a client that went silent.
+   pub patience: Duration,
 }
 
 /// The socket programs in the session open to reach the client's SSH agent.
@@ -597,6 +598,8 @@ struct Holder {
    outbox:   VecDeque<Bytes>,
    /// When the last link went away.
    detached: Instant,
+   /// How long a session on pipes waits without a link.
+   patience: Duration,
    /// Exit status and when it arrived.
    exited:   Option<(u32, Instant)>,
    /// Whether the link was told the exit status.
@@ -607,7 +610,7 @@ impl Holder {
    /// When a session without a link gives up on it. A terminal session
    /// stays until it ends, so that any client of the account can join it.
    fn expiry(&self) -> Option<Instant> {
-      (self.link.is_none() && self.errors.is_some()).then(|| self.detached + DETACH_LIMIT)
+      (self.link.is_none() && self.errors.is_some()).then(|| self.detached + self.patience)
    }
 
    /// Forgets the link.
@@ -1236,6 +1239,7 @@ impl Hold {
          visitor: None,
          active: Instant::now(),
          detached: Instant::now(),
+         patience: self.patience,
          exited: None,
          reported: false,
       };

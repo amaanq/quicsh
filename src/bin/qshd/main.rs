@@ -10,13 +10,17 @@ mod privsep;
 /// The network process's side of a session.
 mod session;
 
-use std::net::Ipv6Addr;
+use std::{
+   net::Ipv6Addr,
+   time::Duration,
+};
 
 use misstep::Result;
 use pound::Parse as _;
 use quicsh::{
    DEFAULT_PORT,
    control::{
+      DETACH_LIMIT,
       Size,
       Terminal,
    },
@@ -72,6 +76,7 @@ fn main() -> Result<()> {
          command,
          agent,
          original_command,
+         patience,
       }) => {
          let hold = Hold {
             user,
@@ -84,6 +89,9 @@ fn main() -> Result<()> {
             command,
             original: original_command,
             agent,
+            patience: patience.map_or(DETACH_LIMIT, |seconds| {
+               Duration::from_secs(seconds).min(DETACH_LIMIT)
+            }),
          };
 
          hold.run()

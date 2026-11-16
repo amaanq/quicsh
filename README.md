@@ -161,9 +161,10 @@ Host box
 `qsh` waits out an outage for as long as the server keeps the session, which
 is an hour. `QshGiveUp` makes it exit once the server has been silent for
 that many seconds, and `BatchMode yes` sets it to 30 unless the file says
-otherwise. `ServerAliveInterval` and `ServerAliveCountMax` are ignored,
-since the values people set for `ssh` would end a session that `qsh` can
-resume.
+otherwise. The server then ends a command that ran without a terminal after
+the same wait, where it would keep it for the hour. `ServerAliveInterval`
+and `ServerAliveCountMax` are ignored, since the values people set for `ssh`
+would end a session that `qsh` can resume.
 
 Accounts come from `/etc/passwd`, and from `getent` for the ones that live in
 LDAP or `systemd-homed`.

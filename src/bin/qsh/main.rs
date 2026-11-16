@@ -1636,6 +1636,7 @@ fn request(options: &Options, login: &Login) -> Result<Open> {
       agent: options.agent,
       environment,
       name: options.attach.clone(),
+      patience: login.give_up,
    })
 }
 
