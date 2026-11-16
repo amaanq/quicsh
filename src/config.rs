@@ -12,8 +12,8 @@
 //!   `ConnectTimeout`, `EscapeChar`, `SendEnv` and `SetEnv`. As in OpenSSH,
 //!   only the first `SetEnv` line counts. `Port` is ignored, because it names
 //!   sshd's TCP port and says nothing about the UDP port.
-//! - `QshPort` for the UDP port, which OpenSSH skips once the file says
-//!   `IgnoreUnknown QshPort`.
+//! - `QshPort` for the UDP port and `QshGiveUp` for how long a silent server is
+//!   waited for, which OpenSSH skips once the file says `IgnoreUnknown Qsh*`.
 //! - As in OpenSSH, the first value found for a keyword wins and identity files
 //!   add up.
 
@@ -79,6 +79,8 @@ pub struct Host {
    pub certificates:    Vec<PathBuf>,
    /// `ConnectTimeout`, as written.
    pub connect_timeout: Option<String>,
+   /// `QshGiveUp`, as written.
+   pub give_up:         Option<String>,
    /// `BatchMode`, as written.
    pub batch:           Option<String>,
    /// `ExitOnForwardFailure`, as written.
@@ -306,6 +308,7 @@ impl Host {
             "controlpath" => Some(&mut self.control_path),
             "controlpersist" => Some(&mut self.control_persist),
             "connecttimeout" => Some(&mut self.connect_timeout),
+            "qshgiveup" => Some(&mut self.give_up),
             "batchmode" => Some(&mut self.batch),
             "exitonforwardfailure" => Some(&mut self.exacting),
             "escapechar" => Some(&mut self.escape),

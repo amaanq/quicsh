@@ -1309,7 +1309,13 @@ impl App for Client {
                bail!("connection lost: {reason}");
             }
 
-            self.suspend(now);
+            // A connection that timed out last heard its server a timeout
+            // and a keep-alive interval ago.
+            let heard = matches!(reason, ConnectionError::TimedOut)
+               .then(|| now.checked_sub(self.login.silence() * 5 / 4))
+               .flatten();
+
+            self.suspend(heard.unwrap_or(now));
          },
          _ => {},
       }
@@ -1466,7 +1472,9 @@ fn serve(transport: &mut Transport, client: &mut Client, addresses: &[SocketAddr
 
    while let Some(since) = client.lost.filter(|_| !client.done) {
       client.current = loop {
-         if shutdown_requested() || since.elapsed() >= DETACH_LIMIT {
+         let patience = client.login.give_up.unwrap_or(DETACH_LIMIT);
+
+         if shutdown_requested() || since.elapsed() >= patience {
             bail!("connection lost");
          }
 
@@ -1937,7 +1945,7 @@ fn main() -> Result<()> {
       sockets.extend(local.listen(&accepted, &waker)?);
    }
 
-   let mut transport = Transport::new(options.congestion)?;
+   let mut transport = Transport::new(options.congestion, login.silence())?;
 
    let mut client = Client {
       current: None,

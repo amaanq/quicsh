@@ -151,11 +151,19 @@ files, because that's sshd's TCP port and `qshd` may sit on another one.
 `QshPort` sets the UDP port, and `IgnoreUnknown` makes `ssh` skip it.
 
 ```
-IgnoreUnknown QshPort
+IgnoreUnknown Qsh*
 
 Host box
    QshPort 4222
+   QshGiveUp 120
 ```
+
+`qsh` waits out an outage for as long as the server keeps the session, which
+is an hour. `QshGiveUp` makes it exit once the server has been silent for
+that many seconds, and `BatchMode yes` sets it to 30 unless the file says
+otherwise. `ServerAliveInterval` and `ServerAliveCountMax` are ignored,
+since the values people set for `ssh` would end a session that `qsh` can
+resume.
 
 Accounts come from `/etc/passwd`, and from `getent` for the ones that live in
 LDAP or `systemd-homed`.
@@ -300,12 +308,14 @@ nu bench.nu host --identity ~/.ssh/id_bench
   `ControlMaster`, `ControlPath`, `ControlPersist`, `ConnectTimeout`,
   `EscapeChar`, `AddressFamily`, `SendEnv`, `SetEnv`, `CertificateFile`,
   `UserKnownHostsFile`, `GlobalKnownHostsFile`, `BatchMode`,
-  `ExitOnForwardFailure` and `QshPort` are read.
+  `ExitOnForwardFailure`, `QshPort` and `QshGiveUp` are read.
   `ControlPath` takes `%h`, `%n`, `%p`, `%r`, `%u`, `%i` and `%C`, and `%C`
   is not the hash `ssh` computes. `StrictHostKeyChecking no` behaves like
   `accept-new`, so a changed host key is always refused. `Match` checks
   `all`, `host`, `originalhost`, `user`, `localuser` and `exec`, and a block
   with any other condition is skipped.
+- `ProxyCommand`. Its command carries a TCP byte stream and `qshd` listens
+  on UDP. `ProxyJump` and `-J` go through another `qshd`.
 - RSA keys under 2048 bits and RSA signatures over SHA-1.
   `ecdsa-sk` keys are accepted but nobody has tried one.
 - RSA and P-521 host keys. `qshd` takes an `ed25519`, P-256 or P-384 key.

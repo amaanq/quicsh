@@ -53,6 +53,7 @@ use quinn_proto::{
    EndpointConfig,
    Event,
    HashedConnectionIdGenerator,
+   IdleTimeout,
    Incoming,
    MtuDiscoveryConfig,
    ReadError,
@@ -142,7 +143,7 @@ const MAX_UDP_PAYLOAD: u16 = u16::MAX - 8;
 /// Largest UDP payload over IPv4.
 const MAX_UDP_PAYLOAD_V4: u16 = 65507;
 /// Idle time after which a connection is closed.
-const IDLE_TIMEOUT_MS: u32 = 60_000;
+pub const IDLE_TIMEOUT: Duration = Duration::from_mins(1);
 /// What a server that stops closes its connections with. The client then
 /// looks for the next server at once.
 pub const RESTARTING: VarInt = VarInt::from_u32(3);
@@ -197,8 +198,9 @@ impl Display for Congestion {
 
 impl Congestion {
    /// The QUIC transport settings for a path with this payload bound, where
-   /// the peer may have `window` bytes unread.
-   fn transport(self, route_bound: u16, window: u32) -> Arc<TransportConfig> {
+   /// the peer may have `window` bytes unread and counts as gone after
+   /// `silence`.
+   fn transport(self, route_bound: u16, window: u32, silence: Duration) -> Arc<TransportConfig> {
       let mut discovery = MtuDiscoveryConfig::default();
       discovery.upper_bound(route_bound);
 
@@ -208,8 +210,8 @@ impl Congestion {
          .stream_receive_window(VarInt::from_u32(16 << 20))
          .receive_window(VarInt::from_u32(window))
          .send_window(INTERACTIVE_WINDOW)
-         .max_idle_timeout(Some(VarInt::from_u32(IDLE_TIMEOUT_MS).into()))
-         .keep_alive_interval(Some(KEEP_ALIVE))
+         .max_idle_timeout(IdleTimeout::try_from(silence).ok())
+         .keep_alive_interval(Some(KEEP_ALIVE.min(silence / 4)))
          .initial_rtt(FIRST_ROUND_TRIP)
          .mtu_discovery_config(Some(discovery));
 
@@ -786,6 +788,8 @@ pub struct Transport {
    sessions:   BTreeMap<ConnectionHandle, Session>,
    /// Settings for new connections.
    congestion: Congestion,
+   /// Idle time after which a dialed connection is closed.
+   silence:    Duration,
    /// Turns readable when a local address or route changes. Present once the
    /// transport has dialed a connection.
    changes:    Option<OwnedFd>,
@@ -796,13 +800,16 @@ pub struct Transport {
 }
 
 impl Transport {
-   /// A transport that only makes outgoing connections.
+   /// A transport that only makes outgoing connections, and gives up one
+   /// that heard nothing for `silence`.
    ///
    /// # Errors
    ///
    /// Fails when the endpoint rejects its configuration.
-   pub fn new(congestion: Congestion) -> Result<Self, Error> {
-      Self::build(None, congestion, None)
+   pub fn new(congestion: Congestion, silence: Duration) -> Result<Self, Error> {
+      let mut transport = Self::build(None, congestion, None)?;
+      transport.silence = silence;
+      Ok(transport)
    }
 
    /// A transport that accepts connections on `socket`, which is bound to
@@ -867,6 +874,7 @@ impl Transport {
          listener,
          sessions: BTreeMap::new(),
          congestion,
+         silence: IDLE_TIMEOUT,
          changes: None,
          recv: vec![0; RECV_LEN * BATCH_SIZE],
          send: Vec::with_capacity(RECV_LEN),
@@ -903,11 +911,11 @@ impl Transport {
       };
 
       let mut config = ClientConfig::new(crypto);
-      config.transport_config(
-         self
-            .congestion
-            .transport(socket.payload_bound(remote)?, RECEIVE_WINDOW),
-      );
+      config.transport_config(self.congestion.transport(
+         socket.payload_bound(remote)?,
+         RECEIVE_WINDOW,
+         self.silence,
+      ));
 
       let (handle, connection) = self
          .endpoint
@@ -1177,11 +1185,11 @@ impl Transport {
       };
 
       let mut config = listener.config.clone();
-      config.transport_config(
-         self
-            .congestion
-            .transport(socket.payload_bound(remote)?, LOGIN_WINDOW),
-      );
+      config.transport_config(self.congestion.transport(
+         socket.payload_bound(remote)?,
+         LOGIN_WINDOW,
+         IDLE_TIMEOUT,
+      ));
 
       match self
          .endpoint

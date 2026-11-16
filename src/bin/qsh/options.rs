@@ -32,7 +32,10 @@ use quicsh::{
    control::Message,
    key::PublicKey,
    known_hosts::glob,
-   transport::Congestion,
+   transport::{
+      Congestion,
+      IDLE_TIMEOUT,
+   },
 };
 use ring::digest::{
    SHA256,
@@ -87,12 +90,44 @@ pub struct Login {
    /// How long the first connection may take per address, from
    /// `ConnectTimeout`.
    pub timeout:      Option<Duration>,
+   /// How long a server may stay silent before this client exits, from
+   /// `QshGiveUp`. Without it a lost session is dialed for as long as the
+   /// server keeps it.
+   pub give_up:      Option<Duration>,
    /// The known hosts files to read, from `UserKnownHostsFile` and
    /// `GlobalKnownHostsFile` or the places OpenSSH looks without them.
    pub known:        Vec<PathBuf>,
    /// Certificates for the keys to log in with, from `CertificateFile` and
    /// from beside the named key files.
    pub certificates: Vec<Certificate>,
+}
+
+/// `QshGiveUp` under `BatchMode`, where nobody waits out an outage.
+const BATCH_GIVE_UP: Duration = Duration::from_secs(30);
+
+impl Login {
+   /// How long a connection may hear nothing before it counts as lost. The
+   /// count starts at the first keep-alive without an answer, which goes
+   /// out a quarter of this after the server was last heard.
+   pub fn silence(&self) -> Duration {
+      self
+         .give_up
+         .map_or(IDLE_TIMEOUT, |limit| (limit * 4 / 5).min(IDLE_TIMEOUT))
+   }
+}
+
+/// The duration `keyword` is set to, which `none` and `0` leave unset.
+fn seconds(written: Option<&str>, keyword: &str) -> Result<Option<Duration>> {
+   match written {
+      None | Some("none" | "0") => Ok(None),
+      Some(text) => {
+         let count = text
+            .parse::<u64>()
+            .with_context(|| format!("{keyword} takes a number of seconds"))?;
+
+         Ok(Some(Duration::from_secs(count)))
+      },
+   }
 }
 
 /// Whether a keyword that takes yes or no is set to yes.
@@ -692,15 +727,10 @@ impl Options {
          environment: environment(&host)?,
          escape: escape(self.escape.as_deref().or(host.escape.as_deref()))?,
          predict: self.predict,
-         timeout: match host.connect_timeout.as_deref() {
-            None | Some("none" | "0") => None,
-            Some(seconds) => {
-               let count = seconds
-                  .parse::<u64>()
-                  .context("ConnectTimeout takes a number of seconds")?;
-
-               Some(Duration::from_secs(count))
-            },
+         timeout: seconds(host.connect_timeout.as_deref(), "ConnectTimeout")?,
+         give_up: match host.give_up {
+            None if agreed(host.batch.as_deref()) => Some(BATCH_GIVE_UP),
+            ref written => seconds(written.as_deref(), "QshGiveUp")?,
          },
          user,
          host: name,
