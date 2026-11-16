@@ -148,6 +148,10 @@ const IDLE_TIMEOUT_MS: u32 = 60_000;
 pub const RESTARTING: VarInt = VarInt::from_u32(3);
 /// Gap between keep-alive packets.
 const KEEP_ALIVE: Duration = Duration::from_secs(15);
+/// The round trip a connection assumes until it has measured one. A lost
+/// handshake packet is sent again after three of these, and quinn's 333 ms
+/// made that a full second.
+const FIRST_ROUND_TRIP: Duration = Duration::from_millis(100);
 /// How many times the packet that closes a connection is sent.
 const CLOSE_COPIES: usize = 3;
 /// Handshakes allowed in progress at once.
@@ -206,6 +210,7 @@ impl Congestion {
          .send_window(INTERACTIVE_WINDOW)
          .max_idle_timeout(Some(VarInt::from_u32(IDLE_TIMEOUT_MS).into()))
          .keep_alive_interval(Some(KEEP_ALIVE))
+         .initial_rtt(FIRST_ROUND_TRIP)
          .mtu_discovery_config(Some(discovery));
 
       match self {
