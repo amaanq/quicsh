@@ -77,11 +77,12 @@ fn provider() -> Arc<CryptoProvider> {
 }
 
 /// The signature schemes a host key may use, one per key type.
-pub const HOST_SCHEMES: [SignatureScheme; 4] = [
+pub const HOST_SCHEMES: [SignatureScheme; 5] = [
    SignatureScheme::ED25519,
    SignatureScheme::ECDSA_NISTP256_SHA256,
    SignatureScheme::ECDSA_NISTP384_SHA384,
    SignatureScheme::ECDSA_NISTP521_SHA512,
+   SignatureScheme::RSA_PSS_SHA256,
 ];
 
 /// Bytes in one number of a P-521 signature.
@@ -104,9 +105,8 @@ pub const fn scheme(key: &PublicKey) -> Result<SignatureScheme, Error> {
       PublicKey::Ecdsa {
          curve: Curve::P521, ..
       } => Ok(SignatureScheme::ECDSA_NISTP521_SHA512),
-      PublicKey::SkEd25519 { .. } | PublicKey::SkEcdsa { .. } | PublicKey::Rsa { .. } => {
-         Err(Error::KeyType)
-      },
+      PublicKey::Rsa { .. } => Ok(SignatureScheme::RSA_PSS_SHA256),
+      PublicKey::SkEd25519 { .. } | PublicKey::SkEcdsa { .. } => Err(Error::KeyType),
    }
 }
 

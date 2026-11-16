@@ -319,7 +319,8 @@ nu bench.nu host --identity ~/.ssh/id_bench
   on UDP. `ProxyJump` and `-J` go through another `qshd`.
 - RSA keys under 2048 bits and RSA signatures over SHA-1.
   `ecdsa-sk` keys are accepted but nobody has tried one.
-- RSA host keys. `qshd` takes an `ed25519` or ECDSA key.
+- RSA host keys over 4096 bits. `qshd` takes an `ed25519`, ECDSA or RSA
+  key.
 - A few `authorized_keys` options. `command=`, `from=`, `expiry-time=`,
   `permitopen=`, `permitlisten=`, `restrict`, `no-touch-required`,
   `verify-required` and the `pty`, `agent-forwarding` and `port-forwarding`

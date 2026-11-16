@@ -33,6 +33,7 @@ use ring::{
 };
 use rustls::pki_types::{
    PrivateKeyDer,
+   PrivatePkcs1KeyDer,
    PrivatePkcs8KeyDer,
    PrivateSec1KeyDer,
 };
@@ -54,6 +55,17 @@ const SK_ED25519_NAME: &[u8] = b"sk-ssh-ed25519@openssh.com";
 const SK_ECDSA_NAME: &[u8] = b"sk-ecdsa-sha2-nistp256@openssh.com";
 /// SSH name of an RSA key.
 const RSA_NAME: &[u8] = b"ssh-rsa";
+/// DER of the algorithm identifier in the `SubjectPublicKeyInfo` of an RSA
+/// key.
+const RSA_ALGORITHM: [u8; 15] = [
+   0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01, 0x05, 0x00,
+];
+/// DER tag of an integer.
+const DER_INTEGER: u8 = 0x02;
+/// DER tag of a bit string.
+const DER_BITS: u8 = 0x03;
+/// DER tag of a sequence.
+const DER_SEQUENCE: u8 = 0x30;
 /// SSH name of an RSA signature over SHA-256.
 const RSA_SHA256_NAME: &[u8] = b"rsa-sha2-256";
 /// SSH name of an RSA signature over SHA-512.
@@ -317,10 +329,27 @@ impl PublicKey {
    /// # Errors
    ///
    /// Fails when the structure is not the `SubjectPublicKeyInfo` of an
-   /// ed25519 or ECDSA key.
+   /// ed25519, ECDSA or RSA key.
    pub fn from_spki(der: &[u8]) -> Result<Self, Error> {
       if let Some(key) = der.strip_prefix(&SPKI_PREFIX) {
          return Ok(Self::Ed25519(key.try_into().map_err(|_| Error::KeyType)?));
+      }
+
+      // A DER integer and an SSH number are the same bytes.
+      let rsa = || {
+         let outer = whole_der(der, DER_SEQUENCE)?;
+         let bits = whole_der(outer.strip_prefix(&RSA_ALGORITHM)?, DER_BITS)?;
+         let numbers = whole_der(bits.strip_prefix(&[0])?, DER_SEQUENCE)?;
+         let (modulus, rest) = take_der(numbers, DER_INTEGER)?;
+
+         Some(Self::Rsa {
+            exponent: whole_der(rest, DER_INTEGER)?.to_vec(),
+            modulus:  modulus.to_vec(),
+         })
+      };
+
+      if let Some(key) = rsa() {
+         return Ok(key);
       }
 
       [Curve::P256, Curve::P384, Curve::P521]
@@ -347,7 +376,25 @@ impl PublicKey {
       match *self {
          Self::Ed25519(ref key) => Ok([&SPKI_PREFIX[..], key].concat()),
          Self::Ecdsa { curve, ref point } => Ok([curve.spki_prefix(), point].concat()),
-         Self::SkEd25519 { .. } | Self::SkEcdsa { .. } | Self::Rsa { .. } => Err(Error::KeyType),
+         Self::Rsa {
+            ref exponent,
+            ref modulus,
+         } => {
+            let mut numbers = Vec::new();
+            put_der(&mut numbers, DER_INTEGER, modulus);
+            put_der(&mut numbers, DER_INTEGER, exponent);
+
+            let mut bits = vec![0];
+            put_der(&mut bits, DER_SEQUENCE, &numbers);
+
+            let mut body = RSA_ALGORITHM.to_vec();
+            put_der(&mut body, DER_BITS, &bits);
+
+            let mut document = Vec::new();
+            put_der(&mut document, DER_SEQUENCE, &body);
+            Ok(document)
+         },
+         Self::SkEd25519 { .. } | Self::SkEcdsa { .. } => Err(Error::KeyType),
       }
    }
 
@@ -518,6 +565,133 @@ impl Display for PublicKey {
    }
 }
 
+/// Appends the DER item with `tag` and `content`.
+fn put_der(out: &mut Vec<u8>, tag: u8, content: &[u8]) {
+   out.push(tag);
+
+   match (u8::try_from(content.len()), u16::try_from(content.len())) {
+      (Ok(short @ ..=0x7F), _) => out.push(short),
+      (Ok(byte), _) => out.extend([0x81, byte]),
+      (Err(_), wide) => {
+         out.push(0x82);
+         out.extend(wide.unwrap_or(u16::MAX).to_be_bytes());
+      },
+   }
+
+   out.extend_from_slice(content);
+}
+
+/// The content of the DER item with `tag` at the front of `der`, and what
+/// follows it.
+fn take_der(der: &[u8], tag: u8) -> Option<(&[u8], &[u8])> {
+   let (&first, rest) = der.strip_prefix(&[tag])?.split_first()?;
+
+   let (length, body) = match first {
+      0x81 => {
+         let (&byte, body) = rest.split_first()?;
+         (usize::from(byte), body)
+      },
+      0x82 => {
+         let (wide, body) = rest.split_first_chunk::<2>()?;
+         (usize::from(u16::from_be_bytes(*wide)), body)
+      },
+      short @ ..=0x7F => (usize::from(short), rest),
+      _ => return None,
+   };
+
+   body.split_at_checked(length)
+}
+
+/// The content of the DER item with `tag` that is all of `der`.
+fn whole_der(der: &[u8], tag: u8) -> Option<&[u8]> {
+   take_der(der, tag)
+      .filter(|pair| pair.1.is_empty())
+      .map(|pair| pair.0)
+}
+
+/// The remainder of `number` by `modulus`, both big-endian and the modulus
+/// without leading zeros. It shifts and subtracts bit by bit, which is slow
+/// and not constant in time, and runs once when a host key is loaded.
+fn remainder(number: &[u8], modulus: &[u8]) -> Zeroizing<Vec<u8>> {
+   let mut rest = Zeroizing::new(vec![0_u8; modulus.len() + 1]);
+   let bits = number
+      .iter()
+      .flat_map(|&byte| (0..8).rev().map(move |shift| (byte >> shift) & 1));
+
+   for bit in bits {
+      let mut carry = bit;
+
+      for digit in rest.iter_mut().rev() {
+         let next = *digit >> 7;
+         *digit = (*digit << 1) | carry;
+         carry = next;
+      }
+
+      let over = rest
+         .split_first()
+         .is_some_and(|(&top, low)| top != 0 || low >= modulus);
+
+      if over {
+         let mut borrow = false;
+         let padded = modulus.iter().rev().chain([&0]);
+
+         for (digit, &taken) in rest.iter_mut().rev().zip(padded) {
+            let (first, under) = digit.overflowing_sub(taken);
+            let (second, again) = first.overflowing_sub(u8::from(borrow));
+
+            *digit = second;
+            borrow = under || again;
+         }
+      }
+   }
+
+   rest.remove(0);
+   rest
+}
+
+/// Reads the rest of an RSA private key into an RFC 8017 document. The key
+/// file lacks the two exponents that document wants, so they are computed.
+fn rsa(private: &mut Reader<'_>) -> Result<HostKey, Error> {
+   let modulus = private.string()?;
+   let exponent = private.string()?;
+   let secret = private.string()?;
+   let inverse = private.string()?;
+   let primes = [private.string()?, private.string()?];
+
+   // A prime is odd, so clearing its last bit takes one away.
+   let reduced = primes.map(|prime| {
+      let mut less = Zeroizing::new(unsigned(prime).to_vec());
+
+      if let Some(last) = less.last_mut() {
+         *last &= 0xFE;
+      }
+
+      remainder(unsigned(secret), &less)
+   });
+
+   let mut body = Zeroizing::new(vec![DER_INTEGER, 1, 0]);
+
+   for number in [modulus, exponent, secret, primes[0], primes[1]]
+      .into_iter()
+      .chain(reduced.iter().map(|number| number.as_slice()))
+      .chain([inverse])
+   {
+      let digits = unsigned(number);
+      let mut signed = Zeroizing::new(Vec::with_capacity(digits.len() + 1));
+
+      signed.extend(digits.first().is_none_or(|&top| top >= 0x80).then_some(0));
+      signed.extend_from_slice(digits);
+      put_der(&mut body, DER_INTEGER, &signed);
+   }
+
+   let mut document = Zeroizing::new(Vec::with_capacity(body.len() + 4));
+   put_der(&mut document, DER_SEQUENCE, &body);
+
+   Ok(HostKey::Document(PrivateKeyDer::Pkcs1(
+      PrivatePkcs1KeyDer::from(document.to_vec()),
+   )))
+}
+
 /// A host key in the form its signer takes.
 pub enum HostKey {
    /// A private key document that ring reads.
@@ -593,8 +767,7 @@ fn ecdsa(curve: Curve, private: &mut Reader<'_>) -> Result<HostKey, Error> {
    )))
 }
 
-/// Reads an unencrypted OpenSSH private key file that holds an ed25519 or
-/// ECDSA key.
+/// Reads an unencrypted OpenSSH private key file.
 ///
 /// # Errors
 ///
@@ -625,6 +798,10 @@ pub fn private_from_openssh(text: &str) -> Result<HostKey, Error> {
    }
 
    let name = private.string()?;
+
+   if name == RSA_NAME {
+      return rsa(&mut private);
+   }
 
    if name != ED25519_NAME {
       let curve = Curve::named(name).ok_or(Error::PrivateKey)?;

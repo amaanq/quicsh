@@ -174,10 +174,10 @@ impl SigningKey for RemoteKey {
    }
 
    fn algorithm(&self) -> SignatureAlgorithm {
-      if self.scheme == SignatureScheme::ED25519 {
-         SignatureAlgorithm::ED25519
-      } else {
-         SignatureAlgorithm::ECDSA
+      match self.scheme {
+         SignatureScheme::ED25519 => SignatureAlgorithm::ED25519,
+         SignatureScheme::RSA_PSS_SHA256 => SignatureAlgorithm::RSA,
+         _ => SignatureAlgorithm::ECDSA,
       }
    }
 }
