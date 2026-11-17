@@ -49,6 +49,8 @@ pub struct Host {
    pub identity_files:  Vec<PathBuf>,
    /// The hosts to connect through, as written.
    pub jump:            Option<String>,
+   /// The program whose input and output carry the connection, as written.
+   pub proxy:           Option<String>,
    /// `IdentityAgent`, as written.
    pub agent:           Option<String>,
    /// `ForwardAgent`, as written.
@@ -299,6 +301,7 @@ impl Host {
             "user" => Some(&mut self.user),
             "qshport" => Some(&mut self.port),
             "proxyjump" => Some(&mut self.jump),
+            "qshproxycommand" => Some(&mut self.proxy),
             "identityagent" => Some(&mut self.agent),
             "forwardagent" => Some(&mut self.forward_agent),
             "clearallforwardings" => Some(&mut self.clear),

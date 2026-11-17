@@ -6,6 +6,7 @@ mod mux;
 /// Command line options.
 mod options;
 mod predict;
+mod proxy;
 
 use std::{
    collections::{
@@ -2087,6 +2088,23 @@ fn divert(
    Ok(Some(0))
 }
 
+/// The addresses to dial, with the socket pair and the helper when another
+/// program carries the datagrams to the server.
+fn route(login: &Login) -> Result<(Vec<SocketAddr>, Option<OwnedFd>, Option<Child>)> {
+   let (child, link) = match (login.proxy.as_deref(), login.jump.as_deref()) {
+      (Some(line), _) => proxy::start(line)?,
+      (None, Some(hops)) => jump(hops, login)?,
+      (None, None) => return Ok((resolve(login)?, None, None)),
+   };
+
+   // A connection through a jump host has no address of its own to dial.
+   // The one below only names the peer, and the jump host looks the real
+   // one up.
+   let named = SocketAddr::from((Ipv4Addr::LOCALHOST, login.port));
+
+   Ok((vec![named], Some(link), Some(child)))
+}
+
 /// The socket that later runs share this connection through, when this
 /// run is the one to hold it.
 fn hosting(
@@ -2174,6 +2192,10 @@ fn main() -> Result<()> {
    let plain = options.plain();
    let login = options.login()?;
 
+   if options.stdio {
+      return proxy::serve(&resolve(&login)?);
+   }
+
    if options.background && !options.detached {
       process::exit(background()?);
    }
@@ -2200,17 +2222,7 @@ fn main() -> Result<()> {
       None => None,
    };
 
-   // A connection through a jump host has no address of its own to dial.
-   // The one below only names the peer, and the jump host looks the real
-   // one up.
-   let (addresses, link, helper) = if let Some(ref hops) = login.jump {
-      let (child, link) = jump(hops, &login)?;
-      let named = SocketAddr::from((Ipv4Addr::LOCALHOST, login.port));
-
-      (vec![named], Some(link), Some(child))
-   } else {
-      (resolve(&login)?, None, None)
-   };
+   let (addresses, link, helper) = route(&login)?;
 
    let waker = Arc::new(Waker::new()?);
 

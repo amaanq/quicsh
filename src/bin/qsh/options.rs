@@ -74,6 +74,9 @@ pub struct Login {
    pub keys:         Vec<Identity>,
    /// The hosts to connect through, the nearest first.
    pub jump:         Option<String>,
+   /// The command whose input and output carry the connection, from
+   /// `QshProxyCommand` with its tokens filled in.
+   pub proxy:        Option<String>,
    /// Socket of the SSH agent, when there is one to use.
    pub agent:        Option<PathBuf>,
    /// What to do about a host key nobody vouched for yet.
@@ -328,6 +331,10 @@ pub struct Options {
    /// server reaches it. This is what -J runs on the jump host.
    #[pound(short = 'W', value_name = "HOST:PORT")]
    pub relay:      Option<String>,
+   /// Carry UDP between standard input and output and HOST's port, with no
+   /// login. A `QshProxyCommand` runs this on a host that reaches the server.
+   #[pound(long)]
+   pub stdio:      bool,
    /// Listen locally and connect each connection to HOST:HOSTPORT from the
    /// server.
    #[pound(short = 'L', value_name = "[BIND:]PORT:HOST:HOSTPORT")]
@@ -565,6 +572,52 @@ impl Options {
       }))
    }
 
+   /// The `QshProxyCommand` to run, which `-J` and the word none turn off.
+   /// `%h` is the host's name, `%p` its UDP port, `%r` the account and `%n`
+   /// the name as given.
+   fn proxy(
+      &self,
+      written: Option<&str>,
+      user: &str,
+      name: &str,
+      port: u16,
+   ) -> Result<Option<String>> {
+      let Some(command) = written.filter(|text| !text.eq_ignore_ascii_case("none")) else {
+         return Ok(None);
+      };
+
+      if self.jump.is_some() {
+         return Ok(None);
+      }
+
+      let given = self
+         .target
+         .rsplit_once('@')
+         .map_or(self.target.as_str(), |(_, alias)| alias);
+
+      let mut line = String::new();
+      let mut symbols = command.chars();
+
+      while let Some(symbol) = symbols.next() {
+         if symbol != '%' {
+            line.push(symbol);
+            continue;
+         }
+
+         match symbols.next() {
+            Some('h') => line.push_str(name),
+            Some('p') => line.push_str(&port.to_string()),
+            Some('r') => line.push_str(user),
+            Some('n') => line.push_str(given),
+            Some('%') => line.push('%'),
+            Some(other) => bail!("QshProxyCommand knows no %{other}"),
+            None => bail!("QshProxyCommand ends in a lone %"),
+         }
+      }
+
+      Ok(Some(line))
+   }
+
    /// The addresses to try, where `-4` and `-6` win over `configured`.
    fn family(&self, configured: Option<&str>) -> Result<Family> {
       let family = match (self.inet, self.inet6, configured) {
@@ -757,6 +810,7 @@ impl Options {
             None if agreed(host.batch.as_deref()) => Some(BATCH_GIVE_UP),
             ref written => seconds(written.as_deref(), "QshGiveUp")?,
          },
+         proxy: self.proxy(host.proxy.as_deref(), &user, &name, port)?,
          user,
          host: name,
          port,

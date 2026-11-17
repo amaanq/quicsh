@@ -31,6 +31,9 @@ afford to lose :)
 - `rsync -e qsh`, and `scp` and `sftp` with `-S qsh`
 - Jump hosts with `-J` or `ProxyJump`, as many as you chain. A jump host
   runs `qshd` and only ever sees encrypted packets
+- `QshProxyCommand` for a server that only another program can reach. With
+  `QshProxyCommand ssh bastion qsh --stdio -p %p %h` the packets ride an
+  `ssh` login to a bastion that has `qsh` but no `qshd`
 - IPv4 and IPv6 on one socket
 - Roaming. A session carries on when the client changes networks
 - Congestion control that fits the path. A connection starts on Cubic,
@@ -326,14 +329,17 @@ nu bench.nu host --identity ~/.ssh/id_bench
   `EscapeChar`, `AddressFamily`, `SendEnv`, `SetEnv`, `CertificateFile`,
   `UserKnownHostsFile`, `GlobalKnownHostsFile`, `BatchMode`,
   `PasswordAuthentication`,
-  `ExitOnForwardFailure`, `QshPort` and `QshGiveUp` are read.
+  `ExitOnForwardFailure`, `QshPort`, `QshGiveUp` and `QshProxyCommand` are
+  read.
   `ControlPath` takes `%h`, `%n`, `%p`, `%r`, `%u`, `%i` and `%C`, and `%C`
   is not the hash `ssh` computes. `StrictHostKeyChecking no` behaves like
   `accept-new`, so a changed host key is always refused. `Match` checks
   `all`, `host`, `originalhost`, `user`, `localuser` and `exec`, and a block
   with any other condition is skipped.
 - `ProxyCommand`. Its command carries a TCP byte stream and `qshd` listens
-  on UDP. `ProxyJump` and `-J` go through another `qshd`.
+  on UDP. `ProxyJump` and `-J` go through another `qshd`, and
+  `QshProxyCommand` runs a program that carries the packets, each behind two
+  bytes of length. `qsh --stdio` is the other end of that.
 - RSA keys under 2048 bits and RSA signatures over SHA-1.
   `ecdsa-sk` keys are accepted but nobody has tried one.
 - RSA host keys over 4096 bits. `qshd` takes an `ed25519`, ECDSA or RSA
