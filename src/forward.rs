@@ -352,8 +352,12 @@ pub fn datagrams(socket: OwnedFd) -> io::Result<OwnedFd> {
          let count = match recv(&inbound, &mut buffer[2..], RecvFlags::DONTWAIT) {
             Ok((0, _)) => break,
             Ok((count, _)) => count,
-            // A refused datagram says nothing about the next one.
-            Err(Errno::WOULDBLOCK | Errno::INTR | Errno::CONNREFUSED) => continue,
+            // A refused datagram says nothing about the next one. A socket
+            // pair whose peer closed with unread messages says so once, as
+            // a reset, ahead of the last messages of that peer.
+            Err(Errno::WOULDBLOCK | Errno::INTR | Errno::CONNREFUSED | Errno::CONNRESET) => {
+               continue;
+            },
             Err(_) => break,
          };
 
