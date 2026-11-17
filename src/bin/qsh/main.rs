@@ -117,6 +117,7 @@ use quicsh::{
       Token,
    },
    forward::{
+      Bound,
       Forwards,
       datagrams,
    },
@@ -750,9 +751,9 @@ struct Master {
 
 impl Master {
    /// Listens on the socket that `control` names.
-   fn listen(control: &Control, waker: &Arc<Waker>) -> Result<Self> {
+   fn listen(control: &Control, waker: &Arc<Waker>, forwards: &Sender<Inbound>) -> Result<Self> {
       Ok(Self {
-         arrivals: mux::accept(mux::listen(&control.path)?, waker),
+         arrivals: mux::accept(mux::listen(&control.path)?, waker, forwards),
          peers:    HashMap::new(),
          persist:  control.persist,
          empty:    None,
@@ -2032,12 +2033,40 @@ fn share(socket: &OwnedFd, options: &Options, login: &Login, starter: Option<Fil
    let signals = SignalPipe::install()?;
    let signalled = reopen(signals.read_fd())?;
 
+   if options.forward {
+      release(starter)?;
+      return mux::wait(socket, &signalled, false);
+   }
+
    let open = request(options, login)?;
    let interactive = open.terminal.is_some();
 
    mux::open(socket, open)?;
    release(starter)?;
    mux::wait(socket, &signalled, interactive)
+}
+
+/// Listens for `locals` and hands each connection to the `qsh` that shares
+/// its connection. The listeners last as long as what this returns and
+/// this process.
+fn lend(control: &Control, locals: Vec<Local>) -> Result<Vec<Bound>> {
+   let (accepted, inbound) = channel();
+   let waker = Arc::new(Waker::new()?);
+   let mut sockets = Vec::new();
+
+   for local in locals {
+      sockets.extend(local.listen(&accepted, &waker)?);
+   }
+
+   let path = control.path.clone();
+
+   thread::spawn(move || {
+      for connection in inbound {
+         let _ = mux::forward(&path, &connection);
+      }
+   });
+
+   Ok(sockets)
 }
 
 /// Handles a run that needs no connection of its own and returns its exit
@@ -2047,6 +2076,7 @@ fn divert(
    login: &Login,
    options: &Options,
    plain: bool,
+   lent: &mut Vec<Local>,
    starter: &mut Option<File>,
 ) -> Result<Option<u32>> {
    let Some(ref control) = login.control else {
@@ -2073,15 +2103,23 @@ fn divert(
       },
       Some(other) => bail!("-O takes check, exit or stop, not {other}"),
       None => {
-         let socket = if plain {
+         // A run that only forwards starts no holder for its listeners,
+         // since it holds the connection as well as one would.
+         let socket = if plain || !lent.is_empty() && !options.forward {
             shared(control, options, login.family)?
-         } else {
+         } else if lent.is_empty() {
             None
+         } else {
+            mux::connect(&control.path).ok()
          };
 
-         return socket
-            .map(|holder| share(&holder, options, login, starter.take()))
-            .transpose();
+         let Some(holder) = socket else {
+            return Ok(None);
+         };
+
+         let _listeners = lend(control, mem::take(lent))?;
+
+         return share(&holder, options, login, starter.take()).map(Some);
       },
    }
 
@@ -2110,7 +2148,7 @@ fn route(login: &Login) -> Result<(Vec<SocketAddr>, Option<OwnedFd>, Option<Chil
 fn hosting(
    options: &Options,
    login: &Login,
-   waker: &Arc<Waker>,
+   (waker, forwards): (&Arc<Waker>, &Sender<Inbound>),
    relaying: bool,
 ) -> Result<Option<Master>> {
    let Some(ref control) = login.control else {
@@ -2118,7 +2156,7 @@ fn hosting(
    };
 
    if options.master {
-      return Master::listen(control, waker).map(Some);
+      return Master::listen(control, waker, forwards).map(Some);
    }
 
    let wanted = options.forward && control.create && !relaying;
@@ -2129,7 +2167,7 @@ fn hosting(
 
    // A run that only forwards has no session whose end ControlPersist
    // could count from, and no other run waits to hear of its login.
-   match Master::listen(control, waker) {
+   match Master::listen(control, waker, forwards) {
       Ok(master) => {
          Ok(Some(Master {
             persist: None,
@@ -2190,6 +2228,7 @@ fn main() -> Result<()> {
    let mut options = Options::parse();
 
    let plain = options.plain();
+   let mut lent = options.lend();
    let login = options.login()?;
 
    if options.stdio {
@@ -2202,7 +2241,7 @@ fn main() -> Result<()> {
 
    let mut starter = silence(&options)?;
 
-   if let Some(status) = divert(&login, &options, plain, &mut starter)? {
+   if let Some(status) = divert(&login, &options, plain, &mut lent, &mut starter)? {
       process::exit(i32::try_from(status).unwrap_or(255));
    }
 
@@ -2226,7 +2265,8 @@ fn main() -> Result<()> {
 
    let waker = Arc::new(Waker::new()?);
 
-   let master = hosting(&options, &login, &waker, relay.is_some())?;
+   let (accepted, inbound) = channel();
+   let master = hosting(&options, &login, (&waker, &accepted), relay.is_some())?;
 
    let channels = first(&options, &login, relay.is_some())?;
    let ask = options.ask();
@@ -2240,15 +2280,15 @@ fn main() -> Result<()> {
       interrupted.wake();
    });
 
-   let (accepted, inbound) = channel();
    let mut sockets = Vec::new();
 
-   for local in options
-      .local
-      .into_iter()
-      .map(Local::from)
-      .chain(options.dynamic.into_iter().map(Local::from))
-   {
+   for local in lent.into_iter().chain(
+      options
+         .local
+         .into_iter()
+         .map(Local::from)
+         .chain(options.dynamic.into_iter().map(Local::from)),
+   ) {
       sockets.extend(local.listen(&accepted, &waker)?);
    }
 

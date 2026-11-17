@@ -9,6 +9,7 @@ use std::{
    fmt::Write as _,
    fs,
    io,
+   mem,
    net::SocketAddr,
    path::{
       Path,
@@ -55,6 +56,7 @@ use zeroize::Zeroizing;
 use crate::{
    forward::{
       Fixed,
+      Local,
       Remote,
       Socks,
    },
@@ -644,6 +646,24 @@ impl Options {
          || self.list.then_some(Message::Sessions),
          |name| Some(Message::End(name.clone())),
       )
+   }
+
+   /// Takes the listeners of `-L` and `-D` out of a run that could hand
+   /// their connections to a shared connection. Like [`Self::plain`], this
+   /// counts only the command line.
+   pub fn lend(&mut self) -> Vec<Local> {
+      let lends =
+         self.remote.is_empty() && self.relay.is_none() && !self.master && self.ask().is_none();
+
+      if !lends {
+         return Vec::new();
+      }
+
+      mem::take(&mut self.local)
+         .into_iter()
+         .map(Local::from)
+         .chain(mem::take(&mut self.dynamic).into_iter().map(Local::from))
+         .collect()
    }
 
    /// Whether the run could be a session through a shared connection.

@@ -85,7 +85,8 @@ afford to lose :)
   connection, and later runs, `rsync`, `scp` and `sftp` included, go through
   it without a handshake or a login. `qsh -O check` asks whether it runs,
   `qsh -O exit` ends it with its sessions and `qsh -O stop` lets them finish
-  first
+  first. A run with `-L` or `-D` goes through it as well and keeps its
+  listeners for as long as it runs. A run with `-R` logs in on its own
 - `ed25519`, ECDSA (P-256, P-384 and P-521) and RSA keys, signed through
   `ssh-agent` or `ssh-keygen`
 - User certificates. A `cert-authority` line in `authorized_keys` lets in

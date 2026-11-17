@@ -69,9 +69,15 @@ use rustix::{
    process::umask,
 };
 
-use crate::channel::{
-   RawMode,
-   Streams,
+use crate::{
+   channel::{
+      RawMode,
+      Streams,
+   },
+   forward::{
+      Destination,
+      Inbound,
+   },
 };
 
 /// Largest message on the socket.
@@ -87,6 +93,14 @@ const CHECK: u8 = 2;
 const STOP: u8 = 3;
 /// Tag of the request that the holder ends its sessions and exits.
 const END: u8 = 4;
+
+/// Tag of a connection that the holder should forward, which comes with
+/// where the server connects it to.
+const FORWARD: u8 = 5;
+/// Marks a [`Destination::Tcp`] in such a request.
+const TCP: u8 = 0;
+/// Marks a [`Destination::Unix`] in such a request.
+const UNIX: u8 = 1;
 
 /// Tag of [`Notice::Exit`].
 const EXIT: u8 = 1;
@@ -197,8 +211,51 @@ pub fn connect(path: &Path) -> io::Result<OwnedFd> {
    }
 }
 
-/// Serves one `qsh` that connected to the holder's socket.
-fn serve(socket: &OwnedFd, peer: u64, arrivals: &Sender<Arrival>, waker: &Waker) {
+/// Hands the holder at `path` a connection that a listener of this
+/// process accepted.
+pub fn forward(path: &Path, inbound: &Inbound) -> io::Result<()> {
+   let mut bytes = vec![FORWARD];
+
+   match inbound.destination {
+      Destination::Tcp { ref host, port } => {
+         bytes.push(TCP);
+         bytes.extend_from_slice(&port.to_be_bytes());
+         bytes.extend_from_slice(host.as_bytes());
+      },
+      Destination::Unix(ref file) => {
+         bytes.push(UNIX);
+         bytes.extend_from_slice(file.as_bytes());
+      },
+   }
+
+   send_message(&connect(path)?, &bytes, &[inbound.socket.as_fd()])
+}
+
+/// Parses where a forwarded connection goes.
+fn destination(bytes: &[u8]) -> Option<Destination> {
+   let text = |name: &[u8]| String::from_utf8(name.to_vec()).ok();
+
+   match *bytes {
+      [TCP, high, low, ref host @ ..] => {
+         Some(Destination::Tcp {
+            host: text(host)?,
+            port: u16::from_be_bytes([high, low]),
+         })
+      },
+      [UNIX, ref file @ ..] => text(file).map(Destination::Unix),
+      _ => None,
+   }
+}
+
+/// Serves one `qsh` that connected to the holder's socket. Connections to
+/// forward go to `forwards`.
+fn serve(
+   socket: &OwnedFd,
+   peer: u64,
+   arrivals: &Sender<Arrival>,
+   forwards: &Sender<Inbound>,
+   waker: &Waker,
+) {
    let Ok(Some((bytes, descriptors))) = receive_message(socket, MAX_MESSAGE) else {
       return;
    };
@@ -214,6 +271,22 @@ fn serve(socket: &OwnedFd, peer: u64, arrivals: &Sender<Arrival>, waker: &Waker)
       Some((&END, _)) => {
          let _ = arrivals.send(Arrival::End);
          waker.wake();
+      },
+      Some((&FORWARD, rest)) => {
+         let (Some(target), Ok([accepted])) =
+            (destination(rest), <[OwnedFd; 1]>::try_from(descriptors))
+         else {
+            return;
+         };
+
+         let lent = Inbound {
+            socket:      accepted,
+            destination: target,
+         };
+
+         if forwards.send(lent).is_ok() {
+            waker.wake();
+         }
       },
       Some((&OPEN, frame)) => {
          let mut deframer = Deframer::default();
@@ -256,10 +329,16 @@ fn serve(socket: &OwnedFd, peer: u64, arrivals: &Sender<Arrival>, waker: &Waker)
 }
 
 /// Accepts every `qsh` that connects to `listener` on threads, and yields
-/// what they ask for. `waker` is woken for each [`Arrival`].
-pub fn accept(listener: OwnedFd, waker: &Arc<Waker>) -> Receiver<Arrival> {
+/// what they ask for. `waker` is woken for each [`Arrival`] and for each
+/// connection that goes to `forwards`.
+pub fn accept(
+   listener: OwnedFd,
+   waker: &Arc<Waker>,
+   forwards: &Sender<Inbound>,
+) -> Receiver<Arrival> {
    let (arrivals, receiver) = channel();
    let signal = Arc::clone(waker);
+   let lent = forwards.clone();
 
    thread::spawn(move || {
       for peer in 0.. {
@@ -268,9 +347,10 @@ pub fn accept(listener: OwnedFd, waker: &Arc<Waker>) -> Receiver<Arrival> {
          };
 
          let sender = arrivals.clone();
+         let lender = lent.clone();
          let notifier = Arc::clone(&signal);
 
-         thread::spawn(move || serve(&socket, peer, &sender, &notifier));
+         thread::spawn(move || serve(&socket, peer, &sender, &lender, &notifier));
       }
    });
 
