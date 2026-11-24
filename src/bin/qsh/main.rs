@@ -119,7 +119,7 @@ use quicsh::{
    forward::{
       Bound,
       Forwards,
-      datagrams,
+      Jump,
    },
    key::PublicKey,
    known_hosts::{
@@ -129,7 +129,6 @@ use quicsh::{
       entry,
    },
    pipe::{
-      NO_SIGNAL,
       Waker,
       reopen,
       socket_pair,
@@ -173,7 +172,6 @@ use rustix::{
       RecvFlags,
       SocketType,
       recv,
-      send,
    },
    process::setsid,
    stdio::{
@@ -725,7 +723,7 @@ struct Hop {
    port:  u16,
    /// The socket pair whose other end the relay's user holds. It stays the
    /// same across connections, so that user never sees one of them end.
-   link:  OwnedFd,
+   link:  Jump,
    /// Whether the user was told that the relay is open.
    ready: bool,
 }
@@ -1043,14 +1041,14 @@ impl Client {
          port: hop.port,
       };
 
-      let socket = datagrams(hop.link.try_clone()?)?;
+      let socket = hop.link.lend()?;
       self
          .forwards
          .open((stream, None), &opening, socket, &self.waker)?;
       self.lost = None;
 
       if !hop.ready {
-         send(&hop.link, &[0], NO_SIGNAL)?;
+         hop.link.start()?;
          hop.ready = true;
       }
 
@@ -1805,7 +1803,7 @@ fn jump(hops: &str, login: &Login) -> Result<(Child, OwnedFd)> {
 
    command.args(login.family.flag());
 
-   let (link, remote) = socket_pair(AddressFamily::UNIX, SocketType::SEQPACKET)?;
+   let (link, remote) = socket_pair(AddressFamily::UNIX, SocketType::STREAM)?;
 
    // Standard input stays free for the question about an unknown host key.
    let child = command
@@ -2251,7 +2249,7 @@ fn main() -> Result<()> {
          Some(Hop {
             host: host.to_owned(),
             port,
-            link: io::stdout().as_fd().try_clone_to_owned()?,
+            link: Jump::new(io::stdout().as_fd().try_clone_to_owned()?)?,
             ready: false,
          })
       },

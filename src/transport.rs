@@ -344,8 +344,7 @@ pub fn udp_socket(local: SocketAddr, remote: Option<SocketAddr>) -> io::Result<O
    // macOS refuses a send that names a destination on a connected socket,
    // and quinn-udp names one on every send. Binding to the source address
    // instead scopes the socket to the first interface that holds it, which
-   // need not be the route. A moved client finds its new path through
-   // silence alone.
+   // need not be the route.
    #[cfg(not(target_os = "linux"))]
    {
       let _ = remote;
@@ -385,17 +384,27 @@ enum Socket {
    /// A UDP socket.
    Udp {
       /// The socket.
-      io:    UdpSocket,
+      io:     UdpSocket,
       /// What the kernel supports for segmentation and receive batching.
-      state: UdpSocketState,
+      state:  UdpSocketState,
+      /// The local address the route to the peer left from when the socket
+      /// opened.
+      origin: Option<IpAddr>,
    },
-   /// A socket pair whose other end relays each message as a datagram, which
-   /// is how a connection runs through a jump host.
+   /// A stream socket pair whose other end relays each datagram, which is how
+   /// a connection runs through a jump host. Each datagram travels behind its
+   /// length in two bytes, the high one first.
    Pipe {
       /// This side of the pair.
-      io:   OwnedFd,
+      io:      OwnedFd,
       /// The address the connection believes its peer has.
-      peer: SocketAddr,
+      peer:    SocketAddr,
+      /// Bytes read and not yet handed on, from `begin` to `end`.
+      pending: Box<[u8]>,
+      /// Where the next frame starts in `pending`.
+      begin:   usize,
+      /// Where the bytes read so far end in `pending`.
+      end:     usize,
    },
 }
 
@@ -422,7 +431,27 @@ impl Socket {
          Ipv6Addr::UNSPECIFIED.into()
       };
 
-      Self::open(SocketAddr::new(unspecified, 0), Some(peer))
+      #[cfg(target_os = "linux")]
+      return Self::open(SocketAddr::new(unspecified, 0), Some(peer));
+
+      // The socket itself stays unconnected on macOS, so a throwaway
+      // connected one finds the route's address.
+      #[cfg(not(target_os = "linux"))]
+      {
+         let mut socket = Self::open(SocketAddr::new(unspecified, 0), Some(peer))?;
+
+         let route = || {
+            let probe = UdpSocket::bind(SocketAddr::new(unspecified, 0))?;
+            probe.connect(peer)?;
+            io::Result::Ok(probe.local_addr()?.ip())
+         };
+
+         if let Self::Udp { ref mut origin, .. } = socket {
+            *origin = route().ok();
+         }
+
+         Ok(socket)
+      }
    }
 
    /// Takes over a socket that is already bound.
@@ -433,17 +462,32 @@ impl Socket {
          state.set_send_buffer_size((&io).into(), SOCKET_BUFFER)?;
          state.set_recv_buffer_size((&io).into(), SOCKET_BUFFER)?;
 
-         io::Result::Ok(Self::Udp { io, state })
+         let origin = io.local_addr().ok().map(|local| local.ip());
+         io::Result::Ok(Self::Udp { io, state, origin })
       };
 
       setup().map_err(Error::Socket)
    }
 
    /// The local address a UDP socket sends from.
-   fn source(&self) -> Option<IpAddr> {
+   const fn source(&self) -> Option<IpAddr> {
       match *self {
-         Self::Udp { ref io, .. } => io.local_addr().ok().map(|local| local.ip()),
+         Self::Udp { origin, .. } => origin,
          Self::Pipe { .. } => None,
+      }
+   }
+
+   /// Whether a whole datagram already waits in this side's buffer, which no
+   /// poll reports.
+   fn buffered(&self) -> bool {
+      match *self {
+         Self::Udp { .. } => false,
+         Self::Pipe {
+            ref pending,
+            begin,
+            end,
+            ..
+         } => framed(&pending[begin..end]).is_some(),
       }
    }
 
@@ -495,28 +539,49 @@ impl Socket {
    /// Returns the number of filled buffers, or `None` when the socket has
    /// nothing queued.
    fn receive(
-      &self,
+      &mut self,
       buffer: &mut [u8],
       metas: &mut [RecvMeta; BATCH_SIZE],
    ) -> Result<Option<usize>, Error> {
       let (io, state) = match *self {
-         Self::Udp { ref io, ref state } => (io, state),
-         Self::Pipe { ref io, peer } => {
-            return match recv(io, &mut buffer[..RECV_LEN], RecvFlags::DONTWAIT) {
-               Ok((0, _)) => Err(Error::Receive(io::ErrorKind::UnexpectedEof.into())),
-               Ok((len, _)) => {
+         Self::Udp {
+            ref io, ref state, ..
+         } => (io, state),
+         Self::Pipe {
+            ref io,
+            peer,
+            ref mut pending,
+            ref mut begin,
+            ref mut end,
+         } => {
+            loop {
+               if let Some(datagram) = framed(&pending[*begin..*end]) {
+                  let length = datagram.len();
+
+                  buffer[..length].copy_from_slice(datagram);
+                  *begin += 2 + length;
+
                   let meta = &mut metas[0];
                   meta.addr = peer;
-                  meta.len = len;
-                  meta.stride = len;
+                  meta.len = length;
+                  meta.stride = length;
                   meta.ecn = None;
                   meta.dst_ip = None;
 
-                  Ok(Some(1))
-               },
-               Err(Errno::WOULDBLOCK | Errno::INTR) => Ok(None),
-               Err(errno) => Err(Error::Receive(errno.into())),
-            };
+                  return Ok(Some(1));
+               }
+
+               pending.copy_within(*begin..*end, 0);
+               *end -= *begin;
+               *begin = 0;
+
+               match recv(io, &mut pending[*end..], RecvFlags::DONTWAIT) {
+                  Ok((0, _)) => return Err(Error::Receive(io::ErrorKind::UnexpectedEof.into())),
+                  Ok((count, _)) => *end += count,
+                  Err(Errno::WOULDBLOCK | Errno::INTR) => return Ok(None),
+                  Err(errno) => return Err(Error::Receive(errno.into())),
+               }
+            }
          },
       };
 
@@ -546,21 +611,31 @@ impl Socket {
    /// Sends one batch of datagrams.
    fn transmit(&self, meta: &Transmit, contents: &[u8]) -> Result<(), Error> {
       let (io, state) = match *self {
-         Self::Udp { ref io, ref state } => (io, state),
+         Self::Udp {
+            ref io, ref state, ..
+         } => (io, state),
          Self::Pipe { ref io, .. } => {
             let size = meta.segment_size.unwrap_or(meta.size).max(1);
+            let mut frames = Vec::with_capacity(meta.size + 2 * meta.size.div_ceil(size));
 
             for datagram in contents[..meta.size].chunks(size) {
-               loop {
-                  match send(io, datagram, NO_SIGNAL) {
-                     Ok(_) | Err(Errno::MSGSIZE) => break,
-                     Err(Errno::WOULDBLOCK) => {
-                        poll(&mut [PollFd::new(io, PollFlags::OUT)], None)
-                           .map_err(|errno| Error::Poll(errno.into()))?;
-                     },
-                     Err(Errno::INTR) => {},
-                     Err(errno) => return Err(Error::Send(errno.into())),
-                  }
+               let length = u16::try_from(datagram.len()).unwrap_or(u16::MAX);
+
+               frames.extend_from_slice(&length.to_be_bytes());
+               frames.extend_from_slice(datagram);
+            }
+
+            let mut sent = 0;
+
+            while sent < frames.len() {
+               match send(io, &frames[sent..], NO_SIGNAL) {
+                  Ok(count) => sent += count,
+                  Err(Errno::WOULDBLOCK) => {
+                     poll(&mut [PollFd::new(io, PollFlags::OUT)], None)
+                        .map_err(|errno| Error::Poll(errno.into()))?;
+                  },
+                  Err(Errno::INTR) => {},
+                  Err(errno) => return Err(Error::Send(errno.into())),
                }
             }
 
@@ -597,6 +672,13 @@ impl Socket {
          }
       }
    }
+}
+
+/// The datagram at the start of `bytes` once its length and all of it are
+/// there.
+fn framed(bytes: &[u8]) -> Option<&[u8]> {
+   let (&length, rest) = bytes.split_first_chunk::<2>()?;
+   rest.get(..usize::from(u16::from_be_bytes(length)))
 }
 
 /// Watches the path of a dialed connection for silence.
@@ -927,8 +1009,8 @@ impl Transport {
    }
 
    /// Starts a connection to `remote` on a socket of its own. With `link`,
-   /// the datagrams travel as messages on that socket pair, and `remote` is
-   /// only a name for whoever answers at its other end.
+   /// the datagrams travel behind their lengths on that stream socket pair,
+   /// and `remote` is only a name for whoever answers at its other end.
    ///
    /// # Errors
    ///
@@ -950,7 +1032,13 @@ impl Transport {
       let socket = match link {
          Some(io) => {
             ioctl_fionbio(&io, true).map_err(|errno| Error::Socket(errno.into()))?;
-            Socket::Pipe { io, peer: remote }
+            Socket::Pipe {
+               io,
+               peer: remote,
+               pending: vec![0; 2 * RECV_LEN].into_boxed_slice(),
+               begin: 0,
+               end: 0,
+            }
          },
          None => Socket::dial(remote)?,
       };
@@ -1113,7 +1201,18 @@ impl Transport {
 
    /// Sleeps until a socket is readable, the waker fires or `deadline` passes.
    fn wait(&self, deadline: Option<Instant>, waker: Option<&Waker>) -> Result<(), Error> {
-      let timeout = deadline.map(|at| {
+      let ready = self
+         .sessions
+         .values()
+         .any(|session| session.socket.buffered());
+
+      let until = if ready {
+         Some(Instant::now())
+      } else {
+         deadline
+      };
+
+      let timeout = until.map(|at| {
          let wait = at.saturating_duration_since(Instant::now());
 
          Timespec {
@@ -1150,8 +1249,13 @@ impl Transport {
 
       for _ in 0..RECV_ROUNDS {
          let socket = match source {
-            Source::Listener => self.listener.as_ref().map(|listener| &listener.socket),
-            Source::Session(handle) => self.sessions.get(&handle).map(|session| &session.socket),
+            Source::Listener => self.listener.as_mut().map(|listener| &mut listener.socket),
+            Source::Session(handle) => {
+               self
+                  .sessions
+                  .get_mut(&handle)
+                  .map(|session| &mut session.socket)
+            },
          };
 
          let Some(count) = socket

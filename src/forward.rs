@@ -50,6 +50,7 @@ use std::{
    },
    sync::{
       Arc,
+      Mutex,
       atomic::{
          AtomicBool,
          Ordering,
@@ -82,13 +83,11 @@ use rustix::{
    io::Errno,
    net::{
       AddressFamily,
-      RecvFlags,
       Shutdown,
       SocketAddrUnix,
       SocketType,
       bind,
       listen,
-      recv,
       send,
       shutdown,
    },
@@ -311,69 +310,114 @@ const BATCH_LIMIT: usize = 64;
 /// fit, and 64 datagrams of 1372 bytes are already more than 64 KiB.
 const BATCH_BYTES: usize = BATCH_LIMIT * 9216;
 
-/// Joins a datagram socket to a byte stream and returns the stream's other
-/// end.
+/// The `-W` helper's end of the stream that carries a jumped connection.
 ///
-/// `socket` is a connected UDP socket or one side of a socket pair that
-/// keeps message boundaries. Each datagram travels behind two bytes that
-/// hold its length.
-///
-/// # Errors
-///
-/// Fails when the process is out of file descriptors.
-pub fn datagrams(socket: OwnedFd) -> io::Result<OwnedFd> {
-   let (near, far) = UnixStream::pair()?;
-   let mut framed = near.try_clone()?;
-   let inbound = socket.try_clone()?;
+/// The relays of the helper's successive connections share it. A relay that
+/// ends shuts its socket down, which on the stream itself would end it for
+/// every relay after.
+pub struct Jump {
+   /// The stream, written by one thread at a time so frames stay whole.
+   writer:  Arc<Mutex<UnixStream>>,
+   /// The near end of the newest relay's socket, which gets each frame read
+   /// from the stream. Frames that arrive while no relay runs are lost.
+   current: Arc<Mutex<Option<UnixStream>>>,
+}
 
-   let closed = Arc::new(Waker::new().map_err(io::Error::other)?);
-   let gone = Arc::clone(&closed);
+impl Jump {
+   /// Starts reading frames from `socket`.
+   ///
+   /// # Errors
+   ///
+   /// Fails when the process is out of file descriptors.
+   pub fn new(socket: OwnedFd) -> io::Result<Self> {
+      let mut reader = UnixStream::from(socket.try_clone()?);
+      let current = Arc::new(Mutex::<Option<UnixStream>>::new(None));
+      let target = Arc::clone(&current);
 
-   thread::spawn(move || {
-      let mut buffer = vec![0; DATAGRAM_LIMIT + 2];
+      thread::spawn(move || {
+         let mut frame = vec![0; 2 + DATAGRAM_LIMIT];
 
-      loop {
-         let mut watched = [
-            PollFd::new(&inbound, PollFlags::IN),
-            PollFd::new(&*gone, PollFlags::IN),
-         ];
-         let _ = poll(&mut watched, None);
+         while let Ok(length) = read_frame(&mut reader, &mut frame) {
+            let Ok(mut slot) = target.lock() else {
+               break;
+            };
 
-         if !watched[1].revents().is_empty() {
-            break;
+            if slot
+               .as_mut()
+               .is_some_and(|near| near.write_all(&frame[..length]).is_err())
+            {
+               *slot = None;
+            }
          }
 
-         let count = match recv(&inbound, &mut buffer[2..], RecvFlags::DONTWAIT) {
-            Ok((0, _)) => break,
-            Ok((count, _)) => count,
-            // A refused datagram says nothing about the next one. A socket
-            // pair whose peer closed with unread messages says so once, as
-            // a reset, ahead of the last messages of that peer.
-            Err(Errno::WOULDBLOCK | Errno::INTR | Errno::CONNREFUSED | Errno::CONNRESET) => {
-               continue;
-            },
-            Err(_) => break,
-         };
-
-         let Ok(length) = u16::try_from(count) else {
-            continue;
-         };
-
-         buffer[..2].copy_from_slice(&length.to_be_bytes());
-
-         if framed.write_all(&buffer[..count + 2]).is_err() {
-            break;
+         // The user of the relay is gone, and the relay ends with it.
+         if let Ok(mut slot) = target.lock() {
+            *slot = None;
          }
-      }
+      });
 
-      // The other thread holds this socket too, so dropping it here would
-      // not end the stream.
-      let _ = shutdown(&framed, Shutdown::Write);
-   });
+      Ok(Self {
+         writer: Arc::new(Mutex::new(UnixStream::from(socket))),
+         current,
+      })
+   }
 
-   thread::spawn(move || unframe(near, &socket, &closed));
+   /// Tells the user of the relay that it may start, with one byte ahead of
+   /// any frame.
+   ///
+   /// # Errors
+   ///
+   /// Fails when the stream does.
+   pub fn start(&self) -> io::Result<()> {
+      self
+         .writer
+         .lock()
+         .map_err(|_| io::Error::other("poisoned"))?
+         .write_all(&[0])
+   }
 
-   Ok(far.into())
+   /// A socket for the newest relay, which takes the frames from here on.
+   ///
+   /// # Errors
+   ///
+   /// Fails when the process is out of file descriptors.
+   pub fn lend(&self) -> io::Result<OwnedFd> {
+      let (near, far) = UnixStream::pair()?;
+      let mut reader = near.try_clone()?;
+      let writer = Arc::clone(&self.writer);
+
+      *self
+         .current
+         .lock()
+         .map_err(|_| io::Error::other("poisoned"))? = Some(near);
+
+      thread::spawn(move || {
+         let mut frame = vec![0; 2 + DATAGRAM_LIMIT];
+
+         while let Ok(length) = read_frame(&mut reader, &mut frame) {
+            let written = writer
+               .lock()
+               .is_ok_and(|mut stream| stream.write_all(&frame[..length]).is_ok());
+
+            if !written {
+               break;
+            }
+         }
+      });
+
+      Ok(far.into())
+   }
+}
+
+/// Reads one datagram with its two bytes of length into `frame` and returns
+/// the length of both.
+fn read_frame(stream: &mut UnixStream, frame: &mut [u8]) -> io::Result<usize> {
+   stream.read_exact(&mut frame[..2])?;
+
+   let length = 2 + usize::from(u16::from_be_bytes([frame[0], frame[1]]));
+   stream.read_exact(&mut frame[2..length])?;
+
+   Ok(length)
 }
 
 /// Sends each length-prefixed datagram that `framed` yields on `socket`, and
@@ -397,10 +441,10 @@ fn unframe(mut framed: UnixStream, socket: &OwnedFd, closed: &Waker) {
    closed.wake();
 }
 
-/// Joins a connected UDP socket to a byte stream as [`datagrams`] does. The
-/// kernel may hand over several datagrams of one size as one batch, which
-/// costs a busy relay far fewer system calls, and each still gets a frame
-/// of its own.
+/// Joins a connected UDP socket to a byte stream that carries each datagram
+/// behind its length in two bytes. The kernel may hand over several
+/// datagrams of one size as one batch, which costs a busy relay far fewer
+/// system calls, and each still gets a frame of its own.
 fn batches(socket: UdpSocket) -> io::Result<OwnedFd> {
    // This also forbids fragments, which lets the connection inside find
    // the real path MTU, and makes the socket non-blocking, which the

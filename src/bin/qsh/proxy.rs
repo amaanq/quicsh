@@ -15,12 +15,16 @@ use std::{
    net::{
       Ipv4Addr,
       Ipv6Addr,
+      Shutdown,
       SocketAddr,
       UdpSocket,
    },
-   os::fd::{
-      AsFd as _,
-      OwnedFd,
+   os::{
+      fd::{
+         AsFd as _,
+         OwnedFd,
+      },
+      unix::net::UnixStream,
    },
    process::{
       Child,
@@ -35,21 +39,10 @@ use misstep::{
    ResultExt as _,
    bail,
 };
-use quicsh::pipe::{
-   NO_SIGNAL,
-   socket_pair,
-};
-use rustix::{
-   io::Errno,
-   net::{
-      AddressFamily,
-      RecvFlags,
-      Shutdown,
-      SocketType,
-      recv,
-      send,
-      shutdown,
-   },
+use quicsh::pipe::socket_pair;
+use rustix::net::{
+   AddressFamily,
+   SocketType,
 };
 
 /// The longest datagram that its two bytes of length can announce.
@@ -81,8 +74,23 @@ fn put(sink: &mut impl Write, frame: &mut Vec<u8>, datagram: &[u8]) -> io::Resul
    sink.write_all(frame)
 }
 
-/// Starts `command` in the user's shell. Returns it with the socket pair that
-/// reaches the server through it, one message for each datagram.
+/// Copies `source` to `sink` until `source` ends. `io::copy` splices on
+/// Linux, which carried a download at 0.1 Gbit/s where this carries 11.
+fn pass(source: &mut impl Read, sink: &mut impl Write) -> io::Result<()> {
+   let mut buffer = vec![0; BUFFER];
+
+   loop {
+      match source.read(&mut buffer) {
+         Ok(0) => return Ok(()),
+         Ok(length) => sink.write_all(&buffer[..length])?,
+         Err(error) if error.kind() == ErrorKind::Interrupted => {},
+         Err(error) => return Err(error),
+      }
+   }
+}
+
+/// Starts `command` in the user's shell. Returns it with the stream socket
+/// pair that reaches the server through it.
 pub fn start(command: &str) -> Result<(Child, OwnedFd)> {
    let shell = env::var_os("SHELL").unwrap_or_else(|| "/bin/sh".into());
 
@@ -98,50 +106,23 @@ pub fn start(command: &str) -> Result<(Child, OwnedFd)> {
       bail!("the QshProxyCommand started without its pipes");
    };
 
-   let (link, arriving) = socket_pair(AddressFamily::UNIX, SocketType::SEQPACKET)?;
-   let leaving = arriving.try_clone()?;
+   // The program frames its datagrams as the link does, so bytes pass
+   // through unchanged.
+   let (link, near) = socket_pair(AddressFamily::UNIX, SocketType::STREAM)?;
+   let mut arriving = UnixStream::from(near);
+   let mut leaving = arriving.try_clone()?;
+   let mut source = output;
 
    thread::spawn(move || {
-      let mut source = BufReader::with_capacity(BUFFER, output);
-      let mut datagram = vec![0; LARGEST];
+      let _ = pass(&mut source, &mut arriving);
 
-      while let Ok(length) = take(&mut source, &mut datagram) {
-         let sent = datagram
-            .get(..length)
-            .is_some_and(|payload| send(&arriving, payload, NO_SIGNAL).is_ok());
-
-         if !sent {
-            break;
-         }
-      }
-
-      // The other thread holds this end open, and the connection has to
+      // The other thread holds this socket too, and the connection has to
       // see that the program is gone.
-      let _ = shutdown(&arriving, Shutdown::Both);
+      let _ = arriving.shutdown(Shutdown::Write);
    });
 
    thread::spawn(move || {
-      let mut datagram = vec![0; LARGEST];
-      let mut frame = Vec::with_capacity(2 + LARGEST);
-
-      loop {
-         // Linux reports a peer that closed with unread messages once, as
-         // this error, ahead of what that peer sent last. Those are the
-         // packets that close the connection.
-         let length = match recv(&leaving, &mut datagram, RecvFlags::empty()) {
-            Ok((length @ 1.., _)) => length,
-            Err(Errno::CONNRESET) => continue,
-            Ok(_) | Err(_) => break,
-         };
-
-         let written = datagram
-            .get(..length)
-            .is_some_and(|payload| put(&mut sink, &mut frame, payload).is_ok());
-
-         if !written {
-            break;
-         }
-      }
+      let _ = pass(&mut leaving, &mut sink);
    });
 
    Ok((child, link))
