@@ -16,6 +16,7 @@
       forAllSystems = lib.genAttrs [
         "x86_64-linux"
         "aarch64-linux"
+        "aarch64-darwin"
       ];
       pkgsFor = system: nixpkgs.legacyPackages.${system};
     in
@@ -87,10 +88,15 @@
         };
       nixosModules.default = self.nixosModules.qshd;
 
-      checks = forAllSystems (system: {
-        quicsh = self.packages.${system}.quicsh;
-        module = (pkgsFor system).callPackage ./nix/test.nix { inherit self; };
-      });
+      checks = forAllSystems (
+        system:
+        {
+          quicsh = self.packages.${system}.quicsh;
+        }
+        // lib.optionalAttrs (lib.hasSuffix "-linux" system) {
+          module = (pkgsFor system).callPackage ./nix/test.nix { inherit self; };
+        }
+      );
 
       formatter = forAllSystems (system: (pkgsFor system).nixfmt-tree);
     };

@@ -44,20 +44,25 @@ use std::{
 };
 
 use bytes::Bytes;
+#[cfg(target_os = "linux")]
+use rustix::event::{
+   EventfdFlags,
+   eventfd,
+};
 use rustix::{
    cmsg_space,
    event::{
-      EventfdFlags,
       PollFd,
       PollFlags,
-      eventfd,
       poll,
    },
    io::{
+      Errno,
       read,
       write,
    },
    net::{
+      AddressFamily,
       RecvAncillaryBuffer,
       RecvAncillaryMessage,
       RecvFlags,
@@ -65,9 +70,29 @@ use rustix::{
       SendAncillaryMessage,
       SendFlags,
       Shutdown,
+      SocketFlags,
+      SocketType,
+      accept_with,
+      recv,
       recvmsg,
+      send,
       sendmsg,
       shutdown,
+      socket_with,
+      socketpair,
+   },
+};
+#[cfg(not(target_os = "linux"))]
+use rustix::{
+   fs::{
+      OFlags,
+      fcntl_getfl,
+      fcntl_setfl,
+   },
+   io::{
+      FdFlags,
+      fcntl_setfd,
+      ioctl_fionbio,
    },
 };
 
@@ -78,38 +103,135 @@ const CHUNK: usize = 1 << 16;
 /// Chunks a channel holds before its thread waits.
 const QUEUE: usize = 16;
 
-/// An eventfd the loop polls beside its sockets.
-pub struct Waker(OwnedFd);
+/// The send flags that keep a write to a closed peer from raising SIGPIPE.
+#[cfg(target_os = "linux")]
+pub const NO_SIGNAL: SendFlags = SendFlags::NOSIGNAL;
+/// macOS has no `MSG_NOSIGNAL`. The Rust runtime ignores SIGPIPE before
+/// `main` runs, which covers the same writes.
+#[cfg(not(target_os = "linux"))]
+pub const NO_SIGNAL: SendFlags = SendFlags::empty();
+
+/// The receive flags that close passed descriptors on exec.
+#[cfg(target_os = "linux")]
+const RECEIVE_FLAGS: RecvFlags = RecvFlags::CMSG_CLOEXEC;
+/// macOS has no `MSG_CMSG_CLOEXEC`, so [`receive_message`] marks them after.
+#[cfg(not(target_os = "linux"))]
+const RECEIVE_FLAGS: RecvFlags = RecvFlags::empty();
+
+/// A socket that closes on exec.
+///
+/// # Errors
+///
+/// Fails when the family or type is not supported or the process is out of
+/// file descriptors.
+pub fn socket(family: AddressFamily, kind: SocketType) -> io::Result<OwnedFd> {
+   #[cfg(target_os = "linux")]
+   return Ok(socket_with(family, kind, SocketFlags::CLOEXEC, None)?);
+
+   #[cfg(not(target_os = "linux"))]
+   close_on_exec(socket_with(family, kind, SocketFlags::empty(), None)?)
+}
+
+/// A connected pair of sockets that close on exec.
+///
+/// # Errors
+///
+/// Fails like [`socket`].
+pub fn socket_pair(family: AddressFamily, kind: SocketType) -> io::Result<(OwnedFd, OwnedFd)> {
+   #[cfg(target_os = "linux")]
+   return Ok(socketpair(family, kind, SocketFlags::CLOEXEC, None)?);
+
+   #[cfg(not(target_os = "linux"))]
+   {
+      let (one, other) = socketpair(family, kind, SocketFlags::empty(), None)?;
+      Ok((close_on_exec(one)?, close_on_exec(other)?))
+   }
+}
+
+/// The next connection on `listener`, closed on exec.
+///
+/// # Errors
+///
+/// Fails when the listener does.
+pub fn accept(listener: &OwnedFd) -> io::Result<OwnedFd> {
+   #[cfg(target_os = "linux")]
+   return Ok(accept_with(listener, SocketFlags::CLOEXEC)?);
+
+   #[cfg(not(target_os = "linux"))]
+   close_on_exec(accept_with(listener, SocketFlags::empty())?)
+}
+
+/// Marks a descriptor close-on-exec after the call that made it, which
+/// leaves a window where another thread's child can inherit it.
+#[cfg(not(target_os = "linux"))]
+fn close_on_exec(descriptor: OwnedFd) -> io::Result<OwnedFd> {
+   fcntl_setfd(&descriptor, FdFlags::CLOEXEC)?;
+   Ok(descriptor)
+}
+
+/// A descriptor the loop polls beside its sockets, an eventfd on Linux and
+/// a socket pair elsewhere.
+pub struct Waker {
+   /// What the loop polls.
+   watched: OwnedFd,
+   /// The other end of the pair, which [`Waker::wake`] writes to.
+   #[cfg(not(target_os = "linux"))]
+   poked:   OwnedFd,
+}
 
 impl Waker {
    /// # Errors
    ///
    /// Fails when the process is out of file descriptors.
+   #[cfg(target_os = "linux")]
    pub fn new() -> Result<Self, Error> {
       eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)
-         .map(Self)
+         .map(|watched| Self { watched })
          .map_err(|errno| Error::Socket(errno.into()))
    }
 
+   /// # Errors
+   ///
+   /// Fails when the process is out of file descriptors.
+   #[cfg(not(target_os = "linux"))]
+   pub fn new() -> Result<Self, Error> {
+      let make = || {
+         let (watched, poked) = socket_pair(AddressFamily::UNIX, SocketType::STREAM)?;
+         ioctl_fionbio(&watched, true)?;
+         ioctl_fionbio(&poked, true)?;
+         io::Result::Ok(Self { watched, poked })
+      };
+
+      make().map_err(Error::Socket)
+   }
+
+   #[cfg(target_os = "linux")]
    #[expect(
       clippy::host_endian_bytes,
       reason = "the kernel reads an eventfd counter in the host's byte order"
    )]
    pub fn wake(&self) {
       // The only failure is a full counter, which already wakes the loop.
-      let _ = write(&self.0, &1_u64.to_ne_bytes());
+      let _ = write(&self.watched, &1_u64.to_ne_bytes());
+   }
+
+   #[cfg(not(target_os = "linux"))]
+   pub fn wake(&self) {
+      // A full socket buffer already wakes the loop.
+      let _ = write(&self.poked, &[1]);
    }
 
    pub fn clear(&self) {
-      // An empty counter fails with EAGAIN, which means there is nothing to
-      // clear.
-      let _ = read(&self.0, &mut [0; 8]);
+      // An empty counter or socket fails with EAGAIN, which means there is
+      // nothing left to clear.
+      let mut drained = [0; 64];
+      while read(&self.watched, &mut drained).is_ok_and(|length| length == drained.len()) {}
    }
 }
 
 impl AsFd for Waker {
    fn as_fd(&self) -> BorrowedFd<'_> {
-      self.0.as_fd()
+      self.watched.as_fd()
    }
 }
 
@@ -174,8 +296,23 @@ impl Drop for SendHalf {
 /// # Errors
 ///
 /// Fails when `/proc` is not mounted or the descriptor is closed.
+#[cfg(target_os = "linux")]
 pub fn reopen(descriptor: RawFd) -> io::Result<File> {
    File::open(format!("/proc/self/fd/{descriptor}"))
+}
+
+/// A second handle to the pipe behind `descriptor`. macOS opens `/dev/fd`
+/// as a duplicate that shares the file status flags, so the pipe turns
+/// blocking for its owner too, where Linux opens the pipe afresh.
+///
+/// # Errors
+///
+/// Fails when the descriptor is closed.
+#[cfg(not(target_os = "linux"))]
+pub fn reopen(descriptor: RawFd) -> io::Result<File> {
+   let file = File::open(format!("/dev/fd/{descriptor}"))?;
+   fcntl_setfl(&file, fcntl_getfl(&file)? - OFlags::NONBLOCK)?;
+   Ok(file)
 }
 
 /// Turns what a reader read into what it passes on, which may be nothing.
@@ -285,12 +422,7 @@ pub fn send_message(
       return Err(io::Error::other("too many descriptors for one message"));
    }
 
-   sendmsg(
-      socket,
-      &[IoSlice::new(bytes)],
-      &mut ancillary,
-      SendFlags::NOSIGNAL,
-   )?;
+   sendmsg(socket, &[IoSlice::new(bytes)], &mut ancillary, NO_SIGNAL)?;
 
    Ok(())
 }
@@ -313,14 +445,22 @@ pub fn receive_message(
       socket,
       &mut [IoSliceMut::new(&mut bytes)],
       &mut ancillary,
-      RecvFlags::CMSG_CLOEXEC,
+      RECEIVE_FLAGS,
    )?;
 
    if received.bytes == 0 {
       return Ok(None);
    }
 
-   let descriptors = ancillary
+   let descriptors = passed(&mut ancillary)?;
+
+   bytes.truncate(received.bytes);
+   Ok(Some((bytes, descriptors)))
+}
+
+/// The descriptors that arrived with a message.
+fn passed(ancillary: &mut RecvAncillaryBuffer<'_>) -> io::Result<Vec<OwnedFd>> {
+   ancillary
       .drain()
       .filter_map(|message| {
          match message {
@@ -329,10 +469,106 @@ pub fn receive_message(
          }
       })
       .flatten()
-      .collect();
+      .map(|descriptor| {
+         #[cfg(not(target_os = "linux"))]
+         fcntl_setfd(&descriptor, FdFlags::CLOEXEC)?;
+         io::Result::Ok(descriptor)
+      })
+      .collect()
+}
 
-   bytes.truncate(received.bytes);
+/// Sends one message on a Unix stream socket after its length in four
+/// bytes, with descriptors for the receiver. macOS has no `SOCK_SEQPACKET`
+/// for [`send_message`].
+///
+/// # Errors
+///
+/// Fails like [`send_message`], or with a message over 4 GiB.
+pub fn send_framed(
+   socket: &OwnedFd,
+   bytes: &[u8],
+   descriptors: &[BorrowedFd<'_>],
+) -> io::Result<()> {
+   let length = u32::try_from(bytes.len()).map_err(|_| io::Error::other("message too long"))?;
+   let frame = [&length.to_be_bytes()[..], bytes].concat();
+
+   let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(MAX_DESCRIPTORS))];
+   let mut ancillary = SendAncillaryBuffer::new(&mut space);
+
+   if !descriptors.is_empty() && !ancillary.push(SendAncillaryMessage::ScmRights(descriptors)) {
+      return Err(io::Error::other("too many descriptors for one message"));
+   }
+
+   // The descriptors travel with the first byte, so the rest of a short
+   // send goes without them.
+   let mut sent = sendmsg(socket, &[IoSlice::new(&frame)], &mut ancillary, NO_SIGNAL)?;
+
+   while sent < frame.len() {
+      match send(socket, &frame[sent..], NO_SIGNAL) {
+         Ok(more) => sent += more,
+         Err(Errno::INTR) => {},
+         Err(errno) => return Err(errno.into()),
+      }
+   }
+
+   Ok(())
+}
+
+/// The next message that [`send_framed`] sent, of at most `limit` bytes,
+/// and its descriptors, or `None` once the other side is gone.
+///
+/// # Errors
+///
+/// Fails when the socket does, the other side leaves in the middle of a
+/// message, or the message is longer than `limit`.
+pub fn receive_framed(
+   socket: &OwnedFd,
+   limit: usize,
+) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
+   let mut length = [0; 4];
+   let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(MAX_DESCRIPTORS))];
+   let mut ancillary = RecvAncillaryBuffer::new(&mut space);
+
+   let received = recvmsg(
+      socket,
+      &mut [IoSliceMut::new(&mut length)],
+      &mut ancillary,
+      RECEIVE_FLAGS,
+   )?;
+
+   if received.bytes == 0 {
+      return Ok(None);
+   }
+
+   let descriptors = passed(&mut ancillary)?;
+   fill(socket, &mut length[received.bytes..])?;
+
+   let size = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
+
+   if size > limit {
+      return Err(io::Error::other("message too long"));
+   }
+
+   let mut bytes = vec![0; size];
+   fill(socket, &mut bytes)?;
+
    Ok(Some((bytes, descriptors)))
+}
+
+/// Reads from `socket` until `buffer` is full.
+fn fill(socket: &OwnedFd, buffer: &mut [u8]) -> io::Result<()> {
+   let mut filled = 0;
+
+   while filled < buffer.len() {
+      match recv(socket, &mut buffer[filled..], RecvFlags::empty()) {
+         Ok((0, _)) => return Err(io::ErrorKind::UnexpectedEof.into()),
+         Ok((length, _)) => filled += length,
+         Err(Errno::INTR) => {},
+         Err(errno) => return Err(errno.into()),
+      }
+   }
+
+   Ok(())
 }
 
 /// The thread of a [`writer`].

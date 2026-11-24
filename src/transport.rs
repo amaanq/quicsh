@@ -77,6 +77,15 @@ use quinn_udp::{
    UdpSocketState,
 };
 use ring::hmac;
+#[cfg(target_os = "linux")]
+use rustix::net::{
+   connect,
+   netlink::SocketAddrNetlink,
+   sockopt::{
+      ip_mtu,
+      ipv6_mtu,
+   },
+};
 use rustix::{
    event::{
       PollFd,
@@ -90,18 +99,11 @@ use rustix::{
    net::{
       AddressFamily,
       RecvFlags,
-      SendFlags,
-      SocketFlags,
       SocketType,
       bind,
-      connect,
-      netlink::SocketAddrNetlink,
       recv,
       send,
-      socket_with,
       sockopt::{
-         ip_mtu,
-         ipv6_mtu,
          set_ipv6_v6only,
          set_socket_reuseport,
       },
@@ -112,7 +114,11 @@ use rustix::{
 use crate::{
    congestion::AdaptiveConfig,
    error::Error,
-   pipe::Waker,
+   pipe::{
+      NO_SIGNAL,
+      Waker,
+      socket,
+   },
 };
 
 /// How much unread data a peer may have sent, over all of its streams.
@@ -137,6 +143,7 @@ const SEND_WINDOW_CEILING: u64 = 64 << 20;
 /// Rate the send window is sized for, in bytes per second.
 const RATE_CEILING: f64 = 10.0e9 / 8.0;
 /// Smallest UDP payload QUIC allows.
+#[cfg(target_os = "linux")]
 const MIN_UDP_PAYLOAD: u16 = 1200;
 /// Largest UDP payload over IPv6.
 const MAX_UDP_PAYLOAD: u16 = u16::MAX - 8;
@@ -164,6 +171,7 @@ const PATIENCE: Duration = Duration::from_secs(1);
 /// Longest gap between attempts to move a silent connection to a new socket.
 const PATIENCE_CEILING: Duration = Duration::from_secs(8);
 /// The `RTMGRP` netlink groups for IPv4 and IPv6 address and route changes.
+#[cfg(target_os = "linux")]
 const NETWORK_CHANGES: u32 = 0x10 | 0x40 | 0x100 | 0x400;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -315,7 +323,7 @@ pub fn udp_socket(local: SocketAddr, remote: Option<SocketAddr>) -> io::Result<O
       AddressFamily::INET6
    };
 
-   let fd = socket_with(family, SocketType::DGRAM, SocketFlags::CLOEXEC, None)?;
+   let fd = socket(family, SocketType::DGRAM)?;
    set_socket_reuseport(&fd, true)?;
 
    // An IPv6 socket also carries IPv4, as IPv4-mapped addresses, whatever
@@ -324,26 +332,47 @@ pub fn udp_socket(local: SocketAddr, remote: Option<SocketAddr>) -> io::Result<O
       set_ipv6_v6only(&fd, false)?;
    }
 
-   bind(&fd, &local)?;
+   #[cfg(target_os = "linux")]
+   {
+      bind(&fd, &local)?;
 
-   if let Some(peer) = remote {
-      connect(&fd, &peer)?;
+      if let Some(peer) = remote {
+         connect(&fd, &peer)?;
+      }
    }
+
+   // macOS refuses a send that names a destination on a connected socket,
+   // and quinn-udp names one on every send. Binding to the source address
+   // instead scopes the socket to the first interface that holds it, which
+   // need not be the route. A moved client finds its new path through
+   // silence alone.
+   #[cfg(not(target_os = "linux"))]
+   {
+      let _ = remote;
+      bind(&fd, &local)?;
+   };
 
    Ok(fd)
 }
 
 /// Opens a netlink socket that turns readable when an address or a route
 /// changes.
+#[cfg(target_os = "linux")]
 fn network_changes() -> io::Result<OwnedFd> {
-   let fd = socket_with(
-      AddressFamily::NETLINK,
-      SocketType::RAW,
-      SocketFlags::CLOEXEC | SocketFlags::NONBLOCK,
-      None,
-   )?;
+   let fd = socket(AddressFamily::NETLINK, SocketType::RAW)?;
 
+   ioctl_fionbio(&fd, true)?;
    bind(&fd, &SocketAddrNetlink::new(0, NETWORK_CHANGES))?;
+   Ok(fd)
+}
+
+/// Opens a routing socket, which every address and route change makes
+/// readable without a subscription.
+#[cfg(not(target_os = "linux"))]
+fn network_changes() -> io::Result<OwnedFd> {
+   let fd = socket(AddressFamily::ROUTE, SocketType::RAW)?;
+
+   ioctl_fionbio(&fd, true)?;
    Ok(fd)
 }
 
@@ -429,6 +458,7 @@ impl Socket {
    /// Largest UDP payload that fits the route this connected socket uses. A
    /// relayed connection cannot see its route, so it probes up to the most a
    /// datagram holds and the relay drops what does not fit.
+   #[cfg(target_os = "linux")]
    fn payload_bound(&self, remote: SocketAddr) -> Result<u16, Error> {
       let Self::Udp { ref io, .. } = *self else {
          return Ok(MAX_UDP_PAYLOAD_V4);
@@ -447,6 +477,19 @@ impl Socket {
          .saturating_sub(overhead);
 
       Ok(u16::try_from(payload).map_or(ceiling, |fits| fits.clamp(MIN_UDP_PAYLOAD, ceiling)))
+   }
+
+   /// Largest UDP payload to probe for. macOS reports no path MTU, so every
+   /// connection probes up to the most a datagram holds, as a relayed one
+   /// does on Linux.
+   #[cfg(not(target_os = "linux"))]
+   #[expect(
+      clippy::unused_self,
+      clippy::unnecessary_wraps,
+      reason = "the Linux version reads the socket"
+   )]
+   const fn payload_bound(&self, _remote: SocketAddr) -> Result<u16, Error> {
+      Ok(MAX_UDP_PAYLOAD_V4)
    }
 
    /// Returns the number of filled buffers, or `None` when the socket has
@@ -509,7 +552,7 @@ impl Socket {
 
             for datagram in contents[..meta.size].chunks(size) {
                loop {
-                  match send(io, datagram, SendFlags::NOSIGNAL) {
+                  match send(io, datagram, NO_SIGNAL) {
                      Ok(_) | Err(Errno::MSGSIZE) => break,
                      Err(Errno::WOULDBLOCK) => {
                         poll(&mut [PollFd::new(io, PollFlags::OUT)], None)

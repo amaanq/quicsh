@@ -1,4 +1,6 @@
 {
+  lib,
+  stdenv,
   mkShell,
   toolchain,
   rust-analyzer,
@@ -19,19 +21,23 @@ mkShell {
     toolchain
     rust-analyzer
     tombi
+    pkg-config
+  ]
+  ++ lib.optionals stdenv.hostPlatform.isLinux [
     clang
     wild
-    pkg-config
   ]
   ++ extraPackages;
 
   buildInputs = [
     libghostty-vt
-    pam
-  ];
+  ]
+  ++ lib.optional stdenv.hostPlatform.isLinux pam;
 
   env = {
     RUST_SRC_PATH = "${toolchain}/lib/rustlib/src/rust/library";
+  }
+  // lib.optionalAttrs stdenv.hostPlatform.isLinux {
     RUSTFLAGS = "-Clinker=${clang}/bin/clang -Clink-arg=--ld-path=wild";
   };
 }

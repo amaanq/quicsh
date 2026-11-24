@@ -43,8 +43,10 @@ use quicsh::{
    },
    pipe::{
       Waker,
-      receive_message,
-      send_message,
+      accept as accept_socket,
+      receive_framed,
+      send_framed,
+      socket,
    },
 };
 use rustix::{
@@ -58,13 +60,10 @@ use rustix::{
    net::{
       AddressFamily,
       SocketAddrUnix,
-      SocketFlags,
       SocketType,
-      accept_with,
       bind,
       connect as connect_socket,
       listen as listen_socket,
-      socket_with,
    },
    process::umask,
 };
@@ -130,7 +129,7 @@ impl Notice {
          Self::Resumed => vec![RESUMED],
       };
 
-      let _ = send_message(socket, &bytes, &[]);
+      let _ = send_framed(socket, &bytes, &[]);
    }
 
    /// Parses one notice.
@@ -170,12 +169,7 @@ pub enum Arrival {
 
 /// Makes the socket at `path`, which only this user may connect to.
 pub fn listen(path: &Path) -> Result<OwnedFd> {
-   let socket = socket_with(
-      AddressFamily::UNIX,
-      SocketType::SEQPACKET,
-      SocketFlags::CLOEXEC,
-      None,
-   )?;
+   let socket = socket(AddressFamily::UNIX, SocketType::STREAM)?;
 
    let address = SocketAddrUnix::new(path)?;
 
@@ -194,12 +188,7 @@ pub fn listen(path: &Path) -> Result<OwnedFd> {
 /// Connects to the holder that listens at `path`. A socket file that
 /// nobody listens on any more is removed.
 pub fn connect(path: &Path) -> io::Result<OwnedFd> {
-   let socket = socket_with(
-      AddressFamily::UNIX,
-      SocketType::SEQPACKET,
-      SocketFlags::CLOEXEC,
-      None,
-   )?;
+   let socket = socket(AddressFamily::UNIX, SocketType::STREAM)?;
 
    match connect_socket(&socket, &SocketAddrUnix::new(path)?) {
       Ok(()) => Ok(socket),
@@ -228,7 +217,7 @@ pub fn forward(path: &Path, inbound: &Inbound) -> io::Result<()> {
       },
    }
 
-   send_message(&connect(path)?, &bytes, &[inbound.socket.as_fd()])
+   send_framed(&connect(path)?, &bytes, &[inbound.socket.as_fd()])
 }
 
 /// Parses where a forwarded connection goes.
@@ -256,13 +245,13 @@ fn serve(
    forwards: &Sender<Inbound>,
    waker: &Waker,
 ) {
-   let Ok(Some((bytes, descriptors))) = receive_message(socket, MAX_MESSAGE) else {
+   let Ok(Some((bytes, descriptors))) = receive_framed(socket, MAX_MESSAGE) else {
       return;
    };
 
    match bytes.split_first() {
       Some((&CHECK, _)) => {
-         let _ = send_message(socket, &process::id().to_be_bytes(), &[]);
+         let _ = send_framed(socket, &process::id().to_be_bytes(), &[]);
       },
       Some((&STOP, _)) => {
          let _ = arrivals.send(Arrival::Stop);
@@ -320,7 +309,7 @@ fn serve(
          waker.wake();
 
          // Nothing more is expected, so this returns when the peer is gone.
-         let _ = receive_message(socket, MAX_MESSAGE);
+         let _ = receive_framed(socket, MAX_MESSAGE);
          let _ = arrivals.send(Arrival::Closed { peer });
          waker.wake();
       },
@@ -342,7 +331,7 @@ pub fn accept(
 
    thread::spawn(move || {
       for peer in 0.. {
-         let Ok(socket) = accept_with(&listener, SocketFlags::CLOEXEC) else {
+         let Ok(socket) = accept_socket(&listener) else {
             break;
          };
 
@@ -364,7 +353,7 @@ pub fn open(socket: &OwnedFd, request: Open) -> io::Result<()> {
    bytes.extend_from_slice(&Message::Open(request).encode());
 
    let (input, output, errors) = (io::stdin(), io::stdout(), io::stderr());
-   send_message(socket, &bytes, &[
+   send_framed(socket, &bytes, &[
       input.as_fd(),
       output.as_fd(),
       errors.as_fd(),
@@ -393,7 +382,7 @@ pub fn wait(socket: &OwnedFd, signals: &File, interactive: bool) -> Result<u32> 
          return Ok(255);
       }
 
-      let Some((bytes, _)) = receive_message(socket, MAX_MESSAGE)? else {
+      let Some((bytes, _)) = receive_framed(socket, MAX_MESSAGE)? else {
          drop(raw);
          bail!("the shared connection ended");
       };
@@ -415,9 +404,9 @@ pub fn wait(socket: &OwnedFd, signals: &File, interactive: bool) -> Result<u32> 
 pub fn check(path: &Path) -> Result<u32> {
    let socket =
       connect(path).with_context(|| format!("no shared connection at {}", path.display()))?;
-   send_message(&socket, &[CHECK], &[])?;
+   send_framed(&socket, &[CHECK], &[])?;
 
-   let answer = receive_message(&socket, MAX_MESSAGE)?
+   let answer = receive_framed(&socket, MAX_MESSAGE)?
       .and_then(|(bytes, _)| Some(u32::from_be_bytes(bytes.try_into().ok()?)));
 
    match answer {
@@ -431,6 +420,6 @@ pub fn check(path: &Path) -> Result<u32> {
 pub fn stop(path: &Path, ending: bool) -> Result<()> {
    let socket =
       connect(path).with_context(|| format!("no shared connection at {}", path.display()))?;
-   send_message(&socket, &[if ending { END } else { STOP }], &[])?;
+   send_framed(&socket, &[if ending { END } else { STOP }], &[])?;
    Ok(())
 }

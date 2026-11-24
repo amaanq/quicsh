@@ -83,17 +83,14 @@ use rustix::{
    net::{
       AddressFamily,
       RecvFlags,
-      SendFlags,
       Shutdown,
       SocketAddrUnix,
-      SocketFlags,
       SocketType,
       bind,
       listen,
       recv,
       send,
       shutdown,
-      socket_with,
    },
 };
 
@@ -107,10 +104,12 @@ use crate::{
    },
    error::Error,
    pipe::{
+      NO_SIGNAL,
       Waker,
       halt,
       receive_message,
       send_message,
+      socket,
    },
    relay::{
       Relay,
@@ -237,12 +236,7 @@ impl Bound {
    /// Fails when the path is taken or cannot be written.
    pub fn listen(path: &Path) -> io::Result<(Self, UnixListener)> {
       let address = SocketAddrUnix::new(path)?;
-      let socket = socket_with(
-         AddressFamily::UNIX,
-         SocketType::STREAM,
-         SocketFlags::CLOEXEC,
-         None,
-      )?;
+      let socket = socket(AddressFamily::UNIX, SocketType::STREAM)?;
 
       if bind(&socket, &address) == Err(Errno::ADDRINUSE) {
          let stale = fs::symlink_metadata(path)?.file_type().is_socket()
@@ -397,7 +391,7 @@ fn unframe(mut framed: UnixStream, socket: &OwnedFd, closed: &Waker) {
 
       // A datagram that is too big for the path is lost alone, as it would
       // be on any network.
-      let _ = send(socket, &buffer[..length], SendFlags::NOSIGNAL);
+      let _ = send(socket, &buffer[..length], NO_SIGNAL);
    }
 
    closed.wake();

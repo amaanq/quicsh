@@ -35,19 +35,20 @@ use misstep::{
    ResultExt as _,
    bail,
 };
+use quicsh::pipe::{
+   NO_SIGNAL,
+   socket_pair,
+};
 use rustix::{
    io::Errno,
    net::{
       AddressFamily,
       RecvFlags,
-      SendFlags,
       Shutdown,
-      SocketFlags,
       SocketType,
       recv,
       send,
       shutdown,
-      socketpair,
    },
 };
 
@@ -97,12 +98,7 @@ pub fn start(command: &str) -> Result<(Child, OwnedFd)> {
       bail!("the QshProxyCommand started without its pipes");
    };
 
-   let (link, arriving) = socketpair(
-      AddressFamily::UNIX,
-      SocketType::SEQPACKET,
-      SocketFlags::CLOEXEC,
-      None,
-   )?;
+   let (link, arriving) = socket_pair(AddressFamily::UNIX, SocketType::SEQPACKET)?;
    let leaving = arriving.try_clone()?;
 
    thread::spawn(move || {
@@ -112,7 +108,7 @@ pub fn start(command: &str) -> Result<(Child, OwnedFd)> {
       while let Ok(length) = take(&mut source, &mut datagram) {
          let sent = datagram
             .get(..length)
-            .is_some_and(|payload| send(&arriving, payload, SendFlags::NOSIGNAL).is_ok());
+            .is_some_and(|payload| send(&arriving, payload, NO_SIGNAL).is_ok());
 
          if !sent {
             break;

@@ -129,8 +129,10 @@ use quicsh::{
       entry,
    },
    pipe::{
+      NO_SIGNAL,
       Waker,
       reopen,
+      socket_pair,
    },
    relay::{
       Relay,
@@ -160,22 +162,20 @@ use ring::rand::{
    SecureRandom as _,
    SystemRandom,
 };
+#[cfg(target_os = "linux")]
+use rustix::process::{
+   Signal,
+   set_parent_process_death_signal,
+};
 use rustix::{
    net::{
       AddressFamily,
       RecvFlags,
-      SendFlags,
-      SocketFlags,
       SocketType,
       recv,
       send,
-      socketpair,
    },
-   process::{
-      Signal,
-      set_parent_process_death_signal,
-      setsid,
-   },
+   process::setsid,
    stdio::{
       dup2_stderr,
       dup2_stdin,
@@ -1050,7 +1050,7 @@ impl Client {
       self.lost = None;
 
       if !hop.ready {
-         send(&hop.link, &[0], SendFlags::NOSIGNAL)?;
+         send(&hop.link, &[0], NO_SIGNAL)?;
          hop.ready = true;
       }
 
@@ -1805,12 +1805,7 @@ fn jump(hops: &str, login: &Login) -> Result<(Child, OwnedFd)> {
 
    command.args(login.family.flag());
 
-   let (link, remote) = socketpair(
-      AddressFamily::UNIX,
-      SocketType::SEQPACKET,
-      SocketFlags::CLOEXEC,
-      None,
-   )?;
+   let (link, remote) = socket_pair(AddressFamily::UNIX, SocketType::SEQPACKET)?;
 
    // Standard input stays free for the question about an unknown host key.
    let child = command
@@ -2248,6 +2243,9 @@ fn main() -> Result<()> {
    let relay = match options.relay.as_deref().map(endpoint) {
       Some((host, Some(port))) => {
          // The process that asked for the relay is the only user of it.
+         // macOS has no death signal, and there the helper ends once a
+         // read or write on its link fails.
+         #[cfg(target_os = "linux")]
          set_parent_process_death_signal(Some(Signal::TERM))?;
 
          Some(Hop {

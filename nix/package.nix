@@ -1,5 +1,6 @@
 {
   lib,
+  stdenv,
   rustPlatform,
   pkg-config,
   libghostty-vt,
@@ -34,8 +35,8 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [ pkg-config ];
   buildInputs = [
     libghostty-vt
-    pam
-  ];
+  ]
+  ++ lib.optional stdenv.hostPlatform.isLinux pam;
 
   strictDeps = true;
   enableParallelBuilding = true;
@@ -46,6 +47,6 @@ rustPlatform.buildRustPackage {
     license = lib.licenses.eupl12;
     maintainers = with lib.maintainers; [ amaanq ];
     mainProgram = "qsh";
-    platforms = lib.platforms.linux;
+    platforms = lib.platforms.linux ++ lib.platforms.darwin;
   };
 }
