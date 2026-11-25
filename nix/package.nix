@@ -1,6 +1,5 @@
 {
   lib,
-  stdenv,
   rustPlatform,
   pkg-config,
   libghostty-vt,
@@ -35,8 +34,8 @@ rustPlatform.buildRustPackage {
   nativeBuildInputs = [ pkg-config ];
   buildInputs = [
     libghostty-vt
-  ]
-  ++ lib.optional stdenv.hostPlatform.isLinux pam;
+    pam
+  ];
 
   strictDeps = true;
   enableParallelBuilding = true;
