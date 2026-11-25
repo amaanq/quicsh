@@ -1,4 +1,4 @@
-#![expect(
+#![allow(
    unused_imports,
    reason = "pound 0.6.1's derive imports `ViaFromStr` for every field and uses it only for \
              fields that parse through `FromStr`"

@@ -105,9 +105,10 @@ use crate::{
    pipe::{
       NO_SIGNAL,
       Waker,
+      finish_sending,
       halt,
-      receive_message,
-      send_message,
+      receive_framed,
+      send_framed,
       socket,
    },
    relay::{
@@ -289,7 +290,7 @@ pub fn handed(link: &OwnedFd, waker: &Arc<Waker>) -> io::Result<Receiver<io::Res
    let notifier = Arc::clone(waker);
 
    thread::spawn(move || {
-      let passed = receive_message(&source, 1).and_then(|message| {
+      let passed = receive_framed(&source, 1).and_then(|message| {
          message
             .and_then(|(_, descriptors)| descriptors.into_iter().next())
             .ok_or_else(|| io::ErrorKind::ConnectionRefused.into())
@@ -752,15 +753,23 @@ const PIECE: usize = 32 << 10;
 pub fn hand_over(link: &OwnedFd, forwards: Vec<Parked>) -> io::Result<()> {
    halt();
 
+   let mut sent = Vec::new();
+
    for (socket, state) in forwards.into_iter().filter_map(Parked::freeze) {
       let length = u32::try_from(state.len()).map_err(io::Error::other)?;
-      send_message(link, &length.to_be_bytes(), &[socket.as_fd()])?;
+      send_framed(link, &length.to_be_bytes(), &[socket.as_fd()])?;
 
       for piece in state.chunks(PIECE) {
-         send_message(link, piece, &[])?;
+         send_framed(link, piece, &[])?;
       }
+
+      sent.push(socket);
    }
 
+   // Keep descriptors open until the keeper finishes reading; closing them
+   // while still in flight on macOS resets the TCP connections.
+   finish_sending(link)?;
+   drop(sent);
    Ok(())
 }
 
@@ -773,7 +782,7 @@ pub fn hand_over(link: &OwnedFd, forwards: Vec<Parked>) -> io::Result<()> {
 pub fn take_over(link: &OwnedFd, waker: &Arc<Waker>) -> io::Result<Vec<Parked>> {
    let mut forwards = Vec::new();
 
-   while let Some((head, sockets)) = receive_message(link, PIECE)? {
+   while let Some((head, sockets)) = receive_framed(link, PIECE)? {
       let length = head
          .first_chunk()
          .and_then(|length| usize::try_from(u32::from_be_bytes(*length)).ok());
@@ -785,7 +794,7 @@ pub fn take_over(link: &OwnedFd, waker: &Arc<Waker>) -> io::Result<Vec<Parked>> 
       let mut state = Vec::new();
 
       while state.len() < wanted {
-         let Some((piece, _)) = receive_message(link, PIECE)? else {
+         let Some((piece, _)) = receive_framed(link, PIECE)? else {
             return Ok(forwards);
          };
 

@@ -3,6 +3,7 @@
 //! This crate holds the unsafe code that calling a C library takes, so that
 //! quicsh itself has none.
 
+#[cfg(target_os = "macos")] use std::io;
 use std::{
    error::Error,
    ffi::{
@@ -21,15 +22,27 @@ const SUCCESS: c_int = 0;
 /// `PAM_BUF_ERR`.
 const BUFFER_ERROR: c_int = 5;
 /// `PAM_CONV_ERR`.
+#[cfg(not(target_os = "macos"))]
 const CONVERSATION_ERROR: c_int = 19;
+/// `PAM_CONV_ERR` (OpenPAM).
+#[cfg(target_os = "macos")]
+const CONVERSATION_ERROR: c_int = 6;
 /// `PAM_TTY`.
 const TERMINAL: c_int = 3;
 /// `PAM_RHOST`.
 const REMOTE_HOST: c_int = 4;
 /// `PAM_ESTABLISH_CRED`.
+#[cfg(not(target_os = "macos"))]
 const ESTABLISH: c_int = 2;
+/// `PAM_ESTABLISH_CRED` (OpenPAM).
+#[cfg(target_os = "macos")]
+const ESTABLISH: c_int = 1;
 /// `PAM_DELETE_CRED`.
+#[cfg(not(target_os = "macos"))]
 const DELETE: c_int = 4;
+/// `PAM_DELETE_CRED` (OpenPAM).
+#[cfg(target_os = "macos")]
+const DELETE: c_int = 2;
 /// `PAM_DISALLOW_NULL_AUTHTOK`, which keeps out an account with an empty
 /// password.
 const NO_EMPTY_PASSWORD: c_int = 1;
@@ -80,6 +93,36 @@ unsafe extern "C" {
    fn calloc(count: usize, size: usize) -> *mut c_void;
    fn free(memory: *mut c_void);
    fn strdup(text: *const c_char) -> *mut c_char;
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+   fn initgroups(name: *const c_char, group: c_int) -> c_int;
+   fn setgid(group: u32) -> c_int;
+   fn setuid(user: u32) -> c_int;
+}
+
+/// Switches the process to `name` (`uid`, `gid`) and its supplementary
+/// groups via `initgroups`, `setgid`, and `setuid`.
+///
+/// # Errors
+///
+/// Fails if `name` contains a NUL byte or any privilege-drop call fails.
+#[cfg(target_os = "macos")]
+pub fn become_user(name: &str, uid: u32, gid: u32) -> io::Result<()> {
+   let text = CString::new(name).map_err(io::Error::other)?;
+
+   // SAFETY: `text` is a valid NUL-terminated C string.
+   if unsafe { initgroups(text.as_ptr(), gid.cast_signed()) } != 0 {
+      return Err(io::Error::last_os_error());
+   }
+
+   // SAFETY: `setgid` and `setuid` take only scalar IDs.
+   if unsafe { setgid(gid) } != 0 || unsafe { setuid(uid) } != 0 {
+      return Err(io::Error::last_os_error());
+   }
+
+   Ok(())
 }
 
 /// What PAM wants shown to whoever logs in.

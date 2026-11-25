@@ -26,7 +26,6 @@ use std::{
    io::{
       self,
       IoSlice,
-      IoSliceMut,
       Read as _,
       Write as _,
    },
@@ -75,6 +74,13 @@ use quicsh::{
       Terminal,
    },
    error::Error,
+   pipe::{
+      NO_SIGNAL,
+      accept,
+      receive_framed,
+      send_framed,
+      send_gathered,
+   },
    relay::Tail,
    wire::Reader,
 };
@@ -83,7 +89,10 @@ use ring::rand::{
    SecureRandom as _,
    SystemRandom,
 };
+#[cfg(target_os = "linux")]
+use rustix::pty::ioctl_tiocgptpeer;
 use rustix::{
+   buffer::spare_capacity,
    cmsg_space,
    event::{
       PollFd,
@@ -97,19 +106,18 @@ use rustix::{
       write,
    },
    net::{
-      RecvAncillaryBuffer,
-      RecvAncillaryMessage,
       RecvFlags,
       SendAncillaryBuffer,
       SendAncillaryMessage,
       SendFlags,
-      SocketFlags,
-      accept_with,
       recv,
-      recvmsg,
       send,
       sendmsg,
-      sockopt::set_socket_send_buffer_size,
+      sockopt::{
+         Timeout,
+         set_socket_send_buffer_size,
+         set_socket_timeout,
+      },
    },
    process::{
       Pid,
@@ -120,7 +128,6 @@ use rustix::{
    pty::{
       OpenptFlags,
       grantpt,
-      ioctl_tiocgptpeer,
       openpt,
       unlockpt,
    },
@@ -129,6 +136,19 @@ use rustix::{
       ttyname,
    },
    time::Timespec,
+};
+#[cfg(not(target_os = "linux"))]
+use rustix::{
+   fs::{
+      Mode,
+      OFlags,
+      open,
+   },
+   io::{
+      FdFlags,
+      fcntl_setfd,
+   },
+   pty::ptsname,
 };
 
 use crate::{
@@ -147,6 +167,8 @@ const LINK_BUFFER: usize = 64 << 10;
 pub const DATA_LIMIT: usize = 32 << 10;
 /// Room for the largest packet.
 pub const PACKET_LIMIT: usize = DATA_LIMIT + 32;
+/// Size of the big-endian `u32` packet length prefix.
+const HEADER: usize = 4;
 /// How long output may stay open after the command exits. A background
 /// process that inherited it would otherwise hold the session open.
 const EXIT_GRACE: Duration = Duration::from_millis(200);
@@ -181,10 +203,7 @@ const INSPECT: u8 = 12;
 const ABOUT: u8 = 13;
 /// How long the network process waits for a holder to say how its session
 /// is doing.
-const INSPECT_LIMIT: Timespec = Timespec {
-   tv_sec:  0,
-   tv_nsec: 200_000_000,
-};
+const INSPECT_LIMIT: Duration = Duration::from_millis(200);
 
 /// One message between the network process and a holder.
 pub enum Packet {
@@ -369,73 +388,32 @@ impl Packet {
    /// Asks the holder behind a new `link` how its session is doing. `None`
    /// means it did not say in time.
    pub fn inspect(link: &OwnedFd) -> Option<Self> {
+      // Bound the read in case the unprivileged holder stalls mid-reply.
+      set_socket_timeout(link, Timeout::Recv, Some(INSPECT_LIMIT)).ok()?;
       Self::Inspect.send(link).ok()?;
 
-      let answered = poll(
-         &mut [PollFd::new(link, PollFlags::IN)],
-         Some(&INSPECT_LIMIT),
-      );
-      let mut buffer = [0; 512];
-
-      match answered {
-         Ok(1..) => Self::receive(link, &mut buffer).ok()??.0.into(),
-         Ok(0) | Err(_) => None,
-      }
-      .filter(|packet| matches!(*packet, Self::About { .. }))
+      Some(Self::receive(link).ok()??.0).filter(|packet| matches!(*packet, Self::About { .. }))
    }
 
    /// Sends the packet, waiting for room unless the socket is non-blocking.
    pub fn send(&self, link: &OwnedFd) -> io::Result<()> {
-      send(link, &self.encode(), SendFlags::NOSIGNAL)?;
-      Ok(())
+      send_framed(link, &self.encode(), &[])
    }
 
    /// Sends `bytes` as a [`Packet::Data`] without copying them first.
    pub fn send_data(link: &OwnedFd, bytes: &[u8]) -> io::Result<()> {
-      sendmsg(
-         link,
-         &[IoSlice::new(&[DATA]), IoSlice::new(bytes)],
-         &mut SendAncillaryBuffer::default(),
-         SendFlags::NOSIGNAL,
-      )?;
-
-      Ok(())
+      send_gathered(link, &[&[DATA], bytes], &[])
    }
 
    /// Waits for the next packet and the descriptor it may carry. `None`
    /// means the other side closed.
-   pub fn receive(
-      link: &OwnedFd,
-      buffer: &mut [u8],
-   ) -> io::Result<Option<(Self, Option<OwnedFd>)>> {
-      let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(1))];
-      let mut ancillary = RecvAncillaryBuffer::new(&mut space);
-
-      let count = recvmsg(
-         link,
-         &mut [IoSliceMut::new(&mut *buffer)],
-         &mut ancillary,
-         RecvFlags::CMSG_CLOEXEC,
-      )?
-      .bytes;
-
-      if count == 0 {
+   pub fn receive(link: &OwnedFd) -> io::Result<Option<(Self, Option<OwnedFd>)>> {
+      let Some((bytes, descriptors)) = receive_framed(link, PACKET_LIMIT)? else {
          return Ok(None);
-      }
+      };
 
-      let descriptor = ancillary
-         .drain()
-         .filter_map(|message| {
-            match message {
-               RecvAncillaryMessage::ScmRights(descriptors) => Some(descriptors),
-               _ => None,
-            }
-         })
-         .flatten()
-         .next();
-
-      Self::decode(&buffer[..count])
-         .map(|packet| Some((packet, descriptor)))
+      Self::decode(&bytes)
+         .map(|packet| Some((packet, descriptors.into_iter().next())))
          .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
    }
 }
@@ -506,6 +484,84 @@ impl Drop for AgentSocket {
       if self.listener.is_some() {
          let _ = fs::remove_file(self.path());
          let _ = fs::remove_dir(&self.directory);
+      }
+   }
+}
+
+/// Encodes `parts` as a length-prefixed packet.
+fn frame(parts: &[&[u8]]) -> Bytes {
+   let length = parts.iter().map(|part| part.len()).sum::<usize>();
+   let mut bytes = Vec::with_capacity(HEADER + length);
+
+   bytes.extend_from_slice(&u32::try_from(length).unwrap_or(u32::MAX).to_be_bytes());
+
+   for part in parts {
+      bytes.extend_from_slice(part);
+   }
+
+   bytes.into()
+}
+
+/// Non-blocking stream connection from the network process.
+struct Link {
+   /// Underlying Unix stream socket.
+   socket: OwnedFd,
+   /// Buffered bytes awaiting packet decoding.
+   unread: Vec<u8>,
+   /// Read cursor into `unread`.
+   start:  usize,
+}
+
+impl Link {
+   /// Wraps `socket` with an empty read buffer.
+   const fn new(socket: OwnedFd) -> Self {
+      Self {
+         socket,
+         unread: Vec::new(),
+         start: 0,
+      }
+   }
+
+   /// Reads and decodes the next complete packet, or `Ok(None)` if it
+   /// would block.
+   ///
+   /// # Errors
+   ///
+   /// Fails on EOF, I/O error, or an invalid packet.
+   fn next(&mut self) -> io::Result<Option<Packet>> {
+      loop {
+         let pending = &self.unread[self.start..];
+
+         if let Some(&length) = pending.first_chunk::<HEADER>() {
+            let size = usize::try_from(u32::from_be_bytes(length)).unwrap_or(usize::MAX);
+
+            if size > PACKET_LIMIT {
+               return Err(io::ErrorKind::InvalidData.into());
+            }
+
+            if let Some(body) = pending.get(HEADER..HEADER + size) {
+               let packet = Packet::decode(body)
+                  .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+               self.start += HEADER + size;
+               return Ok(Some(packet));
+            }
+         }
+
+         self.unread.drain(..self.start);
+         self.start = 0;
+         self.unread.reserve(HEADER + PACKET_LIMIT);
+
+         match recv(
+            &self.socket,
+            spare_capacity(&mut self.unread),
+            RecvFlags::DONTWAIT,
+         ) {
+            Ok((0, _)) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(_) | Err(Errno::INTR) => {},
+            Err(Errno::WOULDBLOCK) => return Ok(None),
+            Err(errno) => return Err(errno.into()),
+         }
       }
    }
 }
@@ -594,15 +650,17 @@ struct Holder {
    /// Whether the client's input ended.
    closing:  bool,
    /// The network process, while one is connected.
-   link:     Option<OwnedFd>,
+   link:     Option<Link>,
    /// A new connection that has not said what it wants.
-   visitor:  Option<OwnedFd>,
+   visitor:  Option<Link>,
    /// When the session last wrote anything.
    active:   Instant,
    /// Whether the link asked for output.
    attached: bool,
-   /// Packets the link has not accepted yet.
-   outbox:   VecDeque<Bytes>,
+   /// Queued outbound packets and any attached file descriptor.
+   outbox:   VecDeque<(Bytes, Option<OwnedFd>)>,
+   /// Bytes already written from the front packet in `outbox`.
+   sent:     usize,
    /// When the last link went away.
    detached: Instant,
    /// How long a session on pipes waits without a link.
@@ -626,15 +684,36 @@ impl Holder {
       self.attached = false;
       self.reported = false;
       self.outbox.clear();
+      self.sent = 0;
       self.detached = now;
    }
 
    /// Sends queued packets until the link would block.
    fn flush(&mut self) {
-      while let (Some(link), Some(packet)) = (self.link.as_ref(), self.outbox.front()) {
-         match send(link, packet, SendFlags::NOSIGNAL | SendFlags::DONTWAIT) {
-            Ok(_) => {
-               self.outbox.pop_front();
+      while let (Some(link), Some(entry)) = (self.link.as_ref(), self.outbox.front()) {
+         let rest = &entry.0[self.sent..];
+         let flags = NO_SIGNAL | SendFlags::DONTWAIT;
+
+         let result = match entry.1 {
+            Some(ref socket) if self.sent == 0 => {
+               let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(1))];
+               let mut ancillary = SendAncillaryBuffer::new(&mut space);
+               let descriptors = [socket.as_fd()];
+               ancillary.push(SendAncillaryMessage::ScmRights(&descriptors));
+
+               sendmsg(&link.socket, &[IoSlice::new(rest)], &mut ancillary, flags)
+            },
+            Some(_) | None => send(&link.socket, rest, flags),
+         };
+
+         match result {
+            Ok(count) => {
+               self.sent += count;
+
+               if self.sent == entry.0.len() {
+                  self.outbox.pop_front();
+                  self.sent = 0;
+               }
             },
             Err(Errno::WOULDBLOCK) => return,
             // A network process that hung up closed the link right after
@@ -642,6 +721,7 @@ impl Holder {
             Err(_) => {
                self.attached = false;
                self.outbox.clear();
+               self.sent = 0;
             },
          }
       }
@@ -649,13 +729,13 @@ impl Holder {
 
    /// Queues a packet for the link.
    fn push(&mut self, packet: &Packet) {
-      self.outbox.push_back(packet.encode().into());
+      self.outbox.push_back((frame(&[&packet.encode()]), None));
       self.flush();
    }
 
    /// Hands a program that wants the SSH agent to the link. Without a link
    /// that listens, the program sees its connection close.
-   fn offer(&self) {
+   fn offer(&mut self) {
       let accepting = self
          .agent
          .as_ref()
@@ -665,21 +745,11 @@ impl Holder {
          return;
       };
 
-      let Some(link) = self.link.as_ref().filter(|_| self.attached) else {
-         return;
-      };
-
-      let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(1))];
-      let mut ancillary = SendAncillaryBuffer::new(&mut space);
-      let descriptors = [socket.as_fd()];
-      ancillary.push(SendAncillaryMessage::ScmRights(&descriptors));
-
-      let _ = sendmsg(
-         link,
-         &[IoSlice::new(&Packet::Agent.encode())],
-         &mut ancillary,
-         SendFlags::NOSIGNAL | SendFlags::DONTWAIT,
-      );
+      if self.link.is_some() && self.attached {
+         let packet = frame(&[&Packet::Agent.encode()]);
+         self.outbox.push_back((packet, Some(socket.into())));
+         self.flush();
+      }
    }
 
    /// Answers a link that asked for output with the counts it needs and the
@@ -709,21 +779,26 @@ impl Holder {
          piped: self.errors.is_some(),
       };
 
-      let mut packets = vec![answer.encode(), Packet::Written(self.written).encode()];
+      let mut packets = vec![
+         frame(&[&answer.encode()]),
+         frame(&[&Packet::Written(self.written).encode()]),
+      ];
 
       if redraw.is_none() {
          for chunk in self.output.tail.since(received) {
-            packets.push([&[DATA][..], &chunk].concat());
+            packets.push(frame(&[&[DATA], &chunk]));
          }
       }
 
       if let Some(ref flow) = self.errors {
          for chunk in flow.tail.since(errors) {
-            packets.push([&[ERRORS][..], &chunk].concat());
+            packets.push(frame(&[&[ERRORS], &chunk]));
          }
       }
 
-      self.outbox.extend(packets.into_iter().map(Bytes::from));
+      self
+         .outbox
+         .extend(packets.into_iter().map(|packet| (packet, None)));
       self.emit(redraw.as_deref().unwrap_or_default());
    }
 
@@ -731,11 +806,11 @@ impl Holder {
    /// such, and keeps it like any other.
    fn emit(&mut self, text: &[u8]) {
       for part in text.chunks(DATA_LIMIT) {
-         let packet = Bytes::from([&[DATA][..], part].concat());
-         self.output.tail.record(packet.slice(1..));
+         let packet = frame(&[&[DATA], part]);
+         self.output.tail.record(packet.slice(HEADER + 1..));
 
          if self.attached {
-            self.outbox.push_back(packet);
+            self.outbox.push_back((packet, None));
          }
       }
 
@@ -745,49 +820,50 @@ impl Holder {
    /// Reads what a new connection says first. One that asks how the
    /// session is doing gets its answer, and the client's link stays. Any
    /// other takes the session over. Breaks when it hung up the session.
-   fn greet(&mut self, now: Instant, buffer: &mut [u8]) -> ControlFlow<()> {
-      let Some(visitor) = self.visitor.take() else {
+   fn greet(&mut self, now: Instant) -> ControlFlow<()> {
+      let Some(mut visitor) = self.visitor.take() else {
          return ControlFlow::Continue(());
       };
 
-      let packet = match recv(&visitor, &mut *buffer, RecvFlags::DONTWAIT) {
-         Ok((count, _)) if count > 0 => Packet::decode(&buffer[..count]).ok(),
-         Err(Errno::WOULDBLOCK) => {
+      let packet = match visitor.next() {
+         Ok(Some(packet)) => packet,
+         Ok(None) => {
             self.visitor = Some(visitor);
             return ControlFlow::Continue(());
          },
-         Ok(_) | Err(_) => return ControlFlow::Continue(()),
+         Err(_) => return ControlFlow::Continue(()),
       };
 
-      if matches!(packet, Some(Packet::Inspect)) {
+      if matches!(packet, Packet::Inspect) {
          let about = Packet::About {
             attached: self.attached,
             quiet:    now.duration_since(self.active).as_secs(),
             title:    self.mirror.as_ref().map_or_else(String::new, Mirror::title),
          };
 
-         let _ = about.send(&visitor);
+         let _ = about.send(&visitor.socket);
          return ControlFlow::Continue(());
       }
 
       // A terminal's output that waits in the link is output the client
       // sees before the current screen, so the link holds little.
       if self.mirror.is_some() {
-         let _ = set_socket_send_buffer_size(&visitor, LINK_BUFFER);
+         let _ = set_socket_send_buffer_size(&visitor.socket, LINK_BUFFER);
       }
 
       self.detach(now);
       self.link = Some(visitor);
-      self.handle(now, packet)
+      self.handle(now, Some(packet))?;
+      self.receive(now)
    }
 
    /// Handles everything the link sent. Breaks when the client hung up.
-   fn receive(&mut self, now: Instant, buffer: &mut [u8]) -> ControlFlow<()> {
-      while let Some(ref link) = self.link {
-         let packet = match recv(link, &mut *buffer, RecvFlags::DONTWAIT) {
-            Ok((count, _)) if count > 0 => Packet::decode(&buffer[..count]).ok(),
-            Err(Errno::WOULDBLOCK) => return ControlFlow::Continue(()),
-            Ok(_) | Err(_) => None,
+   fn receive(&mut self, now: Instant) -> ControlFlow<()> {
+      while let Some(ref mut link) = self.link {
+         let packet = match link.next() {
+            Ok(Some(packet)) => Some(packet),
+            Ok(None) => return ControlFlow::Continue(()),
+            Err(_) => None,
          };
 
          self.handle(now, packet)?;
@@ -882,12 +958,15 @@ impl Holder {
          return;
       };
 
-      buffer[0] = tag;
+      let body = HEADER + 1;
+      buffer[HEADER] = tag;
 
-      match read(&flow.source, &mut buffer[1..=DATA_LIMIT]) {
+      match read(&flow.source, &mut buffer[body..body + DATA_LIMIT]) {
          Ok(0) => flow.ended = true,
          Ok(count) => {
             self.active = Instant::now();
+
+            let output = &buffer[body..body + count];
 
             // A terminal's program does not wait for a client that is
             // behind. The client gets the screen later.
@@ -895,18 +974,21 @@ impl Holder {
                let behind = self.attached && !self.outbox.is_empty();
 
                if behind || mirror.skipping() {
-                  mirror.skip(&buffer[1..=count]);
+                  mirror.skip(output);
                   return;
                }
 
-               mirror.watch(&buffer[1..=count]);
+               mirror.watch(output);
             }
 
-            let packet = Bytes::copy_from_slice(&buffer[..=count]);
-            flow.tail.record(packet.slice(1..));
+            let length = u32::try_from(count + 1).unwrap_or(u32::MAX);
+            buffer[..HEADER].copy_from_slice(&length.to_be_bytes());
+
+            let packet = Bytes::copy_from_slice(&buffer[..body + count]);
+            flow.tail.record(packet.slice(body..));
 
             if self.attached {
-               self.outbox.push_back(packet);
+               self.outbox.push_back((packet, None));
                self.flush();
             }
          },
@@ -989,11 +1071,14 @@ impl Holder {
             .as_ref()
             .filter(|flow| reading && !flow.ended)
             .map(|flow| PollFd::new(&flow.source, PollFlags::IN)),
-         self.link.as_ref().map(|link| PollFd::new(link, sending)),
+         self
+            .link
+            .as_ref()
+            .map(|link| PollFd::new(&link.socket, sending)),
          self
             .visitor
             .as_ref()
-            .map(|visitor| PollFd::new(visitor, PollFlags::IN)),
+            .map(|visitor| PollFd::new(&visitor.socket, PollFlags::IN)),
          self
             .agent
             .as_ref()
@@ -1063,19 +1148,19 @@ impl Holder {
       }
 
       if !ready.listener.is_empty() {
-         let accepted = accept_with(&self.listener, SocketFlags::CLOEXEC | SocketFlags::NONBLOCK)
-            .context("accepting the network process")?;
+         let accepted = accept(&self.listener).context("accepting the network process")?;
+         ioctl_fionbio(&accepted, true)?;
 
-         self.visitor = Some(accepted);
+         self.visitor = Some(Link::new(accepted));
       } else if !ready.visitor.is_empty() {
-         if self.greet(now, buffer).is_break() {
+         if self.greet(now).is_break() {
             return Ok(ControlFlow::Break(()));
          }
 
          self.flush();
          self.feed();
       } else if !ready.link.is_empty() {
-         if self.receive(now, buffer).is_break() {
+         if self.receive(now).is_break() {
             return Ok(ControlFlow::Break(()));
          }
 
@@ -1116,15 +1201,41 @@ impl Holder {
    }
 }
 
-/// Opens a terminal of `size` and returns its two sides, the session's last.
-fn open_terminal(size: Size, account: &Account) -> Result<(OwnedFd, OwnedFd)> {
+/// Allocates a PTY `(master, slave)` pair.
+#[cfg(target_os = "linux")]
+fn terminal_pair() -> io::Result<(OwnedFd, OwnedFd)> {
    let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
-   let master = openpt(flags).context("opening a terminal")?;
+   let master = openpt(flags)?;
    grantpt(&master)?;
    unlockpt(&master)?;
-   tcsetwinsize(&master, winsize(size))?;
 
    let slave = ioctl_tiocgptpeer(&master, flags)?;
+   Ok((master, slave))
+}
+
+/// Allocates a PTY `(master, slave)` pair via `ptsname` (macOS lacks
+/// `O_CLOEXEC` on `posix_openpt` and `TIOCGPTPEER`).
+#[cfg(not(target_os = "linux"))]
+fn terminal_pair() -> io::Result<(OwnedFd, OwnedFd)> {
+   let master = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY)?;
+   fcntl_setfd(&master, FdFlags::CLOEXEC)?;
+   grantpt(&master)?;
+   unlockpt(&master)?;
+
+   let name = ptsname(&master, Vec::new())?;
+   let slave = open(
+      name.as_c_str(),
+      OFlags::RDWR | OFlags::NOCTTY | OFlags::CLOEXEC,
+      Mode::empty(),
+   )?;
+
+   Ok((master, slave))
+}
+
+/// Opens a terminal of `size` and returns its two sides, the session's last.
+fn open_terminal(size: Size, account: &Account) -> Result<(OwnedFd, OwnedFd)> {
+   let (master, slave) = terminal_pair().context("opening a terminal")?;
+   tcsetwinsize(&master, winsize(size))?;
 
    // The account owns the terminal device, because programs such as tmux
    // open it by path.
@@ -1270,6 +1381,7 @@ impl Hold {
          link: None,
          attached: false,
          outbox: VecDeque::new(),
+         sent: 0,
          visitor: None,
          active: Instant::now(),
          detached: Instant::now(),

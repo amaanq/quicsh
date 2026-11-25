@@ -1,31 +1,25 @@
-#[cfg(target_os = "linux")] mod child;
+mod child;
 /// The process that owns one session.
-#[cfg(target_os = "linux")]
 mod hold;
-#[cfg(target_os = "linux")] mod mirror;
-#[cfg(target_os = "linux")] mod monitor;
-#[cfg(target_os = "linux")] mod network;
+mod mirror;
+mod monitor;
+mod network;
 /// Command line options.
-#[cfg(target_os = "linux")]
 mod options;
-#[cfg(target_os = "linux")] mod privsep;
+mod privsep;
 /// The network process's side of a session.
-#[cfg(target_os = "linux")]
 mod session;
 
-#[cfg(target_os = "linux")]
 use std::{
    net::Ipv6Addr,
    time::Duration,
 };
 
-#[cfg(target_os = "linux")]
 use misstep::{
    Result,
    ensure,
 };
-#[cfg(target_os = "linux")] use pound::Parse as _;
-#[cfg(target_os = "linux")]
+use pound::Parse as _;
 use quicsh::{
    DEFAULT_PORT,
    control::{
@@ -35,7 +29,6 @@ use quicsh::{
    },
 };
 
-#[cfg(target_os = "linux")]
 use crate::{
    child::{
       Launch,
@@ -52,10 +45,8 @@ use crate::{
 /// The variables a client may set when no `--accept-env` says otherwise,
 /// which are the ones most distributions let through `sshd`, and the one
 /// that tells programs how many colors the terminal shows.
-#[cfg(target_os = "linux")]
 const ACCEPTED_ENVIRONMENT: [&str; 3] = ["LANG", "LC_*", "COLORTERM"];
 
-#[cfg(target_os = "linux")]
 fn main() -> Result<()> {
    let options = Options::parse();
 
@@ -157,11 +148,4 @@ fn main() -> Result<()> {
          match launch.run()? {}
       },
    }
-}
-
-/// The server needs Linux for its holders, privilege split and PAM sessions.
-#[cfg(not(target_os = "linux"))]
-fn main() -> std::process::ExitCode {
-   eprintln!("qshd: the server runs on Linux only");
-   std::process::ExitCode::FAILURE
 }

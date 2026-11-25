@@ -87,9 +87,13 @@ use quicsh::{
    },
    known_hosts::glob,
    pipe::{
-      receive_message,
+      accept,
+      finish_sending,
+      receive_framed,
       reopen,
-      send_message,
+      send_framed,
+      socket,
+      socket_pair,
    },
    tls::{
       self,
@@ -115,15 +119,13 @@ use rustix::{
    },
    net::{
       AddressFamily,
+      Shutdown,
       SocketAddrUnix,
-      SocketFlags,
       SocketType,
-      accept,
       bind,
       connect,
       listen,
-      socket_with,
-      socketpair,
+      shutdown,
    },
    process::{
       Pid,
@@ -163,6 +165,13 @@ const ACCOUNT_LIMIT: Duration = Duration::from_secs(10);
 
 /// Most terminal sessions one account has at a time.
 const MAX_KEPT: usize = 64;
+
+/// Default runtime directory when running as root.
+#[cfg(target_os = "linux")]
+const RUNTIME: &str = "/run/qshd";
+/// Default runtime directory when running as root (`/var/run` on macOS).
+#[cfg(not(target_os = "linux"))]
+const RUNTIME: &str = "/var/run/qshd";
 
 /// File in the holders directory with the keys a restarted server shares
 /// with the old one. It sits on a runtime directory, so a reboot replaces it.
@@ -382,12 +391,7 @@ impl Monitor {
          return Ok((Reply::Denied, Vec::new()));
       }
 
-      let (near, far) = socketpair(
-         AddressFamily::UNIX,
-         SocketType::SEQPACKET,
-         SocketFlags::CLOEXEC,
-         None,
-      )?;
+      let (near, far) = socket_pair(AddressFamily::UNIX, SocketType::STREAM)?;
 
       // PAM modules run in that process, so none of their code is ever
       // part of this one.
@@ -598,12 +602,7 @@ impl Monitor {
 
    /// Connects to the holder that listens at `path`.
    fn holder(path: &Path) -> io::Result<OwnedFd> {
-      let link = socket_with(
-         AddressFamily::UNIX,
-         SocketType::SEQPACKET,
-         SocketFlags::CLOEXEC,
-         None,
-      )?;
+      let link = socket(AddressFamily::UNIX, SocketType::STREAM)?;
 
       connect(&link, &SocketAddrUnix::new(path)?)?;
       Ok(link)
@@ -719,12 +718,7 @@ impl Monitor {
 
       let path = self.holder_path(grant.account.uid, token);
 
-      let listener = socket_with(
-         AddressFamily::UNIX,
-         SocketType::SEQPACKET,
-         SocketFlags::CLOEXEC,
-         None,
-      )?;
+      let listener = socket(AddressFamily::UNIX, SocketType::STREAM)?;
 
       bind(&listener, &SocketAddrUnix::new(&path)?)
          .with_context(|| format!("binding {}", path.display()))?;
@@ -833,12 +827,7 @@ impl Monitor {
 
       ensure!(permitted, "this key may not forward that socket");
 
-      let (near, far) = socketpair(
-         AddressFamily::UNIX,
-         SocketType::SEQPACKET,
-         SocketFlags::CLOEXEC,
-         None,
-      )?;
+      let (near, far) = socket_pair(AddressFamily::UNIX, SocketType::STREAM)?;
 
       let mut command = Command::new(env::current_exe()?);
       command
@@ -918,23 +907,13 @@ impl Monitor {
       let path = self.holders.join(KEPT);
       let _ = fs::remove_file(&path);
 
-      let listener = socket_with(
-         AddressFamily::UNIX,
-         SocketType::SEQPACKET,
-         SocketFlags::CLOEXEC,
-         None,
-      )?;
+      let listener = socket(AddressFamily::UNIX, SocketType::STREAM)?;
 
       bind(&listener, &SocketAddrUnix::new(&path)?)
          .with_context(|| format!("binding {}", path.display()))?;
       listen(&listener, 1)?;
 
-      let (link, remote) = socketpair(
-         AddressFamily::UNIX,
-         SocketType::SEQPACKET,
-         SocketFlags::CLOEXEC,
-         None,
-      )?;
+      let (link, remote) = socket_pair(AddressFamily::UNIX, SocketType::STREAM)?;
 
       let mut command = Command::new(env::current_exe()?);
       command
@@ -1120,7 +1099,7 @@ fn clock() -> u64 {
 /// and removes the sockets that no holder listens on any more.
 fn holders() -> Result<PathBuf> {
    let directory = if geteuid().is_root() {
-      PathBuf::from("/run/qshd")
+      PathBuf::from(RUNTIME)
    } else {
       env::var_os("XDG_RUNTIME_DIR")
          .map_or_else(env::temp_dir, PathBuf::from)
@@ -1143,10 +1122,7 @@ fn holders() -> Result<PathBuf> {
 /// whether it lives would take a running session from its client, so the
 /// kernel's list of bound sockets decides.
 fn sweep(directory: &Path) {
-   let (Ok(bound), Ok(entries)) = (
-      fs::read_to_string("/proc/net/unix"),
-      fs::read_dir(directory),
-   ) else {
+   let (Some(bound), Ok(entries)) = (bound(), fs::read_dir(directory)) else {
       return;
    };
 
@@ -1174,6 +1150,28 @@ fn sweep(directory: &Path) {
    }
 }
 
+/// Lists bound Unix sockets from `/proc/net/unix`.
+#[cfg(target_os = "linux")]
+fn bound() -> Option<String> {
+   fs::read_to_string("/proc/net/unix").ok()
+}
+
+/// Lists bound Unix sockets via `netstat -an -f unix`.
+#[cfg(not(target_os = "linux"))]
+fn bound() -> Option<String> {
+   let output = Command::new("netstat")
+      .args(["-an", "-f", "unix"])
+      .stdin(Stdio::null())
+      .stderr(Stdio::null())
+      .output()
+      .ok()?;
+
+   output
+      .status
+      .success()
+      .then(|| String::from_utf8(output.stdout).ok())?
+}
+
 /// Takes what a network process that stops hands over on standard input,
 /// and gives it to the first process that connects to the socket on
 /// standard output. Nobody else can connect, since only the server's user
@@ -1185,7 +1183,7 @@ pub fn keep() -> Result<()> {
    let mut kept = Vec::new();
    let mut size = 0;
 
-   while let Some(message) = receive_message(&link, KEPT_MESSAGE)? {
+   while let Some(message) = receive_framed(&link, KEPT_MESSAGE)? {
       size += message.0.len();
       ensure!(
          kept.len() < KEPT_MESSAGES && size <= KEPT_BYTES,
@@ -1194,6 +1192,8 @@ pub fn keep() -> Result<()> {
 
       kept.push(message);
    }
+
+   shutdown(&link, Shutdown::Write)?;
 
    let wait = Timespec {
       tv_sec:  i64::try_from(DETACH_LIMIT.as_secs()).unwrap_or(i64::MAX),
@@ -1213,9 +1213,10 @@ pub fn keep() -> Result<()> {
          .map(OwnedFd::as_fd)
          .collect::<Vec<BorrowedFd>>();
 
-      send_message(&taker, &message.0, &borrowed)?;
+      send_framed(&taker, &message.0, &borrowed)?;
    }
 
+   finish_sending(&taker)?;
    Ok(())
 }
 
@@ -1248,12 +1249,7 @@ pub fn run(settings: Settings) -> Result<()> {
    let listener = udp_socket(settings.listen, None)
       .with_context(|| format!("listening on {}", settings.listen))?;
 
-   let (channel, remote) = socketpair(
-      AddressFamily::UNIX,
-      SocketType::SEQPACKET,
-      SocketFlags::CLOEXEC,
-      None,
-   )?;
+   let (channel, remote) = socket_pair(AddressFamily::UNIX, SocketType::STREAM)?;
 
    let mut network = Command::new(env::current_exe()?);
    network

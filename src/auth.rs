@@ -357,25 +357,61 @@ impl Account {
 
 /// What `getent` prints for `key` in `database`, which covers LDAP,
 /// `systemd-homed` and whatever else the name service switch lists. `None`
-/// means it found nothing or is not installed. A name that could pass for
-/// an option is never handed over.
+/// means it found nothing or is not installed.
+#[cfg(target_os = "linux")]
 fn getent(database: &str, key: &str) -> Option<String> {
-   let plain = !key.is_empty()
+   answer("getent", &[database, "--", plain(key)?])
+}
+
+/// Queries Directory Services via `dscacheutil` / `id` and formats the
+/// result like `getent`.
+#[cfg(not(target_os = "linux"))]
+fn getent(database: &str, key: &str) -> Option<String> {
+   let name = plain(key)?;
+
+   if database == "initgroups" {
+      let groups = answer("id", &["-G", name])?;
+      return Some(format!("{name} {groups}"));
+   }
+
+   let entry = answer("dscacheutil", &["-q", "user", "-a", "name", name])?;
+   let field = |wanted: &str| {
+      entry.lines().find_map(|line| {
+         let (label, value) = line.split_once(": ")?;
+         (label == wanted).then_some(value)
+      })
+   };
+
+   // Preserve the queried name (Directory Services also resolves aliases
+   // like `sshd` -> `_sshd`).
+   Some(format!(
+      "{name}:*:{}:{}::{}:{}",
+      field("uid")?,
+      field("gid")?,
+      field("dir")?,
+      field("shell")?
+   ))
+}
+
+/// Validates `key` as a safe account name (non-empty, not starting with `-`).
+fn plain(key: &str) -> Option<&str> {
+   let named = !key.is_empty()
       && !key.starts_with('-')
       && key
          .chars()
          .all(|letter| letter.is_ascii_alphanumeric() || "._@-".contains(letter));
 
-   let output = plain
-      .then(|| {
-         Command::new("getent")
-            .args([database, "--", key])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()
-      })
-      .flatten()?;
+   named.then_some(key)
+}
+
+/// Runs `program` with `arguments` and returns stdout on success.
+fn answer(program: &str, arguments: &[&str]) -> Option<String> {
+   let output = Command::new(program)
+      .args(arguments)
+      .stdin(Stdio::null())
+      .stderr(Stdio::null())
+      .output()
+      .ok()?;
 
    output
       .status

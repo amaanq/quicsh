@@ -75,7 +75,6 @@ use rustix::{
       accept_with,
       recv,
       recvmsg,
-      send,
       sendmsg,
       shutdown,
       socket_with,
@@ -404,60 +403,6 @@ fn spawn_reader(
 /// Most descriptors one message carries.
 const MAX_DESCRIPTORS: usize = 4;
 
-/// Sends one message on a Unix socket, with descriptors for the receiver.
-///
-/// # Errors
-///
-/// Fails when the socket does, or with more descriptors than one message
-/// carries.
-pub fn send_message(
-   socket: &OwnedFd,
-   bytes: &[u8],
-   descriptors: &[BorrowedFd<'_>],
-) -> io::Result<()> {
-   let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(MAX_DESCRIPTORS))];
-   let mut ancillary = SendAncillaryBuffer::new(&mut space);
-
-   if !descriptors.is_empty() && !ancillary.push(SendAncillaryMessage::ScmRights(descriptors)) {
-      return Err(io::Error::other("too many descriptors for one message"));
-   }
-
-   sendmsg(socket, &[IoSlice::new(bytes)], &mut ancillary, NO_SIGNAL)?;
-
-   Ok(())
-}
-
-/// The next message of at most `limit` bytes and its descriptors, or `None`
-/// once the other side is gone.
-///
-/// # Errors
-///
-/// Fails when the socket does.
-pub fn receive_message(
-   socket: &OwnedFd,
-   limit: usize,
-) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
-   let mut bytes = vec![0; limit];
-   let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(MAX_DESCRIPTORS))];
-   let mut ancillary = RecvAncillaryBuffer::new(&mut space);
-
-   let received = recvmsg(
-      socket,
-      &mut [IoSliceMut::new(&mut bytes)],
-      &mut ancillary,
-      RECEIVE_FLAGS,
-   )?;
-
-   if received.bytes == 0 {
-      return Ok(None);
-   }
-
-   let descriptors = passed(&mut ancillary)?;
-
-   bytes.truncate(received.bytes);
-   Ok(Some((bytes, descriptors)))
-}
-
 /// The descriptors that arrived with a message.
 fn passed(ancillary: &mut RecvAncillaryBuffer<'_>) -> io::Result<Vec<OwnedFd>> {
    ancillary
@@ -477,20 +422,39 @@ fn passed(ancillary: &mut RecvAncillaryBuffer<'_>) -> io::Result<Vec<OwnedFd>> {
       .collect()
 }
 
-/// Sends one message on a Unix stream socket after its length in four
-/// bytes, with descriptors for the receiver. macOS has no `SOCK_SEQPACKET`
-/// for [`send_message`].
+/// Sends a length-prefixed message and optional file descriptors on a Unix
+/// stream socket.
 ///
 /// # Errors
 ///
-/// Fails like [`send_message`], or with a message over 4 GiB.
+/// Fails on socket error, too many descriptors, or a payload over `u32::MAX`
+/// bytes.
 pub fn send_framed(
    socket: &OwnedFd,
    bytes: &[u8],
    descriptors: &[BorrowedFd<'_>],
 ) -> io::Result<()> {
-   let length = u32::try_from(bytes.len()).map_err(|_| io::Error::other("message too long"))?;
-   let frame = [&length.to_be_bytes()[..], bytes].concat();
+   send_gathered(socket, &[bytes], descriptors)
+}
+
+/// Sends a length-prefixed message gathered from `parts` with optional file
+/// descriptors, without concatenating them.
+///
+/// # Errors
+///
+/// Fails like [`send_framed`].
+pub fn send_gathered(
+   socket: &OwnedFd,
+   parts: &[&[u8]],
+   descriptors: &[BorrowedFd<'_>],
+) -> io::Result<()> {
+   let total = parts.iter().map(|part| part.len()).sum::<usize>();
+   let length = u32::try_from(total).map_err(|_| io::Error::other("message too long"))?;
+   let header = length.to_be_bytes();
+
+   let mut slices = Vec::with_capacity(parts.len() + 1);
+   slices.push(IoSlice::new(&header));
+   slices.extend(parts.iter().map(|part| IoSlice::new(part)));
 
    let mut space = [MaybeUninit::uninit(); cmsg_space!(ScmRights(MAX_DESCRIPTORS))];
    let mut ancillary = SendAncillaryBuffer::new(&mut space);
@@ -499,13 +463,16 @@ pub fn send_framed(
       return Err(io::Error::other("too many descriptors for one message"));
    }
 
+   let mut rest = slices.as_mut_slice();
+
    // The descriptors travel with the first byte, so the rest of a short
    // send goes without them.
-   let mut sent = sendmsg(socket, &[IoSlice::new(&frame)], &mut ancillary, NO_SIGNAL)?;
-
-   while sent < frame.len() {
-      match send(socket, &frame[sent..], NO_SIGNAL) {
-         Ok(more) => sent += more,
+   while !rest.is_empty() {
+      match sendmsg(socket, rest, &mut ancillary, NO_SIGNAL) {
+         Ok(count) => {
+            IoSlice::advance_slices(&mut rest, count);
+            ancillary.clear();
+         },
          Err(Errno::INTR) => {},
          Err(errno) => return Err(errno.into()),
       }
@@ -553,6 +520,26 @@ pub fn receive_framed(
    fill(socket, &mut bytes)?;
 
    Ok(Some((bytes, descriptors)))
+}
+
+/// Half-closes the write side of `socket` and waits for the peer to close
+/// its side (EOF).
+///
+/// # Errors
+///
+/// Fails on socket error.
+pub fn finish_sending(socket: &OwnedFd) -> io::Result<()> {
+   shutdown(socket, Shutdown::Write)?;
+
+   let mut rest = [0; 64];
+
+   loop {
+      match recv(socket, &mut rest, RecvFlags::empty()) {
+         Ok((0, _)) => return Ok(()),
+         Ok(_) | Err(Errno::INTR) => {},
+         Err(errno) => return Err(errno.into()),
+      }
+   }
 }
 
 /// Reads from `socket` until `buffer` is full.

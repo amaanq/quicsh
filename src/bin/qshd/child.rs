@@ -4,6 +4,7 @@
 //! process that becomes the shell. The server therefore starts its own binary
 //! in this mode, which does both and then replaces itself with the shell.
 
+#[cfg(not(target_os = "linux"))] use std::thread;
 use std::{
    convert::Infallible,
    env,
@@ -46,40 +47,51 @@ use quicsh::{
    },
    forward::Bound,
    pipe::{
-      receive_message,
-      send_message,
+      receive_framed,
+      send_framed,
+      socket,
    },
 };
+#[cfg(target_os = "macos")] use quicsh_pam::become_user;
 use quicsh_pam::{
    Style,
    login,
    permitted,
+};
+#[cfg(not(target_os = "linux"))]
+use rustix::process::{
+   getpid,
+   getppid,
+   kill_process,
 };
 use rustix::{
    net::{
       AddressFamily,
       RecvFlags,
       SocketAddrUnix,
-      SocketFlags,
       SocketType,
       connect,
       recv,
-      socket_with,
       sockopt::{
          Timeout,
          set_socket_timeout,
       },
    },
    process::{
-      Gid,
       Signal,
-      Uid,
       geteuid,
       ioctl_tiocsctty,
-      set_parent_process_death_signal,
       setsid,
    },
    termios::ttyname,
+};
+#[cfg(target_os = "linux")]
+use rustix::{
+   process::{
+      Gid,
+      Uid,
+      set_parent_process_death_signal,
+   },
    thread::{
       set_thread_gid,
       set_thread_groups,
@@ -92,7 +104,7 @@ use rustix::{
 /// there. With `account`, PAM is asked only whether the account may be
 /// used. The monitor reads the decision from the exit status.
 pub fn ask(service: &str, user: &str, remote: &str, account: bool) -> Result<()> {
-   set_parent_process_death_signal(Some(Signal::TERM))?;
+   end_with_parent(Signal::TERM)?;
 
    if account {
       return permitted(service, user, remote)
@@ -114,13 +126,13 @@ pub fn ask(service: &str, user: &str, remote: &str, account: bool) -> Result<()>
             .to_owned(),
       };
 
-      send_message(&link, &prompt.encode(), &[]).ok()?;
+      send_framed(&link, &prompt.encode(), &[]).ok()?;
 
       if !style.asks() {
          return Some(String::new());
       }
 
-      let (answer, _) = receive_message(&link, MAX_DIALOGUE).ok()??;
+      let (answer, _) = receive_framed(&link, MAX_DIALOGUE).ok()??;
       String::from_utf8(answer).ok()
    });
 
@@ -136,21 +148,39 @@ pub const SESSION_ENVIRONMENT: &str = "QSHD_SESSION_";
 /// `PATH` for sessions when the server has none.
 const FALLBACK_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
+/// Sends `signal` to this process once its parent exits.
+#[cfg(target_os = "linux")]
+pub fn end_with_parent(signal: Signal) -> Result<()> {
+   set_parent_process_death_signal(Some(signal))?;
+   Ok(())
+}
+
+/// Sends `signal` to this process once its parent exits by polling `getppid`.
+#[cfg(not(target_os = "linux"))]
+#[expect(clippy::unnecessary_wraps, reason = "the Linux version can fail")]
+pub fn end_with_parent(signal: Signal) -> Result<()> {
+   let parent = getppid();
+
+   thread::spawn(move || {
+      while getppid() == parent {
+         thread::sleep(PARENT_CHECK);
+      }
+
+      let _ = kill_process(getpid(), signal);
+   });
+
+   Ok(())
+}
+
+/// Polling interval for parent-exit detection on non-Linux targets.
+#[cfg(not(target_os = "linux"))]
+const PARENT_CHECK: Duration = Duration::from_millis(250);
+
 /// Gives up root for `account`. An unprivileged server can only be the
 /// account already.
 pub fn become_account(account: &Account) -> Result<()> {
    if geteuid().is_root() {
-      let groups = account
-         .groups()?
-         .into_iter()
-         .map(Gid::from_raw)
-         .collect::<Vec<Gid>>();
-
-      // Groups and gid go first, because dropping the uid removes the
-      // right to change them.
-      set_thread_groups(&groups).context("setting groups")?;
-      set_thread_gid(Gid::from_raw(account.gid)).context("setting gid")?;
-      set_thread_uid(Uid::from_raw(account.uid)).context("setting uid")?;
+      switch(account)?;
    } else if geteuid().as_raw() != account.uid {
       bail!(
          "an unprivileged server cannot run sessions for {}",
@@ -158,6 +188,31 @@ pub fn become_account(account: &Account) -> Result<()> {
       );
    }
 
+   Ok(())
+}
+
+/// Switches the current thread's credentials to `account`.
+#[cfg(target_os = "linux")]
+fn switch(account: &Account) -> Result<()> {
+   let groups = account
+      .groups()?
+      .into_iter()
+      .map(Gid::from_raw)
+      .collect::<Vec<Gid>>();
+
+   // Groups and gid go first, because dropping the uid removes the right to
+   // change them.
+   set_thread_groups(&groups).context("setting groups")?;
+   set_thread_gid(Gid::from_raw(account.gid)).context("setting gid")?;
+   set_thread_uid(Uid::from_raw(account.uid)).context("setting uid")?;
+   Ok(())
+}
+
+/// Switches this process to `account`.
+#[cfg(target_os = "macos")]
+fn switch(account: &Account) -> Result<()> {
+   become_user(&account.name, account.uid, account.gid)
+      .with_context(|| format!("becoming {}", account.name))?;
    Ok(())
 }
 
@@ -203,25 +258,20 @@ impl Reach {
          let (bound, listener) = Bound::listen(&self.path)
             .with_context(|| format!("listening on {}", self.path.display()))?;
 
-         send_message(&link, &[0], &[listener.as_fd()])?;
+         send_framed(&link, &[0], &[listener.as_fd()])?;
          drop(listener);
 
          let _ = recv(&link, &mut [0_u8; 1], RecvFlags::empty());
          drop(bound);
       } else {
-         let socket = socket_with(
-            AddressFamily::UNIX,
-            SocketType::STREAM,
-            SocketFlags::CLOEXEC,
-            None,
-         )?;
+         let socket = socket(AddressFamily::UNIX, SocketType::STREAM)?;
 
          set_socket_timeout(&socket, Timeout::Send, Some(REACH_TIMEOUT))?;
          connect(&socket, &SocketAddrUnix::new(&self.path)?)
             .with_context(|| format!("connecting to {}", self.path.display()))?;
          set_socket_timeout(&socket, Timeout::Send, None)?;
 
-         send_message(&link, &[0], &[socket.as_fd()])?;
+         send_framed(&link, &[0], &[socket.as_fd()])?;
       }
 
       Ok(())
@@ -257,6 +307,7 @@ impl Launch {
 
       // The kernel clears this setting when the uid changes, so it comes
       // after the switch. A monitor that dies can hang nothing up itself.
+      #[cfg(target_os = "linux")]
       set_parent_process_death_signal(Some(Signal::HUP))?;
 
       let mut shell = Command::new(&account.shell);

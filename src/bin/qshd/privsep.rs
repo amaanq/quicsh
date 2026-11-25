@@ -47,8 +47,8 @@ use quicsh::{
    },
    error::Error,
    pipe::{
-      receive_message,
-      send_message,
+      receive_framed,
+      send_framed,
    },
    wire::{
       Reader,
@@ -720,7 +720,7 @@ fn answer<Handler>(channel: &OwnedFd, handle: &mut Handler) -> Result<bool>
 where
    Handler: FnMut(Request) -> Result<(Reply, Vec<OwnedFd>)>,
 {
-   let Some((bytes, _)) = receive_message(channel, MAX_MESSAGE)? else {
+   let Some((bytes, _)) = receive_framed(channel, MAX_MESSAGE)? else {
       return Ok(false);
    };
 
@@ -733,7 +733,7 @@ where
       .iter()
       .map(OwnedFd::as_fd)
       .collect::<Vec<BorrowedFd>>();
-   send_message(channel, &reply.encode(), &borrowed)?;
+   send_framed(channel, &reply.encode(), &borrowed)?;
 
    Ok(true)
 }
@@ -795,9 +795,9 @@ impl Helper {
          .lock()
          .map_err(|_| report!("a thread died while talking to the monitor"))?;
 
-      send_message(&channel, &request.encode(), &[])?;
+      send_framed(&channel, &request.encode(), &[])?;
       let (bytes, descriptors) =
-         receive_message(&channel, MAX_MESSAGE)?.context("the monitor exited")?;
+         receive_framed(&channel, MAX_MESSAGE)?.context("the monitor exited")?;
 
       match Reply::decode(&bytes)? {
          Reply::Failed(text) => bail!("monitor: {text}"),

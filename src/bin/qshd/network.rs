@@ -70,8 +70,8 @@ use quicsh::{
    key::PublicKey,
    pipe::{
       Waker,
-      receive_message,
-      send_message,
+      receive_framed,
+      send_framed,
    },
    relay::{
       Relay,
@@ -102,13 +102,9 @@ use ring::rand::{
    SecureRandom as _,
    SystemRandom,
 };
-use rustix::{
-   process::{
-      Signal,
-      set_parent_process_death_signal,
-   },
-   thread::set_no_new_privs,
-};
+use rustix::process::Signal;
+#[cfg(target_os = "linux")]
+use rustix::thread::set_no_new_privs;
 use rustls::{
    SignatureAlgorithm,
    SignatureScheme,
@@ -120,6 +116,7 @@ use rustls::{
 };
 
 use crate::{
+   child::end_with_parent,
    hold::Packet,
    privsep::{
       Helper,
@@ -428,7 +425,7 @@ impl Peer {
    /// Gives PAM what the client typed at its question.
    fn answer(&self, text: &str) {
       if let Some(ref conversation) = self.asking {
-         let _ = send_message(&conversation.link, text.as_bytes(), &[]);
+         let _ = send_framed(&conversation.link, text.as_bytes(), &[]);
       }
    }
 
@@ -575,7 +572,7 @@ impl Conversation {
 
       thread::spawn(move || {
          loop {
-            let prompt = receive_message(&source, MAX_QUESTION)
+            let prompt = receive_framed(&source, MAX_QUESTION)
                .ok()
                .flatten()
                .and_then(|(frame, _)| Message::decode(frame.get(4..)?).ok())
@@ -1372,8 +1369,10 @@ impl App for Server {
 /// Serves clients on the socket the monitor hands over, and stops with the
 /// monitor, since a second server could otherwise share the port with it.
 pub fn run(congestion: Congestion) -> Result<()> {
+   // No equivalent to `PR_SET_NO_NEW_PRIVS` on macOS.
+   #[cfg(target_os = "linux")]
    set_no_new_privs(true)?;
-   set_parent_process_death_signal(Some(Signal::TERM))?;
+   end_with_parent(Signal::TERM)?;
 
    let helper = Helper::new(io::stdin().as_fd().try_clone_to_owned()?);
    let (

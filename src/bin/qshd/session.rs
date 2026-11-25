@@ -12,6 +12,7 @@ use std::{
       Arc,
       Condvar,
       Mutex,
+      MutexGuard,
       atomic::{
          AtomicBool,
          Ordering,
@@ -58,7 +59,6 @@ use rustix::{
 
 use crate::hold::{
    DATA_LIMIT,
-   PACKET_LIMIT,
    Packet,
 };
 
@@ -121,10 +121,37 @@ impl Credit {
    }
 }
 
+/// Synchronized writer for a holder stream socket so framed packets do not
+/// interleave across threads.
+#[derive(Clone)]
+struct Sender(Arc<Mutex<OwnedFd>>);
+
+impl Sender {
+   /// Sends `packet`.
+   fn send(&self, packet: &Packet) -> io::Result<()> {
+      packet.send(&*self.lock()?)
+   }
+
+   /// Sends `bytes` as session input.
+   fn send_data(&self, bytes: &[u8]) -> io::Result<()> {
+      Packet::send_data(&*self.lock()?, bytes)
+   }
+
+   /// Locks the underlying socket.
+   fn lock(&self) -> io::Result<MutexGuard<'_, OwnedFd>> {
+      self
+         .0
+         .lock()
+         .map_err(|_| io::Error::other("a thread died while sending to the holder"))
+   }
+}
+
 /// Sends what a relay writes to a holder as session input.
 struct Input {
    /// The connection to the holder.
-   link:     OwnedFd,
+   link:     Sender,
+   /// Cloned socket descriptor used for `AsFd` polling.
+   socket:   OwnedFd,
    /// How many input bytes the holder got, over every connection.
    sent:     u64,
    /// How far the session got with them.
@@ -139,7 +166,7 @@ impl Write for Input {
       self.credit.wait(self.sent);
 
       let count = bytes.len().min(DATA_LIMIT);
-      Packet::send_data(&self.link, &bytes[..count])?;
+      self.link.send_data(&bytes[..count])?;
       self.sent += count as u64;
 
       Ok(count)
@@ -152,14 +179,14 @@ impl Write for Input {
 
 impl AsFd for Input {
    fn as_fd(&self) -> BorrowedFd<'_> {
-      self.link.as_fd()
+      self.socket.as_fd()
    }
 }
 
 impl Drop for Input {
    fn drop(&mut self) {
       if !self.released.load(Ordering::Relaxed) {
-         let _ = Packet::End.send(&self.link);
+         let _ = self.link.send(&Packet::End);
       }
    }
 }
@@ -211,7 +238,7 @@ pub struct Session {
    /// Standard error, for a session without a terminal.
    errors:   Option<Relay>,
    /// The connection to the holder.
-   link:     OwnedFd,
+   link:     Sender,
    /// How much input the session had when this side joined it, and how
    /// much of its output was gone by then.
    before:   (u64, u64),
@@ -257,8 +284,6 @@ impl Session {
 
       Packet::Attach { received, errors }.send(&link)?;
 
-      let mut buffer = vec![0; PACKET_LIMIT];
-
       let Some((
          Packet::Attached {
             taken,
@@ -266,7 +291,7 @@ impl Session {
             piped,
          },
          _,
-      )) = Packet::receive(&link, &mut buffer)?
+      )) = Packet::receive(&link)?
       else {
          bail!("the session holder did not answer");
       };
@@ -285,7 +310,7 @@ impl Session {
       // the last wake, or the loop could look first and then sleep through
       // the end of the session.
       thread::spawn(move || {
-         while let Ok(Some((packet, descriptor))) = Packet::receive(&source, &mut buffer) {
+         while let Ok(Some((packet, descriptor))) = Packet::receive(&source) {
             let delivered = match packet {
                Packet::Data(bytes) => chunks.send(bytes).is_ok(),
                Packet::Errors(bytes) => lines.send(bytes).is_ok(),
@@ -314,11 +339,14 @@ impl Session {
       });
 
       let released = Arc::new(AtomicBool::new(false));
+      let socket = link.try_clone()?;
+      let sender = Sender(Arc::new(Mutex::new(link)));
 
       let input = Input {
-         link:     link.try_clone()?,
-         sent:     taken,
-         credit:   Arc::clone(&credit),
+         link: sender.clone(),
+         socket,
+         sent: taken,
+         credit: Arc::clone(&credit),
          released: Arc::clone(&released),
       };
 
@@ -351,7 +379,7 @@ impl Session {
       Ok(Self {
          relay,
          errors: side,
-         link,
+         link: sender,
          before: (taken, skipped),
          keep: false,
          stay: false,
@@ -378,13 +406,13 @@ impl Session {
 
    /// Sets the terminal's size.
    pub fn resize(&self, size: Size) -> Result<()> {
-      Packet::Resize(size).send(&self.link)?;
+      self.link.send(&Packet::Resize(size))?;
       Ok(())
    }
 
    /// Lets the holder forget the output the client has.
    pub fn release(&self, output: u64, errors: u64) -> Result<()> {
-      Packet::Received { output, errors }.send(&self.link)?;
+      self.link.send(&Packet::Received { output, errors })?;
       Ok(())
    }
 
@@ -462,11 +490,13 @@ impl Drop for Session {
       self.released.store(true, Ordering::Relaxed);
 
       if !self.keep {
-         let _ = Packet::Hangup.send(&self.link);
+         let _ = self.link.send(&Packet::Hangup);
       }
 
       // The thread that reads the link holds a copy of it, so closing this
       // one would not end the connection.
-      let _ = shutdown(&self.link, Shutdown::Both);
+      if let Ok(link) = self.link.lock() {
+         let _ = shutdown(&*link, Shutdown::Both);
+      }
    }
 }
